@@ -218,6 +218,10 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 	return bt, nil
 }
 
+func (bt *BTree[K, V]) GetRootPageID() PageID {
+	return bt.rootPageID
+}
+
 // fetchNode retrieves a node from the buffer pool or disk.
 func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
 	if pageID == InvalidPageID {

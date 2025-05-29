@@ -1,4 +1,4 @@
-package gojodbserver
+package main
 
 import (
 	"bufio"
@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync" // For global B-Tree lock
 
-	"github.com/sushant-115/gojodb/core/indexing/btree/btree_core" // Adjust this import path to your actual module path
+	btree_core "github.com/sushant-115/gojodb/core/indexing/btree" // Adjust this import path to your actual module path
 )
 
 const (
@@ -98,7 +98,7 @@ func initDatabase() error {
 			return fmt.Errorf("failed to open existing BTree file: %w", err)
 		}
 	}
-	log.Printf("INFO: Database initialized successfully. Root PageID: %d", dbInstance.RootPageID)
+	log.Printf("INFO: Database initialized successfully. Root PageID: %d", dbInstance.GetRootPageID())
 	return nil
 }
 
