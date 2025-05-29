@@ -72,32 +72,34 @@ GojoDB's architecture is based on a distributed, microservice-oriented approach:
 
 The project is organized into several key directories:
 
+```
 gojodb/  
-├── api/             \# API microservices (GraphQL, reads, writes, bulk, aggregation)  
-├── cmd/             \# Main application entry points (controller, server, CLI)  
-├── config/          \# Configuration files  
-├── core/            \# Core database engine components  
+├── api/             # API microservices (GraphQL, reads, writes, bulk, aggregation)  
+├── cmd/             # Main application entry points (controller, server, CLI)  
+├── config/          # Configuration files  
+├── core/            # Core database engine components  
 │   ├── controller/  
-│   ├── resource\_management/ \# Logic for query throttling, user quotas, admission control  
-│   │   ├── admission\_control/  
-│   │   ├── query\_throttling/  
-│   │   └── user\_quotas/  
-│   ├── storage\_engine/  
-│   ├── query\_engine/  
-│   ├── write\_engine/  
+│   ├── resource_management/ # Logic for query throttling, user quotas, admission control  
+│   │   ├── admission_control/  
+│   │   ├── query_throttling/  
+│   │   └── user_quotas/  
+│   ├── storage_engine/  
+│   ├── query_engine/  
+│   ├── write_engine/  
 │   ├── indexing/  
 │   └── sharding/  
-├── data\_management/ \# Tools for archival, restore, migration, backup  
-├── docs/            \# Project documentation  
-├── examples/        \# Example client applications  
-├── internal/        \# Private application and library code  
-├── pkg/             \# Public library packages (e.g., client SDK)  
-├── scripts/         \# Build, test, deployment scripts  
-├── tests/           \# Unit, integration, E2E, performance tests  
-├── tools/           \# Internal development tools  
-└── Makefile         \# Makefile for common tasks
+├── data_management/ # Tools for archival, restore, migration, backup  
+├── docs/            # Project documentation  
+├── examples/        # Example client applications  
+├── internal/        # Private application and library code  
+├── pkg/             # Public library packages (e.g., client SDK)  
+├── scripts/         # Build, test, deployment scripts  
+├── tests/           # Unit, integration, E2E, performance tests  
+├── tools/           # Internal development tools  
+└── Makefile         # Makefile for common tasks
 
 *(For a detailed breakdown, refer to the docs/architecture/directory\_structure.md \- this file would be created based on the earlier directory structure output).*
+```
 
 ## **Getting Started**
 
