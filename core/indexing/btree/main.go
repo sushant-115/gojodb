@@ -32,6 +32,8 @@ func int64KeyOrder(a, b int64) int {
 
 func main() {
 	dbFilePath := "my_btree.db"
+	logPath := "log_manager001"
+	archLogPath := "log_manager002"
 	// Clean up existing DB file for fresh test run
 	os.Remove(dbFilePath)
 
@@ -39,7 +41,7 @@ func main() {
 	log.Println("Creating new BTree file...")
 	// Note: LogManager is currently an interface{} placeholder in the BTree code.
 	// For this test, we'll pass nil. A real LogManager would be needed for WAL.
-	var logManagerPlaceholder interface{} = nil
+	logManager, _ := btree.NewLogManager(logPath, archLogPath, 10000, 10000)
 	bt, err := btree.NewBTreeFile[int64, string](
 		dbFilePath,
 		3, // Degree
@@ -47,7 +49,7 @@ func main() {
 		kvSerializer,
 		10, // Buffer pool size (number of pages)
 		btree.DefaultPageSize,
-		logManagerPlaceholder,
+		logManager,
 	)
 	if err != nil {
 		log.Fatalf("Error creating BTree file: %v", err)
@@ -140,7 +142,7 @@ func main() {
 		kvSerializer,
 		10, // Buffer pool size
 		btree.DefaultPageSize,
-		logManagerPlaceholder,
+		logManager,
 	)
 	if err != nil {
 		log.Fatalf("Error reopening BTree file: %v", err)

@@ -2,21 +2,6 @@ package btree_core
 
 // import "container/list"
 
-// // --- Configuration & Constants ---
-
-// const (
-// 	DefaultPageSize          = 4096       // Bytes
-// 	FileHeaderPageID  PageID = 0          // Page ID for the database file header
-// 	InvalidPageID     PageID = 0          // Also used for header, but generally indicates invalid/unallocated
-// 	MaxFilenameLength        = 255        // Example limit
-// 	DBMagic           uint32 = 0x6010DB00 // GoJoDB00
-
-// 	// dbFileHeaderSize must be a fixed size that matches how it's written/read.
-// 	// We'll ensure DBFileHeader struct matches this.
-// 	dbFileHeaderSize = 128 // Increased size for more metadata
-// 	checksumSize     = 4   // Size of CRC32 checksum
-// )
-
 // // --- Page Management ---
 
 // // PageID represents a unique identifier for a page on disk.
