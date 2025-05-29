@@ -299,6 +299,23 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 		fmt.Fprintf(w, response)
 	})
 
+	// Endpoint to get all slot assignments
+	http.HandleFunc("/admin/get_all_slot_assignments", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		slotAssignments := c.fsm.GetAllSlotAssignments()
+		respBytes, err := json.Marshal(slotAssignments)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to marshal slot assignments: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(respBytes)
+	})
+
 	// --- Sharding Endpoints ---
 	// Endpoint to assign a range of slots to a Storage Node
 	http.HandleFunc("/admin/assign_slot_range", func(w http.ResponseWriter, r *http.Request) {
