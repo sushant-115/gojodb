@@ -35,6 +35,8 @@ The primary goals for GojoDB are:
 
 ## **High-Level Design**
 
+For detailed design checkout doc: https://docs.google.com/document/d/1kh8X3yKDaBk03Aa7z_Pp-rm8j2Sb-1Z8Owm_eKGecxY/edit?usp=sharing
+
 GojoDB's architecture is based on a distributed, microservice-oriented approach:
 
 * **Storage Tiers:**  
