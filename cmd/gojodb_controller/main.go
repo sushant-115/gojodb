@@ -3,12 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +16,8 @@ import (
 
 	"github.com/hashicorp/raft"                   // Raft library
 	raftboltdb "github.com/hashicorp/raft-boltdb" // BoltDB backend for Raft log and stable store
+
+	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm" // Our custom FSM
 )
 
 const (
@@ -27,15 +29,13 @@ const (
 	heartbeatInterval    = 5 * time.Second  // Interval for Storage Node heartbeats
 	heartbeatTimeout     = 15 * time.Second // Timeout for Storage Node health
 
-	// --- CHANGE: Default Heartbeat Listen Port ---
 	defaultHeartbeatListenPort = 8086 // Default UDP port for Storage Node heartbeats
-	// --- END CHANGE ---
 )
 
 // Controller represents a single GojoDB Controller Node.
 type Controller struct {
-	raft         *raft.Raft // Raft consensus mechanism
-	fsm          *GojoDBFSM // Our replicated state machine
+	raft         *raft.Raft     // Raft consensus mechanism
+	fsm          *fsm.GojoDBFSM // Our replicated state machine
 	raftDir      string
 	raftBindAddr string
 	nodeID       string
@@ -50,7 +50,7 @@ type Controller struct {
 // NewController creates and initializes a new Controller node.
 func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenPort int) (*Controller, error) {
 	c := &Controller{
-		fsm:                 NewGojoDBFSM(), // Initialize our FSM
+		fsm:                 fsm.NewGojoDBFSM(), // Initialize our FSM
 		raftDir:             raftDir,
 		raftBindAddr:        raftBindAddr,
 		nodeID:              nodeID,
@@ -217,8 +217,8 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 			}
 
 			// Apply the command through Raft
-			cmd := LogCommand{
-				Op:    OpSetMetadata,
+			cmd := fsm.LogCommand{
+				Op:    fsm.OpSetMetadata,
 				Key:   key,
 				Value: value,
 			}
@@ -264,6 +264,9 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 		storageNodes := c.fsm.GetStorageNodes()
 		storageNodeCount := c.fsm.GetStorageNodeCount()
 
+		// Get Slot Assignments from FSM (replicated state)
+		slotAssignments := c.fsm.GetAllSlotAssignments()
+
 		response := fmt.Sprintf("Node ID: %s\nState: %s\nLeader: %s\n\nRegistered Storage Nodes (%d):\n", c.nodeID, state, leaderAddr, storageNodeCount)
 		if storageNodeCount == 0 {
 			response += "  (None)\n"
@@ -273,18 +276,126 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 			}
 		}
 
+		response += "\nSlot Assignments:\n"
+		if len(slotAssignments) == 0 {
+			response += "  (None)\n"
+		} else {
+			// Sort slot ranges for consistent output
+			var sortedRanges []fsm.SlotRangeInfo
+			for _, sr := range slotAssignments {
+				sortedRanges = append(sortedRanges, sr)
+			}
+			sort.Slice(sortedRanges, func(i, j int) bool {
+				return sortedRanges[i].StartSlot < sortedRanges[j].StartSlot
+			})
+
+			for _, sr := range sortedRanges {
+				response += fmt.Sprintf("  - RangeID: %s (%d-%d), Assigned To: %s, Status: %s\n",
+					sr.RangeID, sr.StartSlot, sr.EndSlot, sr.AssignedNodeID, sr.Status)
+			}
+		}
+
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, response)
 	})
+
+	// --- Sharding Endpoints ---
+	// Endpoint to assign a range of slots to a Storage Node
+	http.HandleFunc("/admin/assign_slot_range", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		startSlotStr := r.URL.Query().Get("startSlot")
+		endSlotStr := r.URL.Query().Get("endSlot")
+		assignedNodeID := r.URL.Query().Get("assignedNodeID")
+
+		if startSlotStr == "" || endSlotStr == "" || assignedNodeID == "" {
+			http.Error(w, "startSlot, endSlot, and assignedNodeID are required", http.StatusBadRequest)
+			return
+		}
+
+		startSlot, err := strconv.Atoi(startSlotStr)
+		if err != nil {
+			http.Error(w, "invalid startSlot format", http.StatusBadRequest)
+			return
+		}
+		endSlot, err := strconv.Atoi(endSlotStr)
+		if err != nil {
+			http.Error(w, "invalid endSlot format", http.StatusBadRequest)
+			return
+		}
+
+		if startSlot < 0 || endSlot >= fsm.TotalHashSlots || startSlot > endSlot {
+			http.Error(w, fmt.Sprintf("invalid slot range [%d, %d). Must be within [0, %d) and start <= end.", startSlot, endSlot, fsm.TotalHashSlots), http.StatusBadRequest)
+			return
+		}
+
+		// Create the SlotRangeInfo
+		slotInfo := fsm.SlotRangeInfo{
+			RangeID:        fmt.Sprintf("%d-%d", startSlot, endSlot),
+			StartSlot:      startSlot,
+			EndSlot:        endSlot,
+			AssignedNodeID: assignedNodeID,
+			Status:         "active", // Default status
+			LastUpdated:    time.Now(),
+		}
+
+		slotInfoBytes, err := json.Marshal(slotInfo)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to marshal SlotRangeInfo: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		cmd := fsm.LogCommand{
+			Op:    fsm.OpAssignSlotRange,
+			Key:   slotInfo.RangeID, // Key is the RangeID
+			Value: string(slotInfoBytes),
+		}
+		cmdBytes, err := json.Marshal(cmd)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to marshal command: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		applyFuture := c.raft.Apply(cmdBytes, 5*time.Second)
+		if applyFuture.Error() != nil {
+			http.Error(w, fmt.Sprintf("failed to apply command: %v", applyFuture.Error()), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Slot range %s assigned to %s successfully.", slotInfo.RangeID, assignedNodeID)
+	})
+
+	// Endpoint to get the assigned node for a specific key
+	http.HandleFunc("/admin/get_node_for_key", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "key is required", http.StatusBadRequest)
+			return
+		}
+
+		nodeID, found := c.fsm.GetNodeForHashKey(key)
+		if !found {
+			http.Error(w, fmt.Sprintf("No storage node found for key '%s' (slot %d).", key, fsm.GetSlotForHashKey(key)), http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Key '%s' (slot %d) is assigned to Storage Node: %s", key, fsm.GetSlotForHashKey(key), nodeID)
+	})
+	// --- End Sharding Endpoints ---
 
 	log.Fatal(http.ListenAndServe(httpAddr, nil))
 }
 
 // startHeartbeatListener starts a UDP listener for Storage Node heartbeats.
 func (c *Controller) startHeartbeatListener() {
-	// --- CHANGE: Use configurable heartbeatListenPort ---
 	addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(c.heartbeatListenPort))
-	// --- END CHANGE ---
 	if err != nil {
 		log.Fatalf("FATAL: Failed to resolve UDP address for heartbeat listener: %v", err)
 	}
@@ -324,10 +435,10 @@ func (c *Controller) recordHeartbeat(nodeID string, addr string) {
 	c.localHeartbeatMap[nodeID] = time.Now() // Update local heartbeat time
 	c.storageNodesMu.Unlock()
 
-	// If this Controller node is the Raft leader, apply the state change to the
+	// If this Controller node is the Raft leader, apply the state change to the FSM.
 	if c.raft.State() == raft.Leader {
-		cmd := LogCommand{
-			Op:    OpUpdateNodeStatus, // Use OpUpdateNodeStatus to add or update
+		cmd := fsm.LogCommand{
+			Op:    fsm.OpUpdateNodeStatus, // Use OpUpdateNodeStatus to add or update
 			Key:   nodeID,
 			Value: addr, // Store the address or a more complex status object
 		}
@@ -342,7 +453,7 @@ func (c *Controller) recordHeartbeat(nodeID string, addr string) {
 		if applyFuture.Error() != nil {
 			log.Printf("ERROR: Failed to apply heartbeat command for %s to Raft: %v", nodeID, applyFuture.Error())
 		} else {
-			log.Printf("DEBUG: Applied heartbeat for Storage Node %s (%s) to Raft ", nodeID, addr)
+			log.Printf("DEBUG: Applied heartbeat for Storage Node %s (%s) to Raft FSM.", nodeID, addr)
 		}
 	} else {
 		log.Printf("DEBUG: Received heartbeat from Storage Node %s (%s) but not leader. Not applying to Raft.", nodeID, addr)
@@ -369,8 +480,8 @@ func (c *Controller) monitorStorageNodes() {
 
 				// If this Controller is the leader, apply a state change to remove the node.
 				if c.raft.State() == raft.Leader {
-					cmd := LogCommand{
-						Op:  OpRemoveStorageNode,
+					cmd := fsm.LogCommand{
+						Op:  fsm.OpRemoveStorageNode,
 						Key: nodeID,
 					}
 					cmdBytes, err := json.Marshal(cmd)
@@ -382,7 +493,7 @@ func (c *Controller) monitorStorageNodes() {
 					if applyFuture.Error() != nil {
 						log.Printf("ERROR: Failed to apply remove node command for %s to Raft: %v", nodeID, applyFuture.Error())
 					} else {
-						log.Printf("DEBUG: Applied removal command for Storage Node %s to Raft ", nodeID)
+						log.Printf("DEBUG: Applied removal command for Storage Node %s to Raft FSM.", nodeID)
 					}
 				} else {
 					log.Printf("DEBUG: Storage Node %s timed out, but not leader. Not applying removal to Raft.", nodeID)
@@ -428,7 +539,7 @@ func main() {
 	}
 	joinAddr := os.Getenv("JOIN_ADDR") // Optional: address of an existing node to join
 
-	// --- CHANGE: Configurable Heartbeat Listen Port for Controller ---
+	// Configurable Heartbeat Listen Port for Controller
 	heartbeatListenPortStr := os.Getenv("HEARTBEAT_LISTEN_PORT")
 	heartbeatListenPort := defaultHeartbeatListenPort
 	if heartbeatListenPortStr != "" {
@@ -438,13 +549,12 @@ func main() {
 		}
 		heartbeatListenPort = parsedPort
 	}
-	// --- END CHANGE ---
 
 	// Simulated Storage Node parameters (for testing heartbeat integration)
 	storageNodeID := os.Getenv("STORAGE_NODE_ID")
 	storageNodeAddr := os.Getenv("STORAGE_NODE_ADDR") // e.g., "localhost:9000"
 
-	// --- CHANGE: Configurable Heartbeat Target Port for Simulated Storage Node ---
+	// Configurable Heartbeat Target Port for Simulated Storage Node
 	heartbeatTargetPortStr := os.Getenv("HEARTBEAT_TARGET_PORT")
 	heartbeatTargetPort := defaultHeartbeatListenPort // Default to Controller's default if not specified
 	if heartbeatTargetPortStr != "" {
@@ -454,7 +564,6 @@ func main() {
 		}
 		heartbeatTargetPort = parsedPort
 	}
-	// --- END CHANGE ---
 
 	// Clean up old Raft data for a fresh start (for testing purposes)
 	raftDataPath := filepath.Join(defaultRaftDir, nodeID)
@@ -496,197 +605,4 @@ func main() {
 
 	// Keep the main goroutine alive
 	select {}
-}
-
-// LogCommand defines the structure of commands applied to the FSM via Raft.
-// This is what gets replicated.
-type LogCommand struct {
-	Op    string `json:"op"`    // Operation type (e.g., "set_metadata", "add_node", "remove_node")
-	Key   string `json:"key"`   // Key for the operation
-	Value string `json:"value"` // Value for the operation (e.g., metadata value, node address)
-	// Add other fields as needed for specific command types
-}
-
-// Operation types for the FSM
-const (
-	OpSetMetadata       = "set_metadata"
-	OpDeleteMetadata    = "delete_metadata"
-	OpAddStorageNode    = "add_storage_node"
-	OpRemoveStorageNode = "remove_storage_node"
-	OpUpdateNodeStatus  = "update_node_status" // For more granular node status
-)
-
-// GojoDBFSM implements the raft.FSM interface.
-// It holds the replicated state of the Control Plane.
-type GojoDBFSM struct {
-	mu               sync.RWMutex
-	metadata         map[string]string // Replicated metadata (e.g., table schema, config)
-	storageNodes     map[string]string // Replicated active Storage Node IDs -> Address (or more complex status)
-	lastAppliedIndex uint64            // The last Raft log index applied to this FSM
-}
-
-// NewGojoDBFSM creates a new instance of GojoDBFSM.
-func NewGojoDBFSM() *GojoDBFSM {
-	return &GojoDBFSM{
-		metadata:     make(map[string]string),
-		storageNodes: make(map[string]string),
-	}
-}
-
-// Apply applies a Raft log entry to the FSM.
-// This method is called by Raft on the leader and followers to update the state machine.
-func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
-	var cmd LogCommand
-	if err := json.Unmarshal(logEntry.Data, &cmd); err != nil {
-		log.Printf("ERROR: Failed to unmarshal Raft log entry: %v", err)
-		return nil // Should not happen with valid commands
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.lastAppliedIndex = logEntry.Index // Update the last applied index
-
-	switch cmd.Op {
-	case OpSetMetadata:
-		f.metadata[cmd.Key] = cmd.Value
-		log.Printf("DEBUG: FSM applied: Set metadata '%s' = '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
-		return nil
-	case OpDeleteMetadata:
-		delete(f.metadata, cmd.Key)
-		log.Printf("DEBUG: FSM applied: Deleted metadata '%s' (Index: %d)", cmd.Key, logEntry.Index)
-		return nil
-	case OpAddStorageNode:
-		f.storageNodes[cmd.Key] = cmd.Value // Key is NodeID, Value is Address
-		log.Printf("DEBUG: FSM applied: Added Storage Node '%s' at '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
-		return nil
-	case OpRemoveStorageNode:
-		delete(f.storageNodes, cmd.Key)
-		log.Printf("DEBUG: FSM applied: Removed Storage Node '%s' (Index: %d)", cmd.Key, logEntry.Index)
-		return nil
-	case OpUpdateNodeStatus:
-		// This could be a more complex update, e.g., for health status
-		f.storageNodes[cmd.Key] = cmd.Value // Update status/address
-		log.Printf("DEBUG: FSM applied: Updated Storage Node '%s' status to '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
-		return nil
-	default:
-		log.Printf("WARNING: Unknown FSM command operation: %s (Index: %d)", cmd.Op, logEntry.Index)
-		return fmt.Errorf("unknown FSM command operation: %s", cmd.Op)
-	}
-}
-
-// Snapshot returns a snapshot of the FSM's state.
-// This is used by Raft to truncate the log and recover faster.
-func (f *GojoDBFSM) Snapshot() (raft.FSMSnapshot, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	// Create a deep copy of the current state
-	metadataCopy := make(map[string]string)
-	for k, v := range f.metadata {
-		metadataCopy[k] = v
-	}
-	storageNodesCopy := make(map[string]string)
-	for k, v := range f.storageNodes {
-		storageNodesCopy[k] = v
-	}
-
-	log.Printf("DEBUG: FSM Snapshot created at index %d", f.lastAppliedIndex)
-	return &gojoDBFSMSnapshot{
-		metadata:     metadataCopy,
-		storageNodes: storageNodesCopy,
-	}, nil
-}
-
-// Restore restores the FSM's state from a snapshot.
-// This is used by Raft when a node joins a cluster or recovers from a crash.
-func (f *GojoDBFSM) Restore(rc io.ReadCloser) error {
-	defer rc.Close()
-
-	var snapshotData struct {
-		Metadata     map[string]string `json:"metadata"`
-		StorageNodes map[string]string `json:"storage_nodes"`
-	}
-
-	if err := json.NewDecoder(rc).Decode(&snapshotData); err != nil {
-		return fmt.Errorf("failed to decode FSM snapshot: %w", err)
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.metadata = snapshotData.Metadata
-	f.storageNodes = snapshotData.StorageNodes
-	// Note: lastAppliedIndex is typically restored by Raft itself, not the FSM.
-	// The FSM's Apply method will continue from the next log entry.
-
-	log.Println("INFO: FSM state restored from snapshot.")
-	return nil
-}
-
-// --- FSM Query Methods (Read-only access to the state) ---
-
-// GetMetadata retrieves a metadata value.
-func (f *GojoDBFSM) GetMetadata(key string) (string, bool) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	val, ok := f.metadata[key]
-	return val, ok
-}
-
-// GetStorageNodes returns a copy of the current storage node map.
-func (f *GojoDBFSM) GetStorageNodes() map[string]string {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	copyMap := make(map[string]string)
-	for k, v := range f.storageNodes {
-		copyMap[k] = v
-	}
-	return copyMap
-}
-
-// GetStorageNodeCount returns the number of active storage nodes.
-func (f *GojoDBFSM) GetStorageNodeCount() int {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return len(f.storageNodes)
-}
-
-// --- FSMSnapshot Implementation ---
-
-// gojoDBFSMSnapshot implements the raft.FSMSnapshot interface.
-type gojoDBFSMSnapshot struct {
-	metadata     map[string]string
-	storageNodes map[string]string
-}
-
-// Persist writes the snapshot to the given sink.
-func (s *gojoDBFSMSnapshot) Persist(sink raft.SnapshotSink) error {
-	defer sink.Close()
-
-	snapshotData := struct {
-		Metadata     map[string]string `json:"metadata"`
-		StorageNodes map[string]string `json:"storage_nodes"`
-	}{
-		Metadata:     s.metadata,
-		StorageNodes: s.storageNodes,
-	}
-
-	bytes, err := json.Marshal(snapshotData)
-	if err != nil {
-		return fmt.Errorf("failed to marshal FSM snapshot: %w", err)
-	}
-
-	if _, err := sink.Write(bytes); err != nil {
-		return fmt.Errorf("failed to write FSM snapshot to sink: %w", err)
-	}
-
-	log.Println("DEBUG: FSM Snapshot persisted.")
-	return nil
-}
-
-// Release is called when the snapshot is no longer needed.
-func (s *gojoDBFSMSnapshot) Release() {
-	log.Println("DEBUG: FSM Snapshot released.")
-	// No-op for in-memory snapshot data after it's persisted.
 }
