@@ -17,6 +17,8 @@ import (
 	// Our custom FSM
 )
 
+// NODE_ID=node1 RAFT_BIND_ADDR=localhost:8081 HTTP_ADDR=localhost:8080 HEARTBEAT_ADDR=localhost:8082 go run main.go
+
 const (
 	defaultRaftPort      = 8081
 	defaultHTTPPort      = 8082
@@ -327,14 +329,14 @@ func (c *Controller) monitorStorageNodes() {
 			if time.Since(lastHeartbeat) > heartbeatTimeout {
 				log.Printf("WARNING: Storage Node %s timed out (last heartbeat: %v ago). Marking as unhealthy.", nodeID, time.Since(lastHeartbeat))
 				// Optionally, apply a state change through Raft to remove/mark unhealthy
-				// if c.raft.State() == raft.Leader {
-				//     cmd := LogCommand{
-				//         Op:    OpRemoveNode,
-				//         Key:   nodeID,
-				//     }
-				//     cmdBytes, _ := json.Marshal(cmd)
-				//     c.raft.Apply(cmdBytes, 5*time.Second)
-				// }
+				if c.raft.State() == raft.Leader {
+					cmd := LogCommand{
+						Op:  OpRemoveNode,
+						Key: nodeID,
+					}
+					cmdBytes, _ := json.Marshal(cmd)
+					c.raft.Apply(cmdBytes, 5*time.Second)
+				}
 				delete(c.storageNodes, nodeID) // Remove from in-memory map
 			}
 		}
@@ -358,6 +360,7 @@ const (
 	OpAddStorageNode    = "add_storage_node"
 	OpRemoveStorageNode = "remove_storage_node"
 	OpUpdateNodeStatus  = "update_node_status" // For more granular node status
+	OpRemoveNode        = "remove_node"
 )
 
 // GojoDBFSM implements the raft.FSM interface.
