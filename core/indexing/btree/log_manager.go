@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -251,6 +252,220 @@ func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
 	log.Printf("DEBUG: Appended log record LSN %d (Type: %v, PageID: %d, Size: %d) to segment %d",
 		record.LSN, record.Type, record.PageID, len(serializedRecord), lm.currentSegmentID)
 	return record.LSN, nil
+}
+
+func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN LSN) error {
+	log.Println("INFO: Starting LogManager recovery process (Redo Pass)...")
+
+	// In a full recovery, you'd first perform an Analysis Pass to build
+	// a transaction table and dirty page table from the log.
+	// For this basic Redo Pass, we'll simply reapply all logged changes.
+
+	// 1. Collect all log segments (archived and active) in order.
+	var segmentPaths []string
+
+	// Add archived segments
+	archiveFiles, err := os.ReadDir(lm.archiveDir)
+	if err != nil {
+		return fmt.Errorf("failed to read archive directory: %w", err)
+	}
+	for _, file := range archiveFiles {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
+			segmentPaths = append(segmentPaths, filepath.Join(lm.archiveDir, file.Name()))
+		}
+	}
+
+	// Add active segments (from logDir)
+	logFiles, err := os.ReadDir(lm.logDir)
+	if err != nil {
+		return fmt.Errorf("failed to read log directory: %w", err)
+	}
+	for _, file := range logFiles {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
+			segmentPaths = append(segmentPaths, filepath.Join(lm.logDir, file.Name()))
+		}
+	}
+
+	// Sort segments by their ID to ensure correct replay order
+	sort.Slice(segmentPaths, func(i, j int) bool {
+		id1, _ := strconv.ParseUint(strings.TrimSuffix(strings.Split(filepath.Base(segmentPaths[i]), "_")[1], ".log"), 10, 64)
+		id2, _ := strconv.ParseUint(strings.TrimSuffix(strings.Split(filepath.Base(segmentPaths[j]), "_")[1], ".log"), 10, 64)
+		return id1 < id2
+	})
+
+	// 2. Iterate through each log segment and replay records.
+	var currentGlobalLSN LSN = 0 // Track global LSN for recovery progress
+	for _, segmentPath := range segmentPaths {
+		log.Printf("INFO: Recovering from log segment: %s", segmentPath)
+		segmentFile, err := os.Open(segmentPath)
+		if err != nil {
+			return fmt.Errorf("failed to open log segment %s for recovery: %w", segmentPath, err)
+		}
+		defer segmentFile.Close() // Close each segment file after processing
+
+		reader := io.Reader(segmentFile)
+		for {
+			var lr LogRecord
+			// recordStartOffset := currentGlobalLSN // LSN of this record
+
+			// Attempt to read and deserialize a single log record.
+			// This requires knowing the size of the record beforehand, which is tricky
+			// for variable-length records without a length prefix.
+			// A common pattern is to prefix each log record with its total size.
+			// For now, we'll try to deserialize directly, assuming the reader will stop at EOF.
+			// This might lead to `io.ErrUnexpectedEOF` if a record is truncated.
+
+			// To handle variable length records, we need to read the fixed size header first,
+			// then read the lengths of OldData/NewData, then read the data.
+			// Let's create a temporary buffer to read the fixed part first.
+			fixedHeaderBuf := make([]byte, 8+8+8+1+8+2) // LSN, PrevLSN, TxnID, Type, PageID, Offset
+			n, err := io.ReadFull(reader, fixedHeaderBuf)
+			if err == io.EOF {
+				break // End of segment file
+			}
+			if err != nil {
+				return fmt.Errorf("failed to read fixed log record header from %s: %w", segmentPath, err)
+			}
+			if n != len(fixedHeaderBuf) {
+				return fmt.Errorf("short read for fixed log record header from %s", segmentPath)
+			}
+
+			// Now deserialize the fixed part to get lengths of variable fields
+			tempRecord := LogRecord{}
+			tempReader := bytes.NewReader(fixedHeaderBuf)
+			binary.Read(tempReader, binary.LittleEndian, &tempRecord.LSN)
+			binary.Read(tempReader, binary.LittleEndian, &tempRecord.PrevLSN)
+			binary.Read(tempReader, binary.LittleEndian, &tempRecord.TxnID)
+			binary.Read(tempReader, binary.LittleEndian, &tempRecord.Type)
+			binary.Read(tempReader, binary.LittleEndian, &tempRecord.PageID)
+			binary.Read(tempReader, binary.LittleEndian, &tempRecord.Offset)
+
+			var oldDataLen, newDataLen uint16
+			if err := binary.Read(reader, binary.LittleEndian, &oldDataLen); err != nil {
+				if err == io.EOF {
+					break
+				} // Truncated record at end of file
+				return fmt.Errorf("failed to read oldDataLen: %w", err)
+			}
+			if err := binary.Read(reader, binary.LittleEndian, &newDataLen); err != nil {
+				if err == io.EOF {
+					break
+				} // Truncated record at end of file
+				return fmt.Errorf("failed to read newDataLen: %w", err)
+			}
+
+			lr.OldData = make([]byte, oldDataLen)
+			if _, err := io.ReadFull(reader, lr.OldData); err != nil {
+				if err == io.EOF {
+					break
+				} // Truncated record at end of file
+				return fmt.Errorf("failed to read OldData: %w", err)
+			}
+			lr.NewData = make([]byte, newDataLen)
+			if _, err := io.ReadFull(reader, lr.NewData); err != nil {
+				if err == io.EOF {
+					break
+				} // Truncated record at end of file
+				return fmt.Errorf("failed to read NewData: %w", err)
+			}
+
+			// Now fill the rest of lr from tempRecord
+			lr.LSN = tempRecord.LSN
+			lr.PrevLSN = tempRecord.PrevLSN
+			lr.TxnID = tempRecord.TxnID
+			lr.Type = tempRecord.Type
+			lr.PageID = tempRecord.PageID
+			lr.Offset = tempRecord.Offset
+
+			// --- Redo Pass Logic ---
+			// Only apply if the page's LSN on disk is older than this log record's LSN.
+			// This requires reading the page's current LSN from its header on disk.
+			// For now, we assume the page's LSN is not persisted within the page data itself,
+			// so we'll just apply the change if `lr.LSN >= lastLSN` (from DB header).
+			// A more robust system would persist page LSNs within the page data.
+
+			// For simplicity, we'll apply all records with LSN >= lastLSN from DB header.
+			// This is a simplified Redo-all approach.
+			if lr.LSN >= lastLSN {
+				log.Printf("DEBUG: Replaying log record LSN %d (Type: %v, PageID: %d)", lr.LSN, lr.Type, lr.PageID)
+
+				// Fetch the page from disk (don't use BPM for recovery reads to avoid cache pollution)
+				// Or, use BPM if it has a way to fetch without pinning/LRU updates.
+				// For simplicity, we'll use DiskManager directly for recovery reads/writes.
+				pageData := make([]byte, dm.pageSize)
+
+				// Read page from disk (it might not exist if it's a new page log record)
+				readErr := dm.ReadPage(lr.PageID, pageData)
+				if readErr != nil && lr.Type != LogRecordTypeNewPage {
+					// If it's not a new page record, and we can't read it, it's an error.
+					log.Printf("WARNING: Failed to read page %d for recovery replay: %v. Skipping record LSN %d.", lr.PageID, readErr, lr.LSN)
+					// A real system might panic or require manual intervention here.
+					currentGlobalLSN += LSN(lr.Size()) // Advance LSN even on error
+					continue
+				} else if readErr != nil && lr.Type == LogRecordTypeNewPage {
+					// If it's a new page record and it doesn't exist, it's fine.
+					// We'll allocate it if needed.
+					log.Printf("DEBUG: Page %d not found on disk, but it's a new page record. Will allocate if needed.", lr.PageID)
+				}
+
+				// Apply the change based on log record type
+				switch lr.Type {
+				case LogRecordTypeNewPage:
+					// Ensure the page exists on disk. If it was truncated, re-allocate.
+					// This is a simplified allocation. A real system would use free list.
+					// We assume dm.numPages is the highest allocated ID.
+					if lr.PageID.GetID() >= dm.numPages {
+						log.Printf("INFO: Re-allocating page %d during recovery (was truncated or never allocated).", lr.PageID)
+						// This might involve extending the file to ensure this page ID exists.
+						// The simplest way is to write an empty page at that offset.
+						emptyPage := make([]byte, dm.pageSize)
+						if writeErr := dm.WritePage(lr.PageID, emptyPage); writeErr != nil {
+							return fmt.Errorf("failed to re-allocate new page %d during recovery: %w", lr.PageID, writeErr)
+						}
+						// Update dm.numPages if this extended the file
+						if lr.PageID >= PageID(dm.numPages) {
+							dm.numPages = uint64(lr.PageID) + 1
+						}
+					}
+					// No data to apply, just ensures existence.
+					// If NewData was logged (e.g., initial empty node data), apply it here.
+					if len(lr.NewData) > 0 {
+						if writeErr := dm.WritePage(lr.PageID, lr.NewData); writeErr != nil {
+							return fmt.Errorf("failed to write new page data for %d during recovery: %w", lr.PageID, writeErr)
+						}
+					}
+				case LogRecordTypeUpdate:
+					// Apply NewData to the page
+					copy(pageData, lr.NewData) // Overwrite page data with new data
+					if writeErr := dm.WritePage(lr.PageID, pageData); writeErr != nil {
+						return fmt.Errorf("failed to write updated page %d during recovery: %w", lr.PageID, writeErr)
+					}
+				// TODO: Add cases for other LogRecordTypes (InsertKey, DeleteKey, NodeSplit, NodeMerge)
+				// These would require understanding the byte format within the page.
+				// For now, LogRecordTypeUpdate is a generic page overwrite.
+				default:
+					log.Printf("WARNING: Unhandled log record type %v during recovery for LSN %d. Skipping.", lr.Type, lr.LSN)
+				}
+			}
+			currentGlobalLSN += LSN(lr.Size()) // Advance global LSN
+		}
+	}
+
+	// 3. After replaying all necessary logs, update the DBFileHeader's LastLSN.
+	// This marks the point up to which recovery has completed.
+	// We use the current LSN of the LogManager as the new LastLSN.
+	lm.mu.Lock() // Acquire lock as we're reading lm.currentLSN
+	finalLSN := lm.currentLSN
+	lm.mu.Unlock()
+
+	if err := dm.UpdateHeaderField(func(h *DBFileHeader) {
+		h.LastLSN = finalLSN
+	}); err != nil {
+		return fmt.Errorf("failed to update DBFileHeader LastLSN after recovery: %w", err)
+	}
+
+	log.Println("INFO: LogManager recovery process (Redo Pass) complete.")
+	return nil
 }
 
 // Flush ensures all log records up to a certain LSN (or all if targetLSN is InvalidLSN) are written to disk.

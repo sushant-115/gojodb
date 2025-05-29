@@ -185,17 +185,28 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 
 	bpm := NewBufferPoolManager(poolSize, dm, logManager)
 
-	// --- TODO: Recovery Process using LogManager and BPM ---
+	// --- CRITICAL FIX: Recovery Process using LogManager and BPM ---
 	// This is where you would implement database recovery.
 	// 1. Analysis Pass (scan WAL to find last checkpoint and active transactions)
-	// 2. Redo Pass (replay WAL records to bring pages up to date)
+	// 2. Redo Pass (replay WAL records for committed changes not on disk, ensuring pageLSN consistency)
 	// 3. Undo Pass (rollback uncommitted transactions if any)
-	// After recovery, header.LastLSN and page LSNs would be consistent.
-	// if lm, ok := logManager.(*LogManager); ok {
-	//    if err := lm.Recover(bpm, header.LastLSN); err != nil {
-	//        dm.Close(); return nil, fmt.Errorf("recovery failed: %w", err)
-	//    }
-	// }
+	if logManager != nil {
+		log.Println("INFO: Starting database recovery process...")
+		if err := logManager.Recover(dm, bpm, header.LastLSN); err != nil {
+			dm.Close()
+			return nil, fmt.Errorf("database recovery failed: %w", err)
+		}
+		log.Println("INFO: Database recovery complete.")
+		// After recovery, the header's LastLSN might need to be updated if the recovery process
+		// wrote new log records (e.g., compensation logs for undo).
+		// For now, we assume recovery just applies changes and doesn't write new logs to header.
+		// A more robust recovery would read the latest LSN after recovery and update header.
+		// For simplicity, we re-read header after recovery.
+		if err := dm.readHeader(header); err != nil { // Re-read header after potential recovery changes
+			dm.Close()
+			return nil, fmt.Errorf("failed to re-read header after recovery: %w", err)
+		}
+	}
 
 	// Re-read header after potential recovery changes if recovery can modify it
 	// For now, assume header is correct after open.

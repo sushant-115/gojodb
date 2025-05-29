@@ -25,6 +25,10 @@ type Page struct {
 	lruElement *list.Element // Pointer to the element in LRU list
 }
 
+func (p *PageID) GetID() uint64 {
+	return uint64(*p)
+}
+
 // NewPage creates a new Page instance.
 func NewPage(id PageID, size int) *Page {
 	return &Page{

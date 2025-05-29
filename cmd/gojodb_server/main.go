@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"sync" // For global B-Tree lock
 
@@ -29,7 +28,7 @@ const (
 
 // Global database instance and its lock for simple concurrency control
 var (
-	dbInstance *btree_core.BTree[int64, string]
+	dbInstance *btree_core.BTree[string, string]
 	dbLock     sync.RWMutex // Global lock for the entire B-Tree operations
 	logManager *btree_core.LogManager
 )
@@ -37,7 +36,7 @@ var (
 // Request represents a parsed client request.
 type Request struct {
 	Command string
-	Key     int64
+	Key     string
 	Value   string // Only for PUT
 }
 
@@ -58,12 +57,12 @@ func initDatabase() error {
 	}
 
 	// Try to open existing database first
-	dbInstance, err = btree_core.OpenBTreeFile[int64, string](
+	dbInstance, err = btree_core.OpenBTreeFile[string, string](
 		dbFilePath,
-		btree_core.DefaultKeyOrder[int64],
-		btree_core.KeyValueSerializer[int64, string]{
-			SerializeKey:     btree_core.SerializeInt64,
-			DeserializeKey:   btree_core.DeserializeInt64,
+		btree_core.DefaultKeyOrder[string],
+		btree_core.KeyValueSerializer[string, string]{
+			SerializeKey:     btree_core.SerializeString,
+			DeserializeKey:   btree_core.DeserializeString,
 			SerializeValue:   btree_core.SerializeString,
 			DeserializeValue: btree_core.DeserializeString,
 		},
@@ -76,13 +75,13 @@ func initDatabase() error {
 		// If file not found, create a new one
 		if os.IsNotExist(err) || strings.Contains(err.Error(), "database file not found") { // Check for specific error message
 			log.Printf("INFO: Database file %s not found. Creating new database.", dbFilePath)
-			dbInstance, err = btree_core.NewBTreeFile[int64, string](
+			dbInstance, err = btree_core.NewBTreeFile[string, string](
 				dbFilePath,
 				bTreeDegree,
-				btree_core.DefaultKeyOrder[int64],
-				btree_core.KeyValueSerializer[int64, string]{
-					SerializeKey:     btree_core.SerializeInt64,
-					DeserializeKey:   btree_core.DeserializeInt64,
+				btree_core.DefaultKeyOrder[string],
+				btree_core.KeyValueSerializer[string, string]{
+					SerializeKey:     btree_core.SerializeString,
+					DeserializeKey:   btree_core.DeserializeString,
 					SerializeValue:   btree_core.SerializeString,
 					DeserializeValue: btree_core.DeserializeString,
 				},
@@ -133,20 +132,14 @@ func parseRequest(raw string) (Request, error) {
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PUT requires key and value")
 		}
-		key, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid key format: %w", err)
-		}
+		key := parts[1]
 		req.Key = key
 		req.Value = strings.Join(parts[2:], " ") // Value can contain spaces
 	case "GET", "DELETE":
 		if len(parts) < 2 {
 			return Request{}, fmt.Errorf("%s requires a key", command)
 		}
-		key, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid key format: %w", err)
-		}
+		key := parts[1]
 		req.Key = key
 	case "SIZE":
 		// No additional arguments needed
