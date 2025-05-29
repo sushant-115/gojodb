@@ -236,6 +236,10 @@ func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
 	return node, page, nil
 }
 
+func (bt *BTree[K, V]) DeallocatePage(pageID PageID) error {
+	return bt.diskManager.DeallocatePage(pageID)
+}
+
 // GetSize reads the persisted tree size from the file header.
 func (bt *BTree[K, V]) GetSize() (uint64, error) {
 	var header DBFileHeader
@@ -415,12 +419,28 @@ func (bt *BTree[K, V]) Insert(key K, value V) error {
 		}
 		log.Printf("DEBUG: Root split complete. New root %d, Old root %d", newRootPageID, oldRootPageID)
 
-		// After splitting, insert the key into the new (non-full) root node.
-		// `newRootNode` is modified in memory by `splitChild`. We need to fetch it again
-		// to ensure we have the latest state (as `splitChild` would serialize it).
+		// --- CRITICAL FIX: Serialize the newRootNode after it's modified by splitChild ---
+		// The splitChild method modifies newRootNode (the parent) in memory and marks newRootDiskPage dirty.
+		// But it does NOT serialize newRootNode to newRootDiskPage.
+		// We must do that here before attempting to re-fetch it.
+		if errS := newRootNode.serialize(newRootDiskPage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
+			// If serialization fails, unpin the page and return error.
+			bt.bpm.UnpinPage(newRootDiskPage.GetPageID(), false) // Unpin even if serialize failed
+			return fmt.Errorf("failed to serialize new root node %d after split: %w", newRootPageID, errS)
+		}
+		// Unpin newRootDiskPage here, as it's now serialized and dirty.
+		// The subsequent fetchNode will re-pin it.
+		if errU := bt.bpm.UnpinPage(newRootDiskPage.GetPageID(), true); errU != nil {
+			return fmt.Errorf("failed to unpin new root page %d after serialization: %w", newRootPageID, errU)
+		}
+		// --- END CRITICAL FIX ---
+
+		// Re-fetch newRoot to insert into it, as splitChild only modified it in memory before serializing
+		// This is inefficient. splitChild should ideally return the modified parent node.
+		// For now, fetch it again.
 		reloadedNewRootNode, reloadedNewRootPage, fetchErr := bt.fetchNode(newRootPageID)
 		if fetchErr != nil {
-			return fmt.Errorf("failed to re-fetch new root node after split: %w", fetchErr)
+			return fetchErr
 		}
 		return bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists)
 	} else {
