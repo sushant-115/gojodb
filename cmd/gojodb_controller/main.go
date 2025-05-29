@@ -9,25 +9,27 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"                   // Raft library
 	raftboltdb "github.com/hashicorp/raft-boltdb" // BoltDB backend for Raft log and stable store
-	// Our custom FSM
 )
-
-// NODE_ID=node1 RAFT_BIND_ADDR=localhost:8081 HTTP_ADDR=localhost:8080 HEARTBEAT_ADDR=localhost:8082 go run main.go
 
 const (
 	defaultRaftPort      = 8081
-	defaultHTTPPort      = 8082
-	defaultUDPPort       = 8083
+	defaultHTTPPort      = 8080
 	defaultNodeID        = "node1"
 	defaultRaftDir       = "raft_data"
 	defaultRaftSnapshots = 2                // Number of Raft snapshots to retain
 	heartbeatInterval    = 5 * time.Second  // Interval for Storage Node heartbeats
 	heartbeatTimeout     = 15 * time.Second // Timeout for Storage Node health
+
+	// --- CHANGE: Default Heartbeat Listen Port ---
+	defaultHeartbeatListenPort = 8086 // Default UDP port for Storage Node heartbeats
+	// --- END CHANGE ---
 )
 
 // Controller represents a single GojoDB Controller Node.
@@ -39,19 +41,21 @@ type Controller struct {
 	nodeID       string
 
 	// Node Manager (Initial)
-	storageNodes      map[string]time.Time // NodeID -> LastHeartbeatTime
-	storageNodesMu    sync.Mutex
-	heartbeatListener *net.UDPConn // Listener for incoming heartbeats from Storage Nodes
+	localHeartbeatMap   map[string]time.Time // Local map to track last heartbeat time for timeout detection
+	storageNodesMu      sync.Mutex           // Protects local heartbeat tracking map
+	heartbeatListener   *net.UDPConn         // Listener for incoming heartbeats from Storage Nodes
+	heartbeatListenPort int                  // Configurable UDP port for heartbeats
 }
 
 // NewController creates and initializes a new Controller node.
-func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, udpAddr string) (*Controller, error) {
+func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenPort int) (*Controller, error) {
 	c := &Controller{
-		fsm:          NewGojoDBFSM(), // Initialize our FSM
-		raftDir:      raftDir,
-		raftBindAddr: raftBindAddr,
-		nodeID:       nodeID,
-		storageNodes: make(map[string]time.Time),
+		fsm:                 NewGojoDBFSM(), // Initialize our FSM
+		raftDir:             raftDir,
+		raftBindAddr:        raftBindAddr,
+		nodeID:              nodeID,
+		localHeartbeatMap:   make(map[string]time.Time), // Initialize local map
+		heartbeatListenPort: heartbeatListenPort,        // Set configurable port
 	}
 
 	// Setup Raft
@@ -63,7 +67,7 @@ func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir 
 	go c.startHTTPServer(httpAddr)
 
 	// Start Heartbeat Listener for Storage Nodes
-	go c.startHeartbeatListener(udpAddr)
+	go c.startHeartbeatListener()
 
 	// Start background goroutine for monitoring Storage Nodes
 	go c.monitorStorageNodes()
@@ -81,7 +85,7 @@ func (c *Controller) setupRaft(joinAddr string) error {
 	// Setup Raft configuration
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(c.nodeID)
-	config.Logger = nil
+	config.Logger = nil // Raft-specific logger
 
 	// Setup Raft transport
 	addr, err := net.ResolveTCPAddr("tcp", c.raftBindAddr)
@@ -251,26 +255,36 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 		}
 	})
 
-	// Add endpoint to check Raft leader status
+	// Endpoint to check Raft leader status and Storage Node status
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		state := c.raft.State().String()
 		leaderAddr := c.raft.Leader()
+
+		// Get Storage Node status from FSM (replicated state)
 		storageNodes := c.fsm.GetStorageNodes()
-		status := fmt.Sprintf("Node ID: %s, State: %s, Leader: %s , Cluster Status: %s", c.nodeID, state, leaderAddr, c.raft.String())
-		status += fmt.Sprintf("Cluster Details")
-		for k, v := range storageNodes {
-			status += fmt.Sprintf("Node ID: %s, State: %s, Leader: %s ", k, v, c.raft.String())
+		storageNodeCount := c.fsm.GetStorageNodeCount()
+
+		response := fmt.Sprintf("Node ID: %s\nState: %s\nLeader: %s\n\nRegistered Storage Nodes (%d):\n", c.nodeID, state, leaderAddr, storageNodeCount)
+		if storageNodeCount == 0 {
+			response += "  (None)\n"
+		} else {
+			for id, addr := range storageNodes {
+				response += fmt.Sprintf("  - ID: %s, Addr: %s\n", id, addr)
+			}
 		}
+
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, status)
+		fmt.Fprintf(w, response)
 	})
 
 	log.Fatal(http.ListenAndServe(httpAddr, nil))
 }
 
 // startHeartbeatListener starts a UDP listener for Storage Node heartbeats.
-func (c *Controller) startHeartbeatListener(udpAddr string) {
-	addr, err := net.ResolveUDPAddr("udp", udpAddr)
+func (c *Controller) startHeartbeatListener() {
+	// --- CHANGE: Use configurable heartbeatListenPort ---
+	addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(c.heartbeatListenPort))
+	// --- END CHANGE ---
 	if err != nil {
 		log.Fatalf("FATAL: Failed to resolve UDP address for heartbeat listener: %v", err)
 	}
@@ -288,60 +302,200 @@ func (c *Controller) startHeartbeatListener(udpAddr string) {
 			log.Printf("ERROR: Error reading heartbeat: %v", err)
 			continue
 		}
-		// Assuming heartbeat message is just the Storage Node ID
-		storageNodeID := string(buffer[:n])
-		c.recordHeartbeat(storageNodeID, remoteAddr.String())
+		// Assuming heartbeat message is just the Storage Node ID and its address
+		// Format: "NODE_ID:ADDRESS" e.g., "storage1:localhost:9000"
+		heartbeatMsg := string(buffer[:n])
+		parts := strings.SplitN(heartbeatMsg, ":", 2)
+		if len(parts) != 2 {
+			log.Printf("WARNING: Invalid heartbeat format from %s: '%s'", remoteAddr.String(), heartbeatMsg)
+			continue
+		}
+		storageNodeID := parts[0]
+		storageNodeAddr := parts[1]
+
+		c.recordHeartbeat(storageNodeID, storageNodeAddr)
 	}
 }
 
-// recordHeartbeat updates the last heartbeat time for a Storage Node.
+// recordHeartbeat updates the last heartbeat time for a Storage Node locally,
+// and if this Controller is the leader, it applies the state change via Raft.
 func (c *Controller) recordHeartbeat(nodeID string, addr string) {
 	c.storageNodesMu.Lock()
-	defer c.storageNodesMu.Unlock()
+	c.localHeartbeatMap[nodeID] = time.Now() // Update local heartbeat time
+	c.storageNodesMu.Unlock()
 
-	// Update last heartbeat time
-	c.storageNodes[nodeID] = time.Now()
+	// If this Controller node is the Raft leader, apply the state change to the
+	if c.raft.State() == raft.Leader {
+		cmd := LogCommand{
+			Op:    OpUpdateNodeStatus, // Use OpUpdateNodeStatus to add or update
+			Key:   nodeID,
+			Value: addr, // Store the address or a more complex status object
+		}
+		cmdBytes, err := json.Marshal(cmd)
+		if err != nil {
+			log.Printf("ERROR: Failed to marshal heartbeat command for %s: %v", nodeID, err)
+			return
+		}
 
-	// Optionally, apply this state change through Raft if node membership needs to be replicated.
-	// For now, we'll keep it in-memory for simplicity of heartbeat tracking,
-	// but for true fault-tolerance, active node list should be in
-	// Example:
-	// if c.raft.State() == raft.Leader {
-	//     cmd := LogCommand{
-	//         Op:    OpUpdateNodeStatus,
-	//         Key:   nodeID,
-	//         Value: addr, // Or a more complex status object
-	//     }
-	//     cmdBytes, _ := json.Marshal(cmd)
-	//     c.raft.Apply(cmdBytes, 5*time.Second)
-	// }
-	log.Printf("DEBUG: Heartbeat received from Storage Node: %s (%s)", nodeID, addr)
+		// Apply the command through Raft. This will replicate to all followers.
+		applyFuture := c.raft.Apply(cmdBytes, 5*time.Second)
+		if applyFuture.Error() != nil {
+			log.Printf("ERROR: Failed to apply heartbeat command for %s to Raft: %v", nodeID, applyFuture.Error())
+		} else {
+			log.Printf("DEBUG: Applied heartbeat for Storage Node %s (%s) to Raft ", nodeID, addr)
+		}
+	} else {
+		log.Printf("DEBUG: Received heartbeat from Storage Node %s (%s) but not leader. Not applying to Raft.", nodeID, addr)
+	}
 }
 
 // monitorStorageNodes periodically checks the health of registered Storage Nodes.
+// It relies on the localHeartbeatMap for timeouts and applies removal commands to Raft if a node times out.
 func (c *Controller) monitorStorageNodes() {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		c.storageNodesMu.Lock()
-		for nodeID, lastHeartbeat := range c.storageNodes {
-			if time.Since(lastHeartbeat) > heartbeatTimeout {
-				log.Printf("WARNING: Storage Node %s timed out (last heartbeat: %v ago). Marking as unhealthy.", nodeID, time.Since(lastHeartbeat))
-				// Optionally, apply a state change through Raft to remove/mark unhealthy
-				if c.raft.State() == raft.Leader {
-					cmd := LogCommand{
-						Op:  OpRemoveNode,
-						Key: nodeID,
-					}
-					cmdBytes, _ := json.Marshal(cmd)
-					c.raft.Apply(cmdBytes, 5*time.Second)
-				}
-				delete(c.storageNodes, nodeID) // Remove from in-memory map
-			}
+		nodesToCheck := make(map[string]time.Time)
+		for nodeID, lastHeartbeat := range c.localHeartbeatMap {
+			nodesToCheck[nodeID] = lastHeartbeat
 		}
 		c.storageNodesMu.Unlock()
+
+		for nodeID, lastHeartbeat := range nodesToCheck {
+			if time.Since(lastHeartbeat) > heartbeatTimeout {
+				log.Printf("WARNING: Storage Node %s timed out (last heartbeat: %v ago). Marking as unhealthy.", nodeID, time.Since(lastHeartbeat))
+
+				// If this Controller is the leader, apply a state change to remove the node.
+				if c.raft.State() == raft.Leader {
+					cmd := LogCommand{
+						Op:  OpRemoveStorageNode,
+						Key: nodeID,
+					}
+					cmdBytes, err := json.Marshal(cmd)
+					if err != nil {
+						log.Printf("ERROR: Failed to marshal remove node command for %s: %v", nodeID, err)
+						continue
+					}
+					applyFuture := c.raft.Apply(cmdBytes, 5*time.Second)
+					if applyFuture.Error() != nil {
+						log.Printf("ERROR: Failed to apply remove node command for %s to Raft: %v", nodeID, applyFuture.Error())
+					} else {
+						log.Printf("DEBUG: Applied removal command for Storage Node %s to Raft ", nodeID)
+					}
+				} else {
+					log.Printf("DEBUG: Storage Node %s timed out, but not leader. Not applying removal to Raft.", nodeID)
+				}
+
+				// Remove from local map regardless of leader status (it's just a local cache)
+				c.storageNodesMu.Lock()
+				delete(c.localHeartbeatMap, nodeID)
+				c.storageNodesMu.Unlock()
+			}
+		}
 	}
+}
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Command-line arguments for node configuration
+	// Example usage:
+	// Controller Node 1 (Leader):
+	// NODE_ID=node1 RAFT_BIND_ADDR=localhost:8081 HTTP_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8086 go run controller/main.go
+	//
+	// Controller Node 2 (Follower, joins node1):
+	// NODE_ID=node2 RAFT_BIND_ADDR=localhost:8082 HTTP_ADDR=localhost:8083 JOIN_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8087 go run controller/main.go
+	//
+	// Controller Node 3 (Follower, joins node1):
+	// NODE_ID=node3 RAFT_BIND_ADDR=localhost:8084 HTTP_ADDR=localhost:8085 JOIN_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8088 go run controller/main.go
+	//
+	// Simulated Storage Node client (sends heartbeats to Controller heartbeat port 8086):
+	// STORAGE_NODE_ID=storage_alpha STORAGE_NODE_ADDR=localhost:9000 HEARTBEAT_TARGET_PORT=8086 go run controller/main.go
+
+	nodeID := os.Getenv("NODE_ID")
+	if nodeID == "" {
+		nodeID = defaultNodeID // Default for single node testing
+	}
+	raftBindAddr := os.Getenv("RAFT_BIND_ADDR")
+	if raftBindAddr == "" {
+		raftBindAddr = fmt.Sprintf("localhost:%d", defaultRaftPort)
+	}
+	httpAddr := os.Getenv("HTTP_ADDR")
+	if httpAddr == "" {
+		httpAddr = fmt.Sprintf("localhost:%d", defaultHTTPPort)
+	}
+	joinAddr := os.Getenv("JOIN_ADDR") // Optional: address of an existing node to join
+
+	// --- CHANGE: Configurable Heartbeat Listen Port for Controller ---
+	heartbeatListenPortStr := os.Getenv("HEARTBEAT_LISTEN_PORT")
+	heartbeatListenPort := defaultHeartbeatListenPort
+	if heartbeatListenPortStr != "" {
+		parsedPort, err := strconv.Atoi(heartbeatListenPortStr)
+		if err != nil {
+			log.Fatalf("FATAL: Invalid HEARTBEAT_LISTEN_PORT: %v", err)
+		}
+		heartbeatListenPort = parsedPort
+	}
+	// --- END CHANGE ---
+
+	// Simulated Storage Node parameters (for testing heartbeat integration)
+	storageNodeID := os.Getenv("STORAGE_NODE_ID")
+	storageNodeAddr := os.Getenv("STORAGE_NODE_ADDR") // e.g., "localhost:9000"
+
+	// --- CHANGE: Configurable Heartbeat Target Port for Simulated Storage Node ---
+	heartbeatTargetPortStr := os.Getenv("HEARTBEAT_TARGET_PORT")
+	heartbeatTargetPort := defaultHeartbeatListenPort // Default to Controller's default if not specified
+	if heartbeatTargetPortStr != "" {
+		parsedPort, err := strconv.Atoi(heartbeatTargetPortStr)
+		if err != nil {
+			log.Fatalf("FATAL: Invalid HEARTBEAT_TARGET_PORT: %v", err)
+		}
+		heartbeatTargetPort = parsedPort
+	}
+	// --- END CHANGE ---
+
+	// Clean up old Raft data for a fresh start (for testing purposes)
+	raftDataPath := filepath.Join(defaultRaftDir, nodeID)
+	if err := os.RemoveAll(raftDataPath); err != nil {
+		log.Printf("WARNING: Failed to clean up old Raft data for %s: %v", nodeID, err)
+	}
+	log.Printf("INFO: Raft data directory for %s: %s", nodeID, raftDataPath)
+
+	_, err := NewController(nodeID, raftBindAddr, httpAddr, raftDataPath, joinAddr, heartbeatListenPort) // Pass heartbeatListenPort
+	if err != nil {
+		log.Fatalf("FATAL: Failed to create controller: %v", err)
+	}
+
+	// If this Controller is also simulating a Storage Node, start sending heartbeats
+	if storageNodeID != "" && storageNodeAddr != "" {
+		go func() {
+			log.Printf("INFO: Simulating Storage Node %s sending heartbeats to Controller heartbeat listener on port %d", storageNodeID, heartbeatTargetPort)
+			conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: heartbeatTargetPort}) // Use heartbeatTargetPort
+			if err != nil {
+				log.Fatalf("FATAL: Failed to dial UDP for simulated Storage Node heartbeat: %v", err)
+			}
+			defer conn.Close()
+
+			ticker := time.NewTicker(heartbeatInterval)
+			defer ticker.Stop()
+
+			heartbeatMessage := fmt.Sprintf("%s:%s", storageNodeID, storageNodeAddr)
+
+			for range ticker.C {
+				_, err := conn.Write([]byte(heartbeatMessage))
+				if err != nil {
+					log.Printf("ERROR: Failed to send heartbeat from simulated Storage Node %s: %v", storageNodeID, err)
+				} else {
+					log.Printf("DEBUG: Simulated Storage Node %s sent heartbeat.", storageNodeID)
+				}
+			}
+		}()
+	}
+
+	// Keep the main goroutine alive
+	select {}
 }
 
 // LogCommand defines the structure of commands applied to the FSM via Raft.
@@ -360,7 +514,6 @@ const (
 	OpAddStorageNode    = "add_storage_node"
 	OpRemoveStorageNode = "remove_storage_node"
 	OpUpdateNodeStatus  = "update_node_status" // For more granular node status
-	OpRemoveNode        = "remove_node"
 )
 
 // GojoDBFSM implements the raft.FSM interface.
@@ -492,6 +645,13 @@ func (f *GojoDBFSM) GetStorageNodes() map[string]string {
 	return copyMap
 }
 
+// GetStorageNodeCount returns the number of active storage nodes.
+func (f *GojoDBFSM) GetStorageNodeCount() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.storageNodes)
+}
+
 // --- FSMSnapshot Implementation ---
 
 // gojoDBFSMSnapshot implements the raft.FSMSnapshot interface.
@@ -529,44 +689,4 @@ func (s *gojoDBFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 func (s *gojoDBFSMSnapshot) Release() {
 	log.Println("DEBUG: FSM Snapshot released.")
 	// No-op for in-memory snapshot data after it's persisted.
-}
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	// Command-line arguments for node configuration
-	// go run main.go --id node1 --raft-addr localhost:8081 --http-addr localhost:8080
-	// go run main.go --id node2 --raft-addr localhost:8082 --http-addr localhost:8083 --join-addr localhost:8080
-	nodeID := os.Getenv("NODE_ID")
-	if nodeID == "" {
-		nodeID = defaultNodeID // Default for single node testing
-	}
-	raftBindAddr := os.Getenv("RAFT_BIND_ADDR")
-	if raftBindAddr == "" {
-		raftBindAddr = fmt.Sprintf("localhost:%d", defaultRaftPort)
-	}
-	httpAddr := os.Getenv("HTTP_ADDR")
-	if httpAddr == "" {
-		httpAddr = fmt.Sprintf("localhost:%d", defaultHTTPPort)
-	}
-	joinAddr := os.Getenv("JOIN_ADDR") // Optional: address of an existing node to join
-
-	udpAddr := os.Getenv("HEARTBEAT_ADDR")
-	if udpAddr == "" {
-		udpAddr = fmt.Sprintf("localhost:%d", defaultUDPPort)
-	}
-	// Clean up old Raft data for a fresh start (for testing purposes)
-	raftDataPath := filepath.Join(defaultRaftDir, nodeID)
-	if err := os.RemoveAll(raftDataPath); err != nil {
-		log.Printf("WARNING: Failed to clean up old Raft data for %s: %v", nodeID, err)
-	}
-	log.Printf("INFO: Raft data directory for %s: %s", nodeID, raftDataPath)
-
-	_, err := NewController(nodeID, raftBindAddr, httpAddr, raftDataPath, joinAddr, udpAddr)
-	if err != nil {
-		log.Fatalf("FATAL: Failed to create controller: %v", err)
-	}
-
-	// Keep the main goroutine alive
-	select {}
 }

@@ -15,7 +15,7 @@ import (
 
 const (
 	serverHost     = "localhost"
-	serverPort     = "8080"
+	serverPort     = "9090"
 	dbFilePath     = "data/gojodb.db"
 	logDir         = "data/logs"
 	archiveDir     = "data/archives"
