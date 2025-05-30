@@ -350,7 +350,7 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 				log.Printf("DEBUG: Recovery Analysis: Txn %d is COMMITTED (LSN %d)", lr.TxnID, lr.LSN)
 			case LogRecordTypeAbortTxn:
 				lm.recoveryTxnStates[lr.TxnID] = TxnStateAborted
-				log.Printf("DEBUG: Recovery Analysis: Txn %d is ABORTED (LSN %d)", lr.LSN)
+				log.Printf("DEBUG: Recovery Analysis: Txn %d is ABORTED (LSN %d)", lr.TxnID, lr.LSN)
 			}
 			// For data modification records, track dirty pages if needed for Redo/Undo
 			if lr.Type == LogRecordTypeUpdate || lr.Type == LogRecordTypeNewPage {
