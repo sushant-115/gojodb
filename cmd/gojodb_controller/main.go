@@ -385,6 +385,35 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 		fmt.Fprintf(w, "Slot range %s assigned to %s successfully.", slotInfo.RangeID, assignedNodeID)
 	})
 
+	// In controller/main.go, inside startHTTPServer function:
+	http.HandleFunc("/admin/get_storage_node_address", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		nodeID := r.URL.Query().Get("nodeID")
+		if nodeID == "" {
+			http.Error(w, "nodeID is required", http.StatusBadRequest)
+			return
+		}
+
+		// Check if this node is the leader
+		if c.raft.State() != raft.Leader {
+			http.Error(w, "not leader", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Get Storage Node address from FSM
+		storageNodes := c.fsm.GetStorageNodes() // This is the replicated map
+		addr, found := storageNodes[nodeID]
+		if !found {
+			http.Error(w, fmt.Sprintf("Storage Node %s not found.", nodeID), http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, addr) // Return just the address string
+	})
+
 	// Endpoint to get the assigned node for a specific key
 	http.HandleFunc("/admin/get_node_for_key", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
