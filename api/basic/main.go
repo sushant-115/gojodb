@@ -8,7 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sort" // For sorting controller statuses
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,9 +23,12 @@ const (
 	shardMapFetchInterval     = 5 * time.Second                                // How often to fetch shard map
 	controllerMonitorInterval = 2 * time.Second                                // How often to monitor controller cluster
 	storageNodeDialTimeout    = 2 * time.Second                                // Timeout for connecting to a storage node
-	clientTimeout             = 5 * time.Second
+	CLIENT_TIMEOUT            = 5 * time.Second
 	// Basic API Key for admin endpoints
 	adminAPIKey = "GOJODB_ADMIN_KEY" // Replace with a strong, secret key in production
+
+	// 2PC Coordinator configuration
+	prepareTimeout = 5 * time.Second // Timeout for participants to respond to PREPARE
 )
 
 // APIRequest represents a client request received by the API service.
@@ -37,8 +40,20 @@ type APIRequest struct {
 
 // APIResponse represents a response sent by the API service to the client.
 type APIResponse struct {
-	Status  string `json:"status"`            // OK, ERROR, NOT_FOUND, REDIRECT
+	Status  string `json:"status"`            // OK, ERROR, NOT_FOUND, REDIRECT, COMMITTED, ABORTED
 	Message string `json:"message,omitempty"` // Details or value for GET, or target node address for REDIRECT
+}
+
+// TransactionOperation defines a single operation within a distributed transaction.
+type TransactionOperation struct {
+	Command string `json:"command"` // PUT or DELETE
+	Key     string `json:"key"`
+	Value   string `json:"value,omitempty"`
+}
+
+// TransactionRequest represents a request for a distributed transaction.
+type TransactionRequest struct {
+	Operations []TransactionOperation `json:"operations"`
 }
 
 // ControllerStatus represents the status of a single controller node.
@@ -70,6 +85,10 @@ type APIService struct {
 	// Cache of active connections to Storage Nodes
 	storageNodeConnsMu sync.Mutex
 	storageNodeConns   map[string]net.Conn // storageNodeAddress -> net.Conn
+
+	// Transaction Coordinator state (in-memory for V1)
+	nextTxnID   int64
+	nextTxnIDMu sync.Mutex
 }
 
 // NewAPIService creates and initializes a new API Service.
@@ -80,13 +99,14 @@ func NewAPIService(controllerHTTPAddrs string) *APIService {
 		storageNodeAddresses: make(map[string]string),
 		slotAssignments:      make(map[string]fsm.SlotRangeInfo),
 		storageNodeConns:     make(map[string]net.Conn),
+		nextTxnID:            time.Now().UnixNano(), // Basic unique ID for transactions
 	}
 	go service.monitorControllerCluster() // Start monitoring controller cluster and fetching shard map
 	go service.manageStorageNodeConns()   // Start managing connections
 	return service
 }
 
-// monitorControllerCluster periodically pings controller nodes to find the current Raft leader,
+// findControllerLeader periodically pings controller nodes to find the current Raft leader,
 // fetch their status, and update the cached storage node addresses and shard map.
 func (s *APIService) monitorControllerCluster() {
 	ticker := time.NewTicker(controllerMonitorInterval)
@@ -101,7 +121,7 @@ func (s *APIService) monitorControllerCluster() {
 		for _, addr := range s.controllerAddrs {
 			resp, err := http.Get(fmt.Sprintf("http://%s/status", addr))
 			if err != nil {
-				log.Printf("DEBUG: API Service: Failed to reach Controller %s for status: %v", addr, err)
+				// log.Printf("DEBUG: API Service: Failed to reach Controller %s for status: %v", addr, err) // Too noisy
 				continue
 			}
 			defer resp.Body.Close()
@@ -123,16 +143,11 @@ func (s *APIService) monitorControllerCluster() {
 					} else if strings.HasPrefix(line, "Leader:") {
 						leaderLine = strings.TrimSpace(strings.TrimPrefix(line, "Leader:"))
 					} else if strings.HasPrefix(line, "  - ID:") { // Parse Storage Node addresses
-						log.Println("Before Line: ", line)
 						parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- ID:")), ", Addr:", 2)
-						log.Println("Line: ", line, "parts: 0 ", parts[0], "parts: 1 ", parts[1])
 						if len(parts) == 2 {
 							storageID := strings.TrimSpace(parts[0])
-							// storageID = strings.Trim("- ID:", storageID)
-							// storageID = strings.TrimSpace(storageID)
 							storageAddr := strings.TrimSpace(parts[1])
 							tempStorageNodeAddresses[storageID] = storageAddr
-							log.Println("parts: 0 ", storageID, "parts: 1 ", storageAddr, tempStorageNodeAddresses)
 						}
 					}
 				}
@@ -272,10 +287,23 @@ func authenticate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// handleAPIRequest processes incoming client requests and routes them.
+// handleAPIRequest is the main router for all incoming HTTP requests to the API service.
 func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
-	// --- Path-based Routing ---
 	path := r.URL.Path
+
+	// --- Check for Controller Leader (Fail Fast if no leader for critical ops) ---
+	s.leaderMu.RLock()
+	leaderAddr := s.currentControllerLeader
+	s.leaderMu.RUnlock()
+
+	// Operations that depend on leader or shard map:
+	isCriticalPath := strings.HasPrefix(path, "/admin/") || path == "/api/data"
+	if isCriticalPath && leaderAddr == "" {
+		http.Error(w, "ERROR: No Controller leader available. Cannot process request.", http.StatusServiceUnavailable)
+		log.Printf("ERROR: Request for %s failed: No Controller leader available.", path)
+		return
+	}
+	// --- END Controller Leader Check ---
 
 	if strings.HasPrefix(path, "/admin/") {
 		authenticate(s.handleAdminRequest).ServeHTTP(w, r)
@@ -285,6 +313,9 @@ func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if path == "/api/data" {
 		s.handleDataRequest(w, r)
+		return
+	} else if path == "/api/transaction" { // New endpoint for distributed transactions
+		s.handleTransactionRequest(w, r)
 		return
 	} else {
 		http.Error(w, "Not Found", http.StatusNotFound)
@@ -297,6 +328,7 @@ func (s *APIService) handleAdminRequest(w http.ResponseWriter, r *http.Request) 
 	leaderAddr := s.currentControllerLeader
 	s.leaderMu.RUnlock()
 
+	// leaderAddr check already done in handleAPIRequest, but defensive here.
 	if leaderAddr == "" {
 		http.Error(w, "ERROR: No Controller leader available. Cannot process admin request.", http.StatusServiceUnavailable)
 		return
@@ -321,7 +353,7 @@ func (s *APIService) handleAdminRequest(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	client := &http.Client{Timeout: clientTimeout}
+	client := &http.Client{Timeout: CLIENT_TIMEOUT}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Error proxying request to Controller Leader: %v", err), http.StatusBadGateway)
@@ -380,6 +412,29 @@ func (s *APIService) handleClusterStatus(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Add Slot Assignments summary
+	s.slotAssignmentsMu.RLock()
+	slotAssignments := s.slotAssignments
+	s.slotAssignmentsMu.RUnlock()
+
+	responseBuilder.WriteString(fmt.Sprintf("\nSlot Assignments (%d ranges):\n", len(slotAssignments)))
+	if len(slotAssignments) == 0 {
+		responseBuilder.WriteString("  (None)\n")
+	} else {
+		var sortedRanges []fsm.SlotRangeInfo
+		for _, sr := range slotAssignments {
+			sortedRanges = append(sortedRanges, sr)
+		}
+		sort.Slice(sortedRanges, func(i, j int) bool {
+			return sortedRanges[i].StartSlot < sortedRanges[j].StartSlot
+		})
+
+		for _, sr := range sortedRanges {
+			responseBuilder.WriteString(fmt.Sprintf("  - RangeID: %s (%d-%d), Assigned To: %s, Status: %s\n",
+				sr.RangeID, sr.StartSlot, sr.EndSlot, sr.AssignedNodeID, sr.Status))
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, responseBuilder.String())
 }
@@ -397,18 +452,9 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("INFO: API Service: Received command: %s Key: '%s' Value: '%s'", apiReq.Command, apiReq.Key, apiReq.Value)
+	log.Printf("INFO: API Service: Received data command: %s Key: '%s' Value: '%s'", apiReq.Command, apiReq.Key, apiReq.Value)
 
-	// --- CRITICAL: Check for Controller Leader before processing sharded requests ---
-	s.leaderMu.RLock()
-	leaderAddr := s.currentControllerLeader
-	s.leaderMu.RUnlock()
-	if leaderAddr == "" {
-		resp := APIResponse{Status: "ERROR", Message: "No Controller leader available. Cannot route sharded data request."}
-		json.NewEncoder(w).Encode(resp)
-		return
-	}
-	// --- END CRITICAL CHECK ---
+	// Leader check already done in handleAPIRequest
 
 	// 1. Determine target slot
 	targetSlot := fsm.GetSlotForHashKey(apiReq.Key)
@@ -440,7 +486,7 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 	s.storageNodeAddressesMu.RUnlock()
 
 	if !storageNodeFound || actualStorageNodeAddr == "" {
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Storage Node %s (for slot %d), addr: %s, %v address not found in Controller cache. Node might be down or not registered.", storageNodeID, targetSlot, actualStorageNodeAddr, storageNodeFound)}
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Storage Node %s (for slot %d) address not found in Controller cache. Node might be down or not registered.", storageNodeID, targetSlot)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
@@ -493,6 +539,217 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(apiResp) // Send JSON response to original client
 }
 
+// handleTransactionRequest handles distributed transaction requests (2PC Coordinator).
+func (s *APIService) handleTransactionRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var txReq TransactionRequest
+	if err := json.NewDecoder(r.Body).Decode(&txReq); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid transaction request format: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	s.nextTxnIDMu.Lock()
+	txnID := fmt.Sprintf("%d", s.nextTxnID)
+	s.nextTxnID++
+	s.nextTxnIDMu.Unlock()
+	log.Printf("INFO: API Service: Starting new distributed transaction: %s", txnID)
+
+	// Map to track unique participants involved in this transaction
+	participants := make(map[string]string) // storageNodeID -> storageNodeAddr
+
+	// 1. Pre-check: Determine all participants and ensure key assignments are known
+	for i, op := range txReq.Operations {
+		targetSlot := fsm.GetSlotForHashKey(op.Key)
+		s.slotAssignmentsMu.RLock()
+		var targetSlotInfo fsm.SlotRangeInfo
+		foundAssignment := false
+		for _, slotInfo := range s.slotAssignments {
+			if targetSlot >= slotInfo.StartSlot && targetSlot <= slotInfo.EndSlot {
+				targetSlotInfo = slotInfo
+				foundAssignment = true
+				break
+			}
+		}
+		s.slotAssignmentsMu.RUnlock()
+
+		if !foundAssignment {
+			resp := APIResponse{Status: "ABORTED", Message: fmt.Sprintf("Txn %s: No assignment found for slot %d (key '%s') in operation %d.", txnID, targetSlot, op.Key, i)}
+			json.NewEncoder(w).Encode(resp)
+			log.Printf("ERROR: Txn %s aborted due to unknown slot assignment.", txnID)
+			return
+		}
+
+		storageNodeID := targetSlotInfo.AssignedNodeID
+		s.storageNodeAddressesMu.RLock()
+		actualStorageNodeAddr, storageNodeFound := s.storageNodeAddresses[storageNodeID]
+		s.storageNodeAddressesMu.RUnlock()
+
+		if !storageNodeFound || actualStorageNodeAddr == "" {
+			resp := APIResponse{Status: "ABORTED", Message: fmt.Sprintf("Txn %s: Storage Node %s address not found for operation %d.", txnID, storageNodeID, i)}
+			json.NewEncoder(w).Encode(resp)
+			log.Printf("ERROR: Txn %s aborted due to unknown storage node address.", txnID)
+			return
+		}
+		participants[storageNodeID] = actualStorageNodeAddr
+	}
+
+	// --- Phase 1: Prepare ---
+	log.Printf("INFO: Txn %s: Phase 1 (Prepare) initiated with %d participants.", txnID, len(participants))
+	prepareVotes := make(chan bool, len(participants))
+	var wg sync.WaitGroup
+
+	for nodeID, nodeAddr := range participants {
+		wg.Add(1)
+		go func(id, addr string, ops []TransactionOperation) {
+			defer wg.Done()
+
+			// Send PREPARE command to Storage Node
+			prepareCmd := fmt.Sprintf("PREPARE %s %s\n", txnID, serializeOperations(ops)) // ops need to be serialized
+
+			// This command will go to the Storage Node which needs to parse it
+			// For simplicity, we are passing all operations to each participant for now.
+			// A smarter coordinator would send only relevant ops per participant.
+
+			resp, err := s.sendStorageNodeCommand(addr, prepareCmd)
+			if err != nil {
+				log.Printf("ERROR: Txn %s: Participant %s failed to PREPARE: %v", txnID, id, err)
+				prepareVotes <- false
+				return
+			}
+			if resp.Status == "VOTE_COMMIT" {
+				log.Printf("DEBUG: Txn %s: Participant %s VOTE_COMMIT.", txnID, id)
+				prepareVotes <- true
+			} else {
+				log.Printf("INFO: Txn %s: Participant %s VOTE_ABORT: %s", txnID, id, resp.Message)
+				prepareVotes <- false
+			}
+		}(nodeID, nodeAddr, txReq.Operations) // Pass all operations for now, SN will filter
+	}
+
+	// Wait for all prepare responses or timeout
+	allVoteCommit := true
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All participants responded
+		close(prepareVotes)
+		for vote := range prepareVotes {
+			if !vote {
+				allVoteCommit = false
+				break
+			}
+		}
+	case <-time.After(prepareTimeout):
+		log.Printf("WARNING: Txn %s: Prepare phase timed out after %v.", txnID, prepareTimeout)
+		allVoteCommit = false // Timeout implies abort
+	}
+
+	// --- Phase 2: Commit / Abort ---
+	var finalStatus string
+	var finalMessage string
+	commitCmd := ""
+
+	if allVoteCommit {
+		finalStatus = "COMMITTED"
+		finalMessage = fmt.Sprintf("Transaction %s committed.", txnID)
+		commitCmd = fmt.Sprintf("COMMIT %s\n", txnID)
+		log.Printf("INFO: Txn %s: Phase 2 (COMMIT) initiated.", txnID)
+	} else {
+		finalStatus = "ABORTED"
+		finalMessage = fmt.Sprintf("Transaction %s aborted.", txnID)
+		commitCmd = fmt.Sprintf("ABORT %s\n", txnID)
+		log.Printf("INFO: Txn %s: Phase 2 (ABORT) initiated.", txnID)
+	}
+
+	// Send final command to all participants
+	for nodeID, nodeAddr := range participants {
+		go func(id, addr string, cmd string) {
+			resp, err := s.sendStorageNodeCommand(addr, cmd)
+			if err != nil {
+				log.Printf("ERROR: Txn %s: Participant %s failed to send %s command: %v", txnID, id, strings.TrimSpace(cmd), err)
+				// Coordinator crash recovery (later) needed if this fails.
+				return
+			}
+			log.Printf("DEBUG: Txn %s: Participant %s responded to %s with: %s", txnID, id, strings.TrimSpace(cmd), resp.Status)
+		}(nodeID, nodeAddr, commitCmd)
+	}
+
+	// Respond to original client
+	json.NewEncoder(w).Encode(APIResponse{Status: finalStatus, Message: finalMessage})
+	log.Printf("INFO: Txn %s completed with status: %s", txnID, finalStatus)
+}
+
+// sendStorageNodeCommand is a helper to send a command string to a Storage Node and get its response.
+func (s *APIService) sendStorageNodeCommand(nodeAddr string, command string) (APIResponse, error) {
+	conn, err := s.getStorageNodeConn(nodeAddr)
+	if err != nil {
+		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to connect to storage node %s: %w", nodeAddr, err)
+	}
+
+	_, err = conn.Write([]byte(command))
+	if err != nil {
+		s.closeStorageNodeConn(nodeAddr)
+		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to send command to storage node %s: %w", nodeAddr, err)
+	}
+
+	reader := bufio.NewReader(conn)
+	respRaw, err := reader.ReadString('\n')
+	if err != nil {
+		s.closeStorageNodeConn(nodeAddr)
+		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to read response from storage node %s: %w", nodeAddr, err)
+	}
+
+	parts := strings.Fields(strings.TrimSpace(respRaw))
+	if len(parts) == 0 {
+		return APIResponse{Status: "ERROR"}, fmt.Errorf("empty response from storage node %s", nodeAddr)
+	}
+
+	apiResp := APIResponse{Status: parts[0]}
+	if len(parts) > 1 {
+		apiResp.Message = strings.Join(parts[1:], " ")
+	}
+	return apiResp, nil
+}
+
+// serializeOperations is a helper to serialize a list of operations for sending to Storage Nodes.
+func serializeOperations(ops []TransactionOperation) string {
+	var builder strings.Builder
+	for i, op := range ops {
+		opJSON, _ := json.Marshal(op) // Should handle errors in production
+		builder.WriteString(string(opJSON))
+		if i < len(ops)-1 {
+			builder.WriteString("|") // Delimiter between operations
+		}
+	}
+	return builder.String()
+}
+
+// deserializeOperations is a helper to deserialize a list of operations from a string.
+func deserializeOperations(s string) ([]TransactionOperation, error) {
+	parts := strings.Split(s, "|")
+	var ops []TransactionOperation
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		var op TransactionOperation
+		if err := json.Unmarshal([]byte(part), &op); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal operation part '%s': %w", part, err)
+		}
+		ops = append(ops, op)
+	}
+	return ops, nil
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
 
@@ -505,8 +762,10 @@ func main() {
 	log.Printf("INFO: GojoDB API Service listening on %s:%s", apiServiceHost, apiServicePort)
 	log.Println("INFO: API Endpoints:")
 	log.Println("  - /api/data (POST): { \"command\": \"PUT/GET/DELETE\", \"key\": \"...\", \"value\": \"...\" }")
+	log.Println("  - /api/transaction (POST): { \"operations\": [ {\"command\":\"PUT/DELETE\", \"key\":\"...\", \"value\":\"...\"}, ... ] }")
 	log.Println("  - /admin/assign_slot_range (POST, authenticated): Proxy to Controller Leader")
 	log.Println("  - /admin/get_node_for_key (GET, authenticated): Proxy to Controller Leader")
+	log.Println("  - /admin/set_metadata (POST, authenticated): Proxy to Controller Leader")
 	log.Println("  - /status (GET): Get aggregated status of Controller cluster and Storage Nodes")
 	log.Printf("  Admin API Key: %s (for X-API-Key header)", adminAPIKey)
 

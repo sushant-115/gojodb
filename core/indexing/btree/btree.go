@@ -1,13 +1,17 @@
 package btree
 
 import (
-	"cmp" // For LRU
-	"encoding/binary"
+	// For LRU
+
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"slices"
+	"sync" // For sync.RWMutex and sync.Map
+	// For parsing TxnID
+	// For Node serialization
+	// For Node serialization checksum
 )
 
 // --- Configuration & Constants ---
@@ -49,7 +53,46 @@ var (
 	ErrBTreeNotInitializedProperly = errors.New("btree not initialized properly (e.g. missing disk manager or buffer pool)")
 	ErrLogRecordTooLarge           = errors.New("log record too large for log buffer")
 	ErrLogFileError                = errors.New("log file operation error")
+	// --- NEW: 2PC Specific Errors ---
+	ErrTxnNotFound      = errors.New("transaction not found")
+	ErrTxnAlreadyExists = errors.New("transaction already exists in table")
+	ErrTxnInvalidState  = errors.New("transaction is in an invalid state for this operation")
+	ErrKeyLocked        = errors.New("key is currently locked by another transaction")
+	ErrPrepareFailed    = errors.New("prepare phase failed for transaction")
+	// --- END NEW ---
 )
+
+// --- NEW: TransactionState and Transaction types ---
+
+// TransactionState represents the in-memory state of a transaction on a participant.
+type TransactionState int
+
+const (
+	TxnStateRunning   TransactionState = iota // Transaction is active, operations are being applied
+	TxnStatePrepared                          // Participant has voted COMMIT and is waiting for global decision
+	TxnStateCommitted                         // Participant has received COMMIT decision
+	TxnStateAborted                           // Participant has received ABORT decision or decided to abort locally
+)
+
+// TransactionOperation represents a single operation within a distributed transaction on a participant.
+type TransactionOperation struct {
+	Command string `json:"command"` // PUT or DELETE
+	Key     string `json:"key"`
+	Value   string `json:"value,omitempty"`
+}
+
+// Transaction represents an in-memory record of an active or prepared transaction.
+type Transaction struct {
+	ID    uint64
+	State TransactionState
+	// Operations: For undo, you might need to store the operations performed by this txn
+	// on this shard, or at least the pages/keys it modified.
+	// For V1, we'll rely on WAL for recovery.
+	// LocksHeld: Keep track of locks held by this transaction.
+	locksHeld map[string]struct{} // Set of keys locked by this transaction
+}
+
+// --- END NEW ---
 
 // --- BTree Structure & Operations (Refactored for Persistence) ---
 type Order[K any] func(a, b K) int
@@ -69,7 +112,12 @@ type BTree[K any, V any] struct {
 	bpm          *BufferPoolManager
 	diskManager  *DiskManager
 	logManager   *LogManager // Placeholder for *LogManager
-	// size is now read from/written to header
+
+	// --- NEW: 2PC Participant State ---
+	transactionTable map[uint64]*Transaction // TxnID -> Transaction (in-memory state of active txns)
+	keyLocks         map[string]uint64       // Key (string representation) -> TxnID (ID of txn holding lock)
+	keyLocksMu       sync.RWMutex            // Protects keyLocks map
+	// --- END NEW ---
 }
 
 // NewBTreeFile creates a new database file and initializes a new B-tree within it.
@@ -105,6 +153,10 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 	bt := &BTree[K, V]{
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
 		kvSerializer: kvSerializer, bpm: bpm, diskManager: dm, logManager: logManager,
+		// --- NEW: Initialize 2PC Participant State ---
+		transactionTable: make(map[uint64]*Transaction),
+		keyLocks:         make(map[string]uint64),
+		// --- END NEW ---
 	}
 
 	// Create the initial root node page
@@ -185,6 +237,20 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 
 	bpm := NewBufferPoolManager(poolSize, dm, logManager)
 
+	bt := &BTree[K, V]{
+		rootPageID:   header.RootPageID,
+		degree:       int(header.Degree),
+		keyOrder:     keyOrder,
+		kvSerializer: kvSerializer,
+		bpm:          bpm,
+		diskManager:  dm,
+		logManager:   logManager,
+		// --- NEW: Initialize 2PC Participant State ---
+		transactionTable: make(map[uint64]*Transaction),
+		keyLocks:         make(map[string]uint64),
+		// --- END NEW ---
+	}
+
 	// --- CRITICAL FIX: Recovery Process using LogManager and BPM ---
 	// This is where you would implement database recovery.
 	// 1. Analysis Pass (scan WAL to find last checkpoint and active transactions)
@@ -192,6 +258,7 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 	// 3. Undo Pass (rollback uncommitted transactions if any)
 	if logManager != nil {
 		log.Println("INFO: Starting database recovery process...")
+		// Pass the BTree instance to recovery so it can interact with its locking and transaction table
 		if err := logManager.Recover(dm, bpm, header.LastLSN); err != nil {
 			dm.Close()
 			return nil, fmt.Errorf("database recovery failed: %w", err)
@@ -207,23 +274,8 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 			return nil, fmt.Errorf("failed to re-read header after recovery: %w", err)
 		}
 	}
+	// --- END CRITICAL FIX ---
 
-	// Re-read header after potential recovery changes if recovery can modify it
-	// For now, assume header is correct after open.
-	if err := dm.readHeader(header); err != nil { // Re-read header in case recovery changed it
-		dm.Close()
-		return nil, fmt.Errorf("failed to re-read header after potential recovery: %w", err)
-	}
-
-	bt := &BTree[K, V]{
-		rootPageID:   header.RootPageID,
-		degree:       int(header.Degree),
-		keyOrder:     keyOrder,
-		kvSerializer: kvSerializer,
-		bpm:          bpm,
-		diskManager:  dm,
-		logManager:   logManager,
-	}
 	log.Printf("INFO: Existing B-tree database opened from %s. Root PageID: %d, Degree: %d, TreeSize: %d",
 		filePath, bt.rootPageID, bt.degree, header.TreeSize)
 	return bt, nil
@@ -356,11 +408,22 @@ func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *Page, key
 	return bt.searchRecursive(childNode, childPage, key)
 }
 
-// Insert a key-value pair into the B-tree.
-func (bt *BTree[K, V]) Insert(key K, value V) error {
-	// Check if key already exists to determine if TreeSize should be incremented.
-	// This search is non-transactional and doesn't handle concurrency or LSNs,
-	// simply for determining if it's a new insert or an update.
+// --- NEW: Transactional Insert/Delete Operations ---
+
+// Insert inserts a key-value pair into the B-tree. If txnID is 0, it's an auto-commit operation.
+func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
+	// Acquire lock for the key
+	if err := bt.acquireLock(key, txnID); err != nil {
+		return fmt.Errorf("failed to acquire lock for key %v: %w", key, err)
+	}
+	defer func() {
+		// For auto-commit, release immediately. For 2PC, locks are released by Commit/Abort.
+		if txnID == 0 {
+			bt.releaseLock(key, txnID)
+		}
+	}()
+
+	// Check if key exists for update or if it's a new insert for size update
 	_, exists, searchErr := bt.Search(key)
 	if searchErr != nil {
 		log.Printf("WARNING: Search error during pre-insert check for key %v: %v", key, searchErr)
@@ -370,7 +433,7 @@ func (bt *BTree[K, V]) Insert(key K, value V) error {
 
 	// If the tree is empty, create the first root node
 	if bt.rootPageID == InvalidPageID {
-		log.Printf("DEBUG: Inserting first key %v. Creating initial root page.", key)
+		log.Printf("DEBUG: Txn %d: Inserting first key %v. Creating initial root page.", txnID, key)
 		rootPg, rootPgID, err := bt.bpm.NewPage() // Allocates a new page and pins it
 		if err != nil {
 			return fmt.Errorf("failed to create first root page for insert: %w", err)
@@ -383,8 +446,8 @@ func (bt *BTree[K, V]) Insert(key K, value V) error {
 			return fmt.Errorf("failed to update header with new root page ID: %w", err)
 		}
 		rootNode := &Node[K, V]{pageID: rootPgID, isLeaf: true, tree: bt, keys: make([]K, 0), values: make([]V, 0), childPageIDs: make([]PageID, 0)}
-		// TODO: WAL Log creation of new root page
-		return bt.insertNonFull(rootNode, rootPg, key, value, !exists) // insertNonFull unpins rootPg
+		// TODO: WAL Log creation of new root page with TxnID
+		return bt.insertNonFull(rootNode, rootPg, key, value, !exists, txnID) // insertNonFull unpins rootPg
 	}
 
 	// Fetch the current root node
@@ -395,7 +458,7 @@ func (bt *BTree[K, V]) Insert(key K, value V) error {
 
 	// If the root node is full, the tree must grow in height by splitting the root
 	if len(rootNode.keys) == 2*bt.degree-1 {
-		log.Printf("DEBUG: Root node %d is full. Splitting root.", bt.rootPageID)
+		log.Printf("DEBUG: Txn %d: Root node %d is full. Splitting root.", txnID, bt.rootPageID)
 		newRootDiskPage, newRootPageID, err := bt.bpm.NewPage() // Allocates a new page for the new root
 		if err != nil {
 			bt.bpm.UnpinPage(rootPage.GetPageID(), false) // Unpin old root on error
@@ -422,17 +485,17 @@ func (bt *BTree[K, V]) Insert(key K, value V) error {
 			keys:         make([]K, 0),
 			values:       make([]V, 0),
 		}
-		// TODO: WAL Log new root page creation and the subsequent split operation
+		// TODO: WAL Log new root page creation and the subsequent split operation with TxnID
 
 		// Split the old root node. `splitChild` promotes a key to `newRootNode` and unpins `rootPage` and the new sibling page.
-		err = bt.splitChild(newRootNode, newRootDiskPage, 0, rootNode, rootPage)
+		err = bt.splitChild(newRootNode, newRootDiskPage, 0, rootNode, rootPage, txnID)
 		if err != nil {
 			// If split fails, newRootDiskPage and rootPage (old root) are already unpinned (or handled by splitChild)
 			// The B-tree state might be inconsistent if split fails before full completion.
 			// This is a critical error path.
 			return fmt.Errorf("failed to split root node: %w", err)
 		}
-		log.Printf("DEBUG: Root split complete. New root %d, Old root %d", newRootPageID, oldRootPageID)
+		log.Printf("DEBUG: Txn %d: Root split complete. New root %d, Old root %d", txnID, newRootPageID, oldRootPageID)
 
 		// --- CRITICAL FIX: Serialize the newRootNode after it's modified by splitChild ---
 		// The splitChild method modifies newRootNode (the parent) in memory and marks newRootDiskPage dirty.
@@ -457,16 +520,16 @@ func (bt *BTree[K, V]) Insert(key K, value V) error {
 		if fetchErr != nil {
 			return fetchErr
 		}
-		return bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists)
+		return bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists, txnID) // Recursive call unpins
 	} else {
 		// Root node is not full, just insert into it directly.
-		return bt.insertNonFull(rootNode, rootPage, key, value, !exists) // insertNonFull unpins rootPage
+		return bt.insertNonFull(rootNode, rootPage, key, value, !exists, txnID) // insertNonFull unpins rootPage
 	}
 }
 
 // insertNonFull inserts a key-value pair into a node that is guaranteed not to be full.
 // It takes ownership of `node` and `page`, unpinning `page` before returning.
-func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value V, incrementSize bool) error {
+func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value V, incrementSize bool, txnID uint64) error {
 	// Find the correct insertion position
 	idx := slices.IndexFunc(node.keys, func(k K) bool { return bt.keyOrder(key, k) <= 0 })
 	if idx == -1 { // Key is larger than all existing keys
@@ -487,8 +550,8 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 		}
 
 		if updated {
-			log.Printf("DEBUG: Updated existing key %v in leaf node %d", key, node.pageID)
-			// TODO: WAL Log value update
+			log.Printf("DEBUG: Txn %d: Updated existing key %v in leaf node %d", txnID, key, node.pageID)
+			// TODO: WAL Log value update with TxnID
 			if err := node.serialize(page, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); err != nil {
 				bt.bpm.UnpinPage(page.GetPageID(), false)
 				return fmt.Errorf("failed to serialize leaf node %d after update: %w", node.pageID, err)
@@ -499,9 +562,9 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 		// Key not found, insert new key-value pair
 		node.keys = slices.Insert(node.keys, idx, key)
 		node.values = slices.Insert(node.values, idx, value)
-		log.Printf("DEBUG: Inserted new key %v into leaf node %d at index %d. New numKeys: %d", key, node.pageID, idx, len(node.keys))
+		log.Printf("DEBUG: Txn %d: Inserted new key %v into leaf node %d at index %d. New numKeys: %d", txnID, key, node.pageID, idx, len(node.keys))
 
-		// TODO: WAL Log key/value insert
+		// TODO: WAL Log key/value insert with TxnID
 		if err := node.serialize(page, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); err != nil {
 			bt.bpm.UnpinPage(page.GetPageID(), false)
 			return fmt.Errorf("failed to serialize leaf node %d after insert: %w", node.pageID, err)
@@ -524,8 +587,8 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 		}
 
 		if updated {
-			log.Printf("DEBUG: Updated existing key %v in internal node %d", key, node.pageID)
-			// TODO: WAL Log value update in internal node
+			log.Printf("DEBUG: Txn %d: Updated existing key %v in internal node %d", txnID, key, node.pageID)
+			// TODO: WAL Log value update in internal node with TxnID
 			if err := node.serialize(page, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); err != nil {
 				bt.bpm.UnpinPage(page.GetPageID(), false)
 				return fmt.Errorf("failed to serialize internal node %d after update: %w", node.pageID, err)
@@ -543,9 +606,9 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 
 		// If the child node is full, split it
 		if len(childNode.keys) == 2*bt.degree-1 {
-			log.Printf("DEBUG: Child node %d of parent %d is full. Splitting child.", childNode.pageID, node.pageID)
-			// TODO: WAL Log upcoming split operation (parent and child involved)
-			err = bt.splitChild(node, page, idx, childNode, childPage) // `splitChild` unpins `childPage` and new sibling page
+			log.Printf("DEBUG: Txn %d: Child node %d of parent %d is full. Splitting child.", txnID, childNode.pageID, node.pageID)
+			// TODO: WAL Log upcoming split operation (parent and child involved) with TxnID
+			err = bt.splitChild(node, page, idx, childNode, childPage, txnID)
 			if err != nil {
 				bt.bpm.UnpinPage(page.GetPageID(), false) // Unpin parent if split fails
 				return fmt.Errorf("failed to split child node %d: %w", childNode.pageID, err)
@@ -560,8 +623,8 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 			} else if bt.keyOrder(key, node.keys[idx]) == 0 {
 				// The key to insert is the same as the promoted key. Update its value in parent.
 				node.values[idx] = value
-				log.Printf("DEBUG: Key %v matches promoted key from split. Updating value in parent %d.", key, node.pageID)
-				// TODO: WAL Log this update in parent node
+				log.Printf("DEBUG: Txn %d: Key %v matches promoted key from split. Updating value in parent %d.", txnID, key, node.pageID)
+				// TODO: WAL Log this update in parent node with TxnID
 				if errS := node.serialize(page, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
 					bt.bpm.UnpinPage(page.GetPageID(), false)
 					return fmt.Errorf("failed to serialize parent node %d after updating promoted key value: %w", node.pageID, errS)
@@ -586,7 +649,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 			if fetchErr != nil {
 				return fmt.Errorf("failed to fetch correct child %d after split: %w", descendChildPageID, fetchErr)
 			}
-			return bt.insertNonFull(descendChildNode, descendChildPage, key, value, incrementSize) // Recursive call unpins
+			return bt.insertNonFull(descendChildNode, descendChildPage, key, value, incrementSize, txnID) // Recursive call unpins
 		} else {
 			// Child has space. Unpin current parent node before descending.
 			unpinErr := bt.bpm.UnpinPage(page.GetPageID(), false)
@@ -595,7 +658,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 				return fmt.Errorf("failed to unpin parent page %d before descending: %w", page.GetPageID(), unpinErr)
 			}
 			// Recurse into the child
-			return bt.insertNonFull(childNode, childPage, key, value, incrementSize) // Recursive call unpins
+			return bt.insertNonFull(childNode, childPage, key, value, incrementSize, txnID) // Recursive call unpins
 		}
 	}
 }
@@ -605,7 +668,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 // It serializes and unpins `childToSplitPage` and the new sibling page.
 // It modifies `parentNode` and marks `parentPage` dirty, but *does not unpin* `parentPage`.
 // The caller (`insertNonFull`) is responsible for serializing and unpinning `parentPage`.
-func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *Page, childIdx int, childToSplitNode *Node[K, V], childToSplitPage *Page) error {
+func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *Page, childIdx int, childToSplitNode *Node[K, V], childToSplitPage *Page, txnID uint64) error {
 	t := bt.degree // B-tree degree/order
 
 	// 1. Create a new page for the new sibling node
@@ -652,9 +715,9 @@ func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *Page, chil
 	parentNode.values = slices.Insert(parentNode.values, childIdx, middleValue)
 	parentNode.childPageIDs = slices.Insert(parentNode.childPageIDs, childIdx+1, newSiblingPageID)
 
-	// TODO: WAL - Log modifications to parentNode, childToSplitNode, newSiblingNode
-	log.Printf("DEBUG: Split child %d into new sibling %d. Promoted key %v to parent %d.",
-		childToSplitNode.pageID, newSiblingPageID, middleKey, parentNode.pageID)
+	// TODO: WAL - Log modifications to parentNode, childToSplitNode, newSiblingNode with TxnID
+	log.Printf("DEBUG: Txn %d: Split child %d into new sibling %d. Promoted key %v to parent %d.",
+		txnID, childToSplitNode.pageID, newSiblingPageID, parentNode.pageID)
 
 	// 7. Serialize the modified child and the new sibling node
 	var firstErr error
@@ -680,10 +743,19 @@ func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *Page, chil
 	return firstErr
 }
 
-// --- Deletion Implementation (Persistent) ---
+// Delete removes a key-value pair from the B-tree. If txnID is 0, it's an auto-commit operation.
+func (bt *BTree[K, V]) Delete(key K, txnID uint64) error {
+	// Acquire lock for the key
+	if err := bt.acquireLock(key, txnID); err != nil {
+		return fmt.Errorf("failed to acquire lock for key %v: %w", key, err)
+	}
+	defer func() {
+		// For auto-commit, release immediately. For 2PC, locks are released by Commit/Abort.
+		if txnID == 0 {
+			bt.releaseLock(key, txnID)
+		}
+	}()
 
-// Delete removes a key-value pair from the B-tree.
-func (bt *BTree[K, V]) Delete(key K) error {
 	if bt.rootPageID == InvalidPageID {
 		return ErrKeyNotFound // Cannot delete from an empty tree
 	}
@@ -705,13 +777,13 @@ func (bt *BTree[K, V]) Delete(key K) error {
 	}
 
 	// Perform the recursive deletion. It handles unpinning of pages.
-	wasDeleted, err := bt.deleteRecursive(rootNode, rootPage, key)
+	wasDeleted, err := bt.deleteRecursive(rootNode, rootPage, key, txnID)
 	if err != nil {
 		return fmt.Errorf("recursive deletion failed for key %v: %w", key, err)
 	}
 	if !wasDeleted {
 		// This should theoretically not happen if pre-search found the key
-		log.Printf("WARNING: Key %v found in pre-search but not deleted by recursive delete.", key)
+		log.Printf("WARNING: Txn %d: Key %v found in pre-search but not deleted by recursive delete.", txnID, key)
 		return ErrKeyNotFound
 	}
 
@@ -729,7 +801,7 @@ func (bt *BTree[K, V]) Delete(key K) error {
 		if len(currentRootNode.childPageIDs) == 1 {
 			oldRootPageID := bt.rootPageID
 			bt.rootPageID = currentRootNode.childPageIDs[0] // The only child becomes the new root
-			log.Printf("DEBUG: Root %d has 0 keys and 1 child. New root is child %d.", oldRootPageID, bt.rootPageID)
+			log.Printf("DEBUG: Txn %d: Root %d has 0 keys and 1 child. New root is child %d.", txnID, oldRootPageID, bt.rootPageID)
 
 			// Update the file header with the new root PageID
 			if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader) { h.RootPageID = bt.rootPageID }); err != nil {
@@ -748,7 +820,7 @@ func (bt *BTree[K, V]) Delete(key K) error {
 			// This state usually means the tree became completely empty (last key deleted from a root that was also a leaf).
 			// The root should remain a single empty leaf page. No change to bt.rootPageID needed if it's already pointing to this empty leaf.
 			// The `deleteRecursive` should have already made `currentRootNode` an empty leaf.
-			log.Printf("DEBUG: B-tree root %d became empty after deletion.", bt.rootPageID)
+			log.Printf("DEBUG: Txn %d: B-tree root %d became empty after deletion.", txnID, bt.rootPageID)
 		}
 	}
 
@@ -770,7 +842,7 @@ func (bt *BTree[K, V]) Delete(key K) error {
 // deleteRecursive attempts to delete a key from the subtree rooted at `node`.
 // It takes ownership of `node` and `nodePage`, unpinning `nodePage` before returning.
 // Returns (true if a key was deleted, error).
-func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) (bool, error) {
+func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K, txnID uint64) (bool, error) {
 	idx, found := slices.BinarySearchFunc(node.keys, key, bt.keyOrder)
 	var err error
 	var actuallyDeleted bool = false
@@ -781,9 +853,9 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) 
 			// Remove the key and its value from the leaf node.
 			node.keys = slices.Delete(node.keys, idx, idx+1)
 			node.values = slices.Delete(node.values, idx, idx+1)
-			log.Printf("DEBUG: Deleted key %v from leaf node %d. New numKeys: %d", key, node.pageID, len(node.keys))
+			log.Printf("DEBUG: Txn %d: Deleted key %v from leaf node %d. New numKeys: %d", txnID, key, node.pageID, len(node.keys))
 
-			// TODO: WAL Log key deletion from leaf
+			// TODO: WAL Log key deletion from leaf with TxnID
 			// Serialize the modified leaf node and mark it dirty.
 			if errS := node.serialize(nodePage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
 				bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin even on serialize failure
@@ -793,7 +865,7 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) 
 			err = bt.bpm.UnpinPage(nodePage.GetPageID(), true) // Unpin, mark dirty
 		} else {
 			// Key not found in this leaf node.
-			log.Printf("DEBUG: Key %v not found in leaf node %d during recursive delete.", key, node.pageID)
+			log.Printf("DEBUG: Txn %d: Key %v not found in leaf node %d during recursive delete.", txnID, key, node.pageID)
 			err = bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin, page is clean
 		}
 		return actuallyDeleted, err
@@ -803,8 +875,8 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) 
 	if found {
 		// Case 2: Key `k` is found in this internal node `node` at `node.keys[idx]`.
 		// We need to replace `k` with its predecessor or successor, and then recursively delete that predecessor/successor.
-		log.Printf("DEBUG: Key %v found in internal node %d at index %d.", key, node.pageID, idx)
-		actuallyDeleted, err = bt.deleteFromInternalNode(node, nodePage, key, idx)
+		log.Printf("DEBUG: Txn %d: Key %v found in internal node %d at index %d.", txnID, key, node.pageID, idx)
+		actuallyDeleted, err = bt.deleteFromInternalNode(node, nodePage, key, idx, txnID)
 		// `deleteFromInternalNode` is responsible for serializing `nodePage` (if modified) and unpinning it.
 	} else {
 		// Case 3: Key `k` is NOT in this internal node `node`. Recurse into the appropriate child.
@@ -825,11 +897,11 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) 
 				// Log but try to continue, as `ensureChildHasEnoughKeys` might recover
 				log.Printf("WARNING: Error unpinning child page %d before ensureChildHasEnoughKeys: %v", childPage.GetPageID(), errUnpinChild)
 			}
-			log.Printf("DEBUG: Child node %d is under-full. Calling ensureChildHasEnoughKeys from parent %d.", childNode.pageID, node.pageID)
+			log.Printf("DEBUG: Txn %d: Child node %d is under-full. Calling ensureChildHasEnoughKeys from parent %d.", txnID, childNode.pageID, node.pageID)
 
 			// This function will ensure `node.childPageIDs[idx]` now points to a child with enough keys.
 			// It modifies `node` (parent) and `nodePage` (marks dirty).
-			errEnsure := bt.ensureChildHasEnoughKeys(node, nodePage, idx)
+			errEnsure := bt.ensureChildHasEnoughKeys(node, nodePage, idx, txnID)
 			if errEnsure != nil {
 				bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin parent if ensure fails
 				return false, fmt.Errorf("failed to ensure child %d has enough keys: %w", childNode.pageID, errEnsure)
@@ -843,8 +915,8 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) 
 			if foundAfterEnsure {
 				// Key was found in the parent after reorganization (e.g., a child merged up).
 				// We now fall back to Case 2.
-				log.Printf("DEBUG: Key %v found in parent %d after ensureChildHasEnoughKeys. Recursing into deleteFromInternalNode.", key, node.pageID)
-				actuallyDeleted, err = bt.deleteFromInternalNode(node, nodePage, key, idx)
+				log.Printf("DEBUG: Txn %d: Key %v found in parent %d after ensureChildHasEnoughKeys. Recursing into deleteFromInternalNode.", txnID, key, node.pageID)
+				actuallyDeleted, err = bt.deleteFromInternalNode(node, nodePage, key, idx, txnID)
 				// deleteFromInternalNode will serialize and unpin nodePage.
 				return actuallyDeleted, err
 			}
@@ -859,11 +931,11 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) 
 				bt.bpm.UnpinPage(nodePage.GetPageID(), true) // Parent was dirtied by ensure
 				return false, fmt.Errorf("failed to re-fetch child %d after ensureChildHasEnoughKeys: %w", reFetchedChildPageID, reFetchErr)
 			}
-			actuallyDeleted, err = bt.deleteRecursive(reFetchedChildNode, reFetchedChildPage, key) // Recursive call unpins child
+			actuallyDeleted, err = bt.deleteRecursive(reFetchedChildNode, reFetchedChildPage, key, txnID) // Recursive call unpins child
 		} else {
 			// Child has enough keys, just recurse.
-			log.Printf("DEBUG: Child node %d has enough keys. Recursing into child.", childNode.pageID)
-			actuallyDeleted, err = bt.deleteRecursive(childNode, childPage, key) // Recursive call unpins child
+			log.Printf("DEBUG: Txn %d: Child node %d has enough keys. Recursing into child.", txnID, childNode.pageID)
+			actuallyDeleted, err = bt.deleteRecursive(childNode, childPage, key, txnID) // Recursive call unpins child
 		}
 		// After the recursive call, unpin the parent page (`nodePage`).
 		// It might have been dirtied by `ensureChildHasEnoughKeys` or a subsequent write.
@@ -877,11 +949,11 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K) 
 // deleteFromInternalNode handles the case where the key to delete (`key`) is found in an internal `node`.
 // It replaces `key` with its predecessor or successor, and then recursively deletes that predecessor/successor.
 // It takes ownership of `node` and `nodePage`, responsible for serializing `nodePage` (if modified) and unpinning it.
-func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, key K, idxInNode int) (bool, error) {
+func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, key K, idxInNode int, txnID uint64) (bool, error) {
 	t := bt.degree
 	var err error
 	keyActuallyRemoved := false // This will be true if the replacement key is successfully deleted from child
-
+	actuallyDeleted := false
 	// Fetch left child (subtree containing predecessor of key)
 	leftChildPageID := node.childPageIDs[idxInNode]
 	leftChildNode, leftChildPage, fetchErr := bt.fetchNode(leftChildPageID) // Left child is pinned
@@ -902,7 +974,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 	if len(leftChildNode.keys) >= t {
 		// Case 2a: Left child has at least 't' keys.
 		// Find the predecessor of `key` (rightmost key in left child's subtree).
-		log.Printf("DEBUG: Borrowing predecessor from left child %d for key %v in parent %d.", leftChildNode.pageID, key, node.pageID)
+		log.Printf("DEBUG: Txn %d: Borrowing predecessor from left child %d for key %v in parent %d.", txnID, leftChildNode.pageID, key, node.pageID)
 		predKey, predValue := bt.findPredecessor(leftChildNode, leftChildPage) // `findPredecessor` unpins `leftChildPage`
 
 		// Replace `key` in `node` with `predKey` and `predValue`.
@@ -925,11 +997,11 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 		}
 
 		// Recursively delete the predecessor from the left child's subtree.
-		keyActuallyRemoved, err = bt.deleteRecursive(reFetchedLeftChildNode, reFetchedLeftChildPage, predKey)
+		keyActuallyRemoved, err = bt.deleteRecursive(reFetchedLeftChildNode, reFetchedLeftChildPage, predKey, txnID)
 		// `deleteRecursive` will serialize and unpin `reFetchedLeftChildPage`.
 		if err != nil {
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin parent on error
-			return false, err
+			return false, fmt.Errorf("failed to delete recursive. isKeyDelete: %v. Error: %w", keyActuallyRemoved, err)
 		}
 
 		// Parent `node` was modified (key/value replaced). Serialize and unpin it.
@@ -942,7 +1014,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 	} else if len(rightChildNode.keys) >= t {
 		// Case 2b: Right child has at least 't' keys.
 		// Find the successor of `key` (leftmost key in right child's subtree).
-		log.Printf("DEBUG: Borrowing successor from right child %d for key %v in parent %d.", rightChildNode.pageID, key, node.pageID)
+		log.Printf("DEBUG: Txn %d: Borrowing successor from right child %d for key %v in parent %d.", txnID, rightChildNode.pageID, key, node.pageID)
 		succKey, succValue := bt.findSuccessor(rightChildNode, rightChildPage) // `findSuccessor` unpins `rightChildPage`
 
 		// Replace `key` in `node` with `succKey` and `succValue`.
@@ -964,7 +1036,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 		}
 
 		// Recursively delete the successor from the right child's subtree.
-		keyActuallyRemoved, err = bt.deleteRecursive(reFetchedRightChildNode, reFetchedRightChildPage, succKey)
+		keyActuallyRemoved, err = bt.deleteRecursive(reFetchedRightChildNode, reFetchedRightChildPage, succKey, txnID)
 		// `deleteRecursive` will serialize and unpin `reFetchedRightChildPage`.
 		if err != nil {
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin parent on error
@@ -983,8 +1055,8 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 		// Merge `key` (from `node`) and all of `rightChildNode` into `leftChildNode`.
 		// `node` will lose `key` and its pointer to `rightChild`.
 		// `leftChildNode` will now contain `2t-1` keys (full).
-		log.Printf("DEBUG: Merging child %d (left) and %d (right) for key %v in parent %d.",
-			leftChildNode.pageID, rightChildNode.pageID, key, node.pageID)
+		log.Printf("DEBUG: Txn %d: Merging child %d (left) and %d (right) for key %v in parent %d.",
+			txnID, leftChildNode.pageID, rightChildNode.pageID, key, node.pageID)
 
 		// `mergeChildrenAndKey` is a high-level function that handles:
 		// 1. Moving `key` and `value` from `node` to `leftChildNode`.
@@ -993,7 +1065,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 		// 4. Serializing `leftChildNode` and marking `nodePage` dirty.
 		// 5. Unpinning `leftChildPage` and `rightChildPage`.
 		// 6. Deallocating `rightChildPageID`.
-		err = bt.mergeChildrenAndKey(node, nodePage, idxInNode, leftChildNode, leftChildPage, rightChildNode, rightChildPage, key)
+		err = bt.mergeChildrenAndKey(node, nodePage, idxInNode, leftChildNode, leftChildPage, rightChildNode, rightChildPage, key, txnID)
 		if err != nil {
 			// If merge fails, some pages might still be pinned. Attempt to unpin for clean exit.
 			bt.bpm.UnpinPage(leftChildPage.GetPageID(), false)
@@ -1011,7 +1083,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 			bt.bpm.UnpinPage(nodePage.GetPageID(), true) // Parent was dirtied by merge
 			return false, fmt.Errorf("failed to re-fetch merged child %d: %w", leftChildPageID, reFetchErr)
 		}
-		actuallyDeleted, err := bt.deleteRecursive(reFetchedLeftChildNode, reFetchedLeftChildPage, key)
+		actuallyDeleted, err := bt.deleteRecursive(reFetchedLeftChildNode, reFetchedLeftChildPage, key, txnID)
 		// `deleteRecursive` will serialize and unpin `reFetchedLeftChildPage`.
 		log.Println("Actually Deleted", actuallyDeleted)
 		// Finally, unpin the parent node's page.
@@ -1023,7 +1095,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 			err = e // Propagate unpin error if no other error occurred
 		}
 	}
-	return keyActuallyRemoved, err
+	return actuallyDeleted, err
 }
 
 // findPredecessor finds the rightmost key in the subtree rooted at `node`.
@@ -1091,7 +1163,7 @@ func (bt *BTree[K, V]) findSuccessor(node *Node[K, V], nodePage *Page) (K, V) {
 // It takes ownership of `parentNode` and `parentPage` but *does not unpin `parentPage`*.
 // It fetches, modifies, serializes, and unpins the involved child and sibling pages.
 // It marks `parentPage` dirty if `parentNode` is modified.
-func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPage *Page, childIdx int) error {
+func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPage *Page, childIdx int, txnID uint64) error {
 	childPageID := parentNode.childPageIDs[childIdx]
 	childNode, childPage, err := bt.fetchNode(childPageID) // Child is pinned
 	if err != nil {
@@ -1114,7 +1186,7 @@ func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPa
 		// Current check `len(childNode.keys) < bt.degree` is for `t-1` keys. So if it has `t-2` or fewer keys, it's underfull.
 		// If it has `t-1` keys, it's at minimum, but may need a borrow for recursive descent.
 		// Let's keep the existing check for underflow.
-		log.Printf("DEBUG: Child node %d already has enough keys (%d >= %d). No action needed.", childNode.pageID, len(childNode.keys), t)
+		log.Printf("DEBUG: Txn %d: Child node %d already has enough keys (%d >= %d). No action needed.", txnID, childNode.pageID, len(childNode.keys), t)
 		return bt.bpm.UnpinPage(childPage.GetPageID(), false) // Unpin clean child
 	}
 
@@ -1128,8 +1200,8 @@ func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPa
 		}
 
 		if len(leftSiblingNode.keys) >= t { // Left sibling has enough to lend
-			log.Printf("DEBUG: Borrowing from left sibling %d for child %d.", leftSiblingNode.pageID, childNode.pageID)
-			err = bt.borrowFromLeftSibling(parentNode, parentPage, childIdx, childNode, childPage, leftSiblingNode, leftSiblingPage)
+			log.Printf("DEBUG: Txn %d: Borrowing from left sibling %d for child %d.", txnID, leftSiblingNode.pageID, childNode.pageID)
+			err = bt.borrowFromLeftSibling(parentNode, parentPage, childIdx, childNode, childPage, leftSiblingNode, leftSiblingPage, txnID)
 			// `borrowFromLeftSibling` handles serialization and unpinning of `childPage` and `leftSiblingPage`.
 			// It also marks `parentPage` dirty.
 			return err // Propagate error from borrow
@@ -1151,8 +1223,8 @@ func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPa
 		}
 
 		if len(rightSiblingNode.keys) >= t { // Right sibling has enough to lend
-			log.Printf("DEBUG: Borrowing from right sibling %d for child %d.", rightSiblingNode.pageID, childNode.pageID)
-			err = bt.borrowFromRightSibling(parentNode, parentPage, childIdx, childNode, childPage, rightSiblingNode, rightSiblingPage)
+			log.Printf("DEBUG: Txn %d: Borrowing from right sibling %d for child %d.", txnID, rightSiblingNode.pageID, childNode.pageID)
+			err = bt.borrowFromRightSibling(parentNode, parentPage, childIdx, childNode, childPage, rightSiblingNode, rightSiblingPage, txnID)
 			// `borrowFromRightSibling` handles serialization and unpinning of `childPage` and `rightSiblingPage`.
 			// It also marks `parentPage` dirty.
 			return err
@@ -1171,17 +1243,17 @@ func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPa
 		// Continue
 	}
 
-	log.Printf("DEBUG: Neither sibling can lend for child %d. Performing merge.", childNode.pageID)
+	log.Printf("DEBUG: Txn %d: Neither sibling can lend for child %d. Performing merge.", txnID, childNode.pageID)
 	// Decide which sibling to merge with (prefer left if possible, else right).
 	if childIdx > 0 { // Merge child with left sibling
 		// `mergeChildrenAndKey` expects `leftMergeChildIdx` to be the index of the LEFT child of the merge pair.
 		// So, merge `parentNode.childPageIDs[childIdx-1]` (left sibling) and `parentNode.childPageIDs[childIdx]` (current child).
 		// The key `parentNode.keys[childIdx-1]` will come down from the parent.
-		return bt.mergeChildrenAndKey(parentNode, parentPage, childIdx-1, nil, nil, nil, nil, parentNode.keys[childIdx-1])
+		return bt.mergeChildrenAndKey(parentNode, parentPage, childIdx-1, nil, nil, nil, nil, parentNode.keys[childIdx-1], txnID)
 	} else { // Merge child with right sibling (current child is `childIdx=0`)
 		// Merge `parentNode.childPageIDs[childIdx]` (current child) and `parentNode.childPageIDs[childIdx+1]` (right sibling).
 		// The key `parentNode.keys[childIdx]` will come down from the parent.
-		return bt.mergeChildrenAndKey(parentNode, parentPage, childIdx, nil, nil, nil, nil, parentNode.keys[childIdx])
+		return bt.mergeChildrenAndKey(parentNode, parentPage, childIdx, nil, nil, nil, nil, parentNode.keys[childIdx], txnID)
 	}
 }
 
@@ -1192,9 +1264,9 @@ func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPa
 func (bt *BTree[K, V]) borrowFromLeftSibling(
 	parentNode *Node[K, V], parentPage *Page, childIdx int,
 	childNode *Node[K, V], childPage *Page,
-	leftSiblingNode *Node[K, V], leftSiblingPage *Page) error {
+	leftSiblingNode *Node[K, V], leftSiblingPage *Page, txnID uint64) error {
 
-	log.Printf("DEBUG: Borrowing from left sibling: parent %d, child %d, leftSibling %d", parentNode.pageID, childNode.pageID, leftSiblingNode.pageID)
+	log.Printf("DEBUG: Txn %d: Borrowing from left sibling: parent %d, child %d, leftSibling %d", txnID, parentNode.pageID, childNode.pageID, leftSiblingNode.pageID)
 
 	// Key/value from parent that moves down to the child
 	keyFromParent := parentNode.keys[childIdx-1]
@@ -1256,9 +1328,9 @@ func (bt *BTree[K, V]) borrowFromLeftSibling(
 func (bt *BTree[K, V]) borrowFromRightSibling(
 	parentNode *Node[K, V], parentPage *Page, childIdx int,
 	childNode *Node[K, V], childPage *Page,
-	rightSiblingNode *Node[K, V], rightSiblingPage *Page) error {
+	rightSiblingNode *Node[K, V], rightSiblingPage *Page, txnID uint64) error {
 
-	log.Printf("DEBUG: Borrowing from right sibling: parent %d, child %d, rightSibling %d", parentNode.pageID, childNode.pageID, rightSiblingNode.pageID)
+	log.Printf("DEBUG: Txn %d: Borrowing from right sibling: parent %d, child %d, rightSibling %d", txnID, parentNode.pageID, childNode.pageID, rightSiblingNode.pageID)
 
 	// Key/value from parent that moves down to the end of the child
 	keyFromParent := parentNode.keys[childIdx]
@@ -1279,7 +1351,7 @@ func (bt *BTree[K, V]) borrowFromRightSibling(
 	// If children are not leaves, move the leftmost child pointer from right sibling to rightmost of child
 	if !childNode.isLeaf {
 		childPointerFromSibling := rightSiblingNode.childPageIDs[0]
-		childNode.childPageIDs = append(childNode.childPageIDs, childPointerFromSibling)
+		childNode.childPageIDs = slices.Insert(childNode.childPageIDs, 0, childPointerFromSibling)
 		rightSiblingNode.childPageIDs = slices.Delete(rightSiblingNode.childPageIDs, 0, 1) // Remove first child pointer
 	}
 
@@ -1327,8 +1399,9 @@ func (bt *BTree[K, V]) mergeChildrenAndKey(
 	_leftNodeHint *Node[K, V], _leftPageHint *Page,
 	_rightNodeHint *Node[K, V], _rightPageHint *Page,
 	originalKeyToDelete K, // The key that was in parentNode and now needs to be deleted from the merged child
-) error {
-	log.Printf("DEBUG: Initiating merge operation for parent %d, left child index %d, key to delete: %v", parentNode.pageID, leftMergeChildIdx, originalKeyToDelete)
+	txnID uint64) error {
+
+	log.Printf("DEBUG: Txn %d: Initiating merge operation for parent %d, left child index %d, key to delete: %v", txnID, parentNode.pageID, leftMergeChildIdx, originalKeyToDelete)
 
 	// 1. Fetch left child
 	leftChildPageID := parentNode.childPageIDs[leftMergeChildIdx]
@@ -1349,7 +1422,7 @@ func (bt *BTree[K, V]) mergeChildrenAndKey(
 	keyFromParent := parentNode.keys[leftMergeChildIdx]
 	valueFromParent := parentNode.values[leftMergeChildIdx]
 
-	// TODO: WAL Log: merge operation, including deallocation of rightChildPageID
+	// TODO: WAL Log: merge operation, including deallocation of rightChildPageID with TxnID
 
 	// 3. Move key from parent down to leftChild.
 	leftChildNode.keys = append(leftChildNode.keys, keyFromParent)
@@ -1361,16 +1434,16 @@ func (bt *BTree[K, V]) mergeChildrenAndKey(
 	if !leftChildNode.isLeaf {
 		leftChildNode.childPageIDs = append(leftChildNode.childPageIDs, rightChildNode.childPageIDs...)
 	}
-	log.Printf("DEBUG: Merged content into left child %d. New keys: %d, New children: %d",
-		leftChildNode.pageID, len(leftChildNode.keys), len(leftChildNode.childPageIDs))
+	log.Printf("DEBUG: Txn %d: Merged content into left child %d. New keys: %d, New children: %d",
+		txnID, leftChildNode.pageID, len(leftChildNode.keys), len(leftChildNode.childPageIDs))
 
 	// 5. Remove the merged key/value from parent.
 	parentNode.keys = slices.Delete(parentNode.keys, leftMergeChildIdx, leftMergeChildIdx+1)
 	parentNode.values = slices.Delete(parentNode.values, leftMergeChildIdx, leftMergeChildIdx+1)
 	// 6. Remove the rightChild pointer from parent.
 	parentNode.childPageIDs = slices.Delete(parentNode.childPageIDs, leftMergeChildIdx+1, leftMergeChildIdx+2)
-	log.Printf("DEBUG: Updated parent %d after merge. New keys: %d, New children: %d",
-		parentNode.pageID, len(parentNode.keys), len(parentNode.childPageIDs))
+	log.Printf("DEBUG: Txn %d: Updated parent %d after merge. New keys: %d, New children: %d",
+		txnID, parentNode.pageID, len(parentNode.keys), len(parentNode.childPageIDs))
 
 	parentPage.SetDirty(true) // Parent node modified
 
@@ -1395,128 +1468,267 @@ func (bt *BTree[K, V]) mergeChildrenAndKey(
 
 	// 10. Recursively delete the `originalKeyToDelete` from the now-merged `leftChildNode`.
 	// `leftChildPage` is still pinned and dirty. The `deleteRecursive` call will handle its final unpinning.
-	log.Printf("DEBUG: Recursively deleting original key %v from merged child %d.", originalKeyToDelete, leftChildNode.pageID)
-	_, errDel := bt.deleteRecursive(leftChildNode, leftChildPage, originalKeyToDelete)
+	log.Printf("DEBUG: Txn %d: Recursively deleting original key %v from merged child %d.", txnID, originalKeyToDelete, leftChildNode.pageID)
+	_, errDel := bt.deleteRecursive(leftChildNode, leftChildPage, originalKeyToDelete, txnID)
 	return errDel // This error includes final unpinning of leftChildPage
 }
 
-// Close flushes all dirty pages and closes the database file.
-func (bt *BTree[K, V]) Close() error {
-	if bt.bpm == nil {
-		return errors.New("btree buffer pool manager is nil, cannot close")
+// --- NEW: 2PC Participant Methods ---
+
+// Prepare handles the PREPARE phase of a 2PC transaction.
+// It attempts to acquire locks for all keys involved in the operations and logs a PREPARE record.
+func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) error {
+	bt.keyLocksMu.Lock()
+	defer bt.keyLocksMu.Unlock()
+
+	if _, ok := bt.transactionTable[txnID]; ok {
+		return fmt.Errorf("%w: transaction %d already exists", ErrTxnAlreadyExists, txnID)
 	}
 
-	log.Println("INFO: Closing B-tree database...")
-	// Update persisted tree size in header one last time (if you have an accurate in-memory size tracker)
-	// For this implementation, TreeSize is updated on every insert/delete, but a final checkpoint is good.
-	// If bt.size was an accurate in-memory field, you'd do:
-	// if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader){ h.TreeSize = bt.sizeInMemory }); err != nil {
-	// 	fmt.Fprintf(os.Stderr, "Error updating tree size in header on close: %v\n", err)
-	// }
+	txn := &Transaction{
+		ID:        txnID,
+		State:     TxnStateRunning, // Initially running
+		locksHeld: make(map[string]struct{}),
+	}
+	bt.transactionTable[txnID] = txn
 
-	// Flush all dirty pages from the buffer pool to disk
-	flushErr := bt.bpm.FlushAllPages()
-	if flushErr != nil {
-		log.Printf("ERROR: Error flushing all pages on close: %v", flushErr)
+	log.Printf("INFO: Txn %d: Received PREPARE request. Attempting to acquire locks.", txnID)
+
+	// Acquire locks for all keys involved in the transaction on this shard
+	for _, op := range operations {
+		keyStr := fmt.Sprintf("%v", op.Key) // Convert K to string for map key
+		if err := bt.acquireLockInternal(keyStr, txnID); err != nil {
+			// If lock acquisition fails, abort the transaction on this participant.
+			log.Printf("ERROR: Txn %d: Failed to acquire lock for key %v during PREPARE: %v. Aborting locally.", txnID, op.Key, err)
+			bt.releaseAllLocksForTxn(txnID)    // Release any locks already held
+			delete(bt.transactionTable, txnID) // Remove from table
+			return fmt.Errorf("%w: failed to acquire lock for key %v", ErrPrepareFailed, op.Key)
+		}
+		txn.locksHeld[keyStr] = struct{}{} // Track locks held by this transaction
+		log.Printf("DEBUG: Txn %d: Acquired lock for key %v.", txnID, op.Key)
 	}
 
-	// Close the underlying disk manager (which closes the file)
-	closeErr := bt.diskManager.Close()
-	if closeErr != nil {
-		log.Printf("ERROR: Error closing disk manager on close: %v", closeErr)
+	// Log the PREPARE record
+	// This record needs to contain enough info to redo/undo the operations if needed.
+	// For V1, we'll log a generic PREPARE record. Full operations would be serialized into NewData.
+	// For now, we assume the Coordinator will re-send operations on COMMIT/ABORT.
+	lsn, err := bt.logManager.Append(&LogRecord{
+		TxnID:  txnID,
+		Type:   LogRecordTypePrepare,
+		PageID: InvalidPageID, // Not specific to a page, but to the transaction
+	})
+	if err != nil {
+		bt.releaseAllLocksForTxn(txnID)
+		delete(bt.transactionTable, txnID)
+		return fmt.Errorf("%w: failed to log PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
+	}
+	// Flush the log to ensure the PREPARE record is durable before voting COMMIT
+	if err := bt.logManager.Flush(lsn); err != nil {
+		bt.releaseAllLocksForTxn(txnID)
+		delete(bt.transactionTable, txnID)
+		return fmt.Errorf("%w: failed to flush log for PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
 	}
 
-	if flushErr != nil || closeErr != nil {
-		return fmt.Errorf("errors occurred during B-tree close: flush error: %v, close error: %v", flushErr, closeErr)
+	txn.State = TxnStatePrepared // Transition state to PREPARED
+	log.Printf("INFO: Txn %d: PREPARED. All locks acquired and PREPARE record logged.", txnID)
+	return nil // Vote COMMIT
+}
+
+// Commit handles the COMMIT phase of a 2PC transaction.
+// It logs a COMMIT record and releases locks.
+func (bt *BTree[K, V]) Commit(txnID uint64) error {
+	bt.keyLocksMu.Lock()
+	defer bt.keyLocksMu.Unlock()
+
+	txn, ok := bt.transactionTable[txnID]
+	if !ok {
+		return fmt.Errorf("%w: transaction %d not found in table", ErrTxnNotFound, txnID)
 	}
-	log.Println("INFO: B-tree database closed successfully.")
+	if txn.State != TxnStatePrepared && txn.State != TxnStateRunning { // Can commit from Running if coordinator crashed before prepare log
+		log.Printf("WARNING: Txn %d: Attempted to COMMIT from state %v. Expected PREPARED or RUNNING. Proceeding.", txnID, txn.State)
+	}
+
+	log.Printf("INFO: Txn %d: Received COMMIT request. Logging COMMIT record.", txnID)
+
+	// Log the COMMIT record
+	lsn, err := bt.logManager.Append(&LogRecord{
+		TxnID:  txnID,
+		Type:   LogRecordTypeCommitTxn,
+		PageID: InvalidPageID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to log COMMIT record for txn %d: %w", txnID, err)
+	}
+	// Flush the log to ensure COMMIT record is durable
+	if err := bt.logManager.Flush(lsn); err != nil {
+		return fmt.Errorf("failed to flush log for COMMIT record for txn %d: %w", txnID, err)
+	}
+
+	txn.State = TxnStateCommitted      // Transition state to COMMITTED
+	bt.releaseAllLocksForTxn(txnID)    // Release all locks held by this transaction
+	delete(bt.transactionTable, txnID) // Remove from in-memory table
+
+	log.Printf("INFO: Txn %d: COMMITTED. Locks released.", txnID)
 	return nil
 }
 
-// String provides a string representation of the B-tree for debugging.
-func (bt *BTree[K, V]) String() string {
-	if bt.rootPageID == InvalidPageID {
-		return "BTree (empty or not initialized)\n"
+// Abort handles the ABORT phase of a 2PC transaction.
+// It logs an ABORT record, releases locks, and rolls back changes (V1: conceptual).
+func (bt *BTree[K, V]) Abort(txnID uint64) error {
+	bt.keyLocksMu.Lock()
+	defer bt.keyLocksMu.Unlock()
+
+	txn, ok := bt.transactionTable[txnID]
+	if !ok {
+		return fmt.Errorf("%w: transaction %d not found in table", ErrTxnNotFound, txnID)
 	}
-	str, err := bt.stringRecursive(bt.rootPageID, 0)
+	if txn.State != TxnStatePrepared && txn.State != TxnStateRunning {
+		log.Printf("WARNING: Txn %d: Attempted to ABORT from state %v. Expected PREPARED or RUNNING. Proceeding.", txnID, txn.State)
+	}
+
+	log.Printf("INFO: Txn %d: Received ABORT request. Logging ABORT record.", txnID)
+
+	// Log the ABORT record
+	lsn, err := bt.logManager.Append(&LogRecord{
+		TxnID:  txnID,
+		Type:   LogRecordTypeAbortTxn,
+		PageID: InvalidPageID,
+	})
 	if err != nil {
-		return fmt.Sprintf("Error generating string: %v\n", err)
+		return fmt.Errorf("failed to log ABORT record for txn %d: %w", txnID, err)
 	}
-	return str
+	// Flush the log to ensure ABORT record is durable
+	if err := bt.logManager.Flush(lsn); err != nil {
+		return fmt.Errorf("failed to flush log for ABORT record for txn %d: %w", txnID, err)
+	}
+
+	// TODO: Rollback changes made by this transaction.
+	// This would involve reading the WAL backwards from the PREPARE record
+	// and applying OldData to reverse changes. For V1, this is conceptual.
+	log.Printf("WARNING: Txn %d: Rollback logic is conceptual for V1. Changes are not actively undone.", txnID)
+
+	txn.State = TxnStateAborted        // Transition state to ABORTED
+	bt.releaseAllLocksForTxn(txnID)    // Release all locks held by this transaction
+	delete(bt.transactionTable, txnID) // Remove from in-memory table
+
+	log.Printf("INFO: Txn %d: ABORTED. Locks released.", txnID)
+	return nil
 }
 
-// stringRecursive is a helper for String() to traverse and format the tree.
-func (bt *BTree[K, V]) stringRecursive(pageID PageID, level int) (string, error) {
-	if pageID == InvalidPageID {
-		return "", nil
-	}
-	node, page, err := bt.fetchNode(pageID) // Node is pinned
-	if err != nil {
-		return "", fmt.Errorf("stringRecursive failed to fetch page %d: %w", pageID, err)
-	}
-	// Ensure the page is unpinned once we're done with it for this string representation.
-	defer bt.bpm.UnpinPage(page.GetPageID(), false)
-
-	s := ""
-	indent := ""
-	for i := 0; i < level; i++ {
-		indent += "  " // Two spaces per level
-	}
-	s += fmt.Sprintf("%sPageID: %d (Leaf: %t, Keys: %d)\n", indent, node.pageID, node.isLeaf, len(node.keys))
-	s += fmt.Sprintf("%s  Keys: %v\n", indent, node.keys)
-	s += fmt.Sprintf("%s  Values: %v\n", indent, node.values)
-	if !node.isLeaf {
-		s += fmt.Sprintf("%s  ChildPageIDs (%d): %v\n", indent, len(node.childPageIDs), node.childPageIDs)
-		for i, childPID := range node.childPageIDs {
-			if childPID != InvalidPageID {
-				childStr, err := bt.stringRecursive(childPID, level+1)
-				if err != nil {
-					s += fmt.Sprintf("%s  [%d]: Error fetching child %d: %v\n", indent, i, childPID, err)
-				} else {
-					s += childStr
-				}
-			} else {
-				s += fmt.Sprintf("%s  [%d]: <InvalidChildPageID>\n", indent, i)
-			}
+// ProcessOperations processes a list of operations within a transaction context.
+// This is called by Prepare.
+func (bt *BTree[K, V]) ProcessOperations(txnID uint64, operations []TransactionOperation) error {
+	log.Printf("DEBUG: Txn %d: Processing %d operations.", txnID, len(operations))
+	for i, op := range operations {
+		log.Printf("DEBUG: Txn %d: Processing operation %d: %s Key: %s", txnID, i, op.Command, op.Key)
+		var err error
+		switch op.Command {
+		case "PUT":
+			var k K
+			var v V
+			// Need to convert string key/value from TransactionOperation back to K/V types
+			// This requires a reverse lookup or a generic conversion function.
+			// For simplicity, assuming K is string and V is string for now.
+			k = (any)(op.Key).(K)
+			v = (any)(op.Value).(V)
+			err = bt.Insert(k, v, txnID) // Call transactional insert
+		case "DELETE":
+			var k K
+			k = (any)(op.Key).(K)
+			err = bt.Delete(k, txnID) // Call transactional delete
+		default:
+			err = fmt.Errorf("unsupported operation command: %s", op.Command)
+		}
+		if err != nil {
+			return fmt.Errorf("Txn %d: failed to process operation %d (%s %s): %w", txnID, i, op.Command, op.Key, err)
 		}
 	}
-	return s, nil
+	log.Printf("DEBUG: Txn %d: All operations processed successfully.", txnID)
+	return nil
 }
 
-// --- Default Serializers/Deserializers (Generic K, V) ---
+// acquireLock attempts to acquire a lock for a key for a given transaction.
+// It blocks until the lock is acquired or an error occurs.
+func (bt *BTree[K, V]) acquireLock(key K, txnID uint64) error {
+	keyStr := fmt.Sprintf("%v", key) // Convert K to string for map key
+	return bt.acquireLockInternal(keyStr, txnID)
+}
 
-// DefaultKeyOrder provides a comparison function for comparable types.
-func DefaultKeyOrder[K cmp.Ordered](a, b K) int {
-	if a < b {
-		return -1
+// acquireLockInternal is the internal, string-key based lock acquisition.
+func (bt *BTree[K, V]) acquireLockInternal(keyStr string, txnID uint64) error {
+	bt.keyLocksMu.Lock()
+	defer bt.keyLocksMu.Unlock()
+
+	for {
+		if ownerTxnID, ok := bt.keyLocks[keyStr]; ok {
+			if ownerTxnID == txnID {
+				// Already locked by this transaction, idempotent.
+				return nil
+			}
+			// Locked by another transaction, wait.
+			log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, ownerTxnID)
+			// For V1, simple blocking wait. In production, use condition variables or timeout.
+			// This is a busy-wait loop, which is inefficient.
+			// A production system would use a condition variable or a lock manager with queues.
+			// For now, we'll just return ErrKeyLocked to avoid indefinite blocking in a simple test.
+			// If this is called from Prepare, the Prepare will fail.
+			return ErrKeyLocked
+		} else {
+			// Lock available, acquire it.
+			bt.keyLocks[keyStr] = txnID
+			if txn, ok := bt.transactionTable[txnID]; ok {
+				txn.locksHeld[keyStr] = struct{}{}
+			}
+			log.Printf("DEBUG: Txn %d: Acquired lock for key '%s'.", txnID, keyStr)
+			return nil
+		}
 	}
-	if a > b {
-		return 1
+}
+
+// releaseLock releases the lock for a specific key held by a specific transaction.
+func (bt *BTree[K, V]) releaseLock(key K, txnID uint64) {
+	keyStr := fmt.Sprintf("%v", key) // Convert K to string for map key
+	bt.releaseLockInternal(keyStr, txnID)
+}
+
+// releaseLockInternal is the internal, string-key based lock release.
+func (bt *BTree[K, V]) releaseLockInternal(keyStr string, txnID uint64) {
+	bt.keyLocksMu.Lock()
+	defer bt.keyLocksMu.Unlock()
+
+	if ownerTxnID, ok := bt.keyLocks[keyStr]; ok {
+		if ownerTxnID == txnID {
+			delete(bt.keyLocks, keyStr)
+			if txn, ok := bt.transactionTable[txnID]; ok {
+				delete(txn.locksHeld, keyStr)
+			}
+			log.Printf("DEBUG: Txn %d: Released lock for key '%s'.", txnID, keyStr)
+		} else {
+			log.Printf("WARNING: Txn %d: Attempted to release lock for key '%s' owned by Txn %d.", txnID, keyStr, ownerTxnID)
+		}
+	} else {
+		log.Printf("WARNING: Txn %d: Attempted to release unheld lock for key '%s'.", txnID, keyStr)
 	}
-	return 0
 }
 
-// SerializeInt64 serializes an int64 to a byte slice.
-func SerializeInt64(k int64) ([]byte, error) {
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, uint64(k))
-	return buf, nil
-}
+// releaseAllLocksForTxn releases all locks held by a given transaction.
+func (bt *BTree[K, V]) releaseAllLocksForTxn(txnID uint64) {
+	bt.keyLocksMu.Lock()
+	defer bt.keyLocksMu.Unlock()
 
-// DeserializeInt64 deserializes a byte slice to an int64.
-func DeserializeInt64(data []byte) (int64, error) {
-	if len(data) != 8 {
-		return 0, fmt.Errorf("%w: int64 data must be 8 bytes, got %d", ErrDeserialization, len(data))
+	txn, ok := bt.transactionTable[txnID]
+	if !ok {
+		log.Printf("WARNING: Attempted to release locks for non-existent Txn %d.", txnID)
+		return
 	}
-	return int64(binary.LittleEndian.Uint64(data)), nil
-}
 
-// SerializeString serializes a string to a byte slice.
-func SerializeString(s string) ([]byte, error) {
-	return []byte(s), nil
-}
-
-// DeserializeString deserializes a byte slice to a string.
-func DeserializeString(data []byte) (string, error) {
-	return string(data), nil
+	for keyStr := range txn.locksHeld {
+		if ownerTxnID, held := bt.keyLocks[keyStr]; held && ownerTxnID == txnID {
+			delete(bt.keyLocks, keyStr)
+			log.Printf("DEBUG: Txn %d: Released lock for key '%s' during bulk release.", txnID, keyStr)
+		} else {
+			log.Printf("WARNING: Txn %d: Expected to hold lock for key '%s' but it was not held or owned by another txn %d.", txnID, keyStr, ownerTxnID)
+		}
+	}
+	txn.locksHeld = make(map[string]struct{}) // Clear the transaction's record of held locks
 }
