@@ -800,11 +800,11 @@ func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Check if the entire range falls within this single shard
-	if endSlot > startKeySlotInfo.EndSlot || endSlot < startKeySlotInfo.StartSlot { // End slot outside this shard's range
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Range query spans multiple shards or is invalid. StartKey slot %d (shard %s) and EndKey slot %d. V1 only supports single-shard range queries.", startSlot, startKeySlotInfo.RangeID, endSlot)}
-		json.NewEncoder(w).Encode(resp)
-		return
-	}
+	// if endSlot > startKeySlotInfo.EndSlot || endSlot < startKeySlotInfo.StartSlot { // End slot outside this shard's range
+	// 	resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Range query spans multiple shards or is invalid. StartKey slot %d (shard %s) and EndKey slot %d. V1 only supports single-shard range queries.", startSlot, startKeySlotInfo.RangeID, endSlot)}
+	// 	json.NewEncoder(w).Encode(resp)
+	// 	return
+	// }
 
 	responsibleNodeID = startKeySlotInfo.AssignedNodeID
 	s.storageNodeAddressesMu.RLock()

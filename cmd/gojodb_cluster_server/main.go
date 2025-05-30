@@ -248,7 +248,7 @@ func fetchShardMapFromController() {
 			//log.Printf("WARNING: No Controller leader found. Cannot fetch shard map.")
 			continue
 		}
-		log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
+		//log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
 
 		// 2. Fetch all slot assignments from the leader
 		resp, err := http.Get(fmt.Sprintf("http://%s/admin/get_all_slot_assignments", leaderAddr)) // New endpoint needed
@@ -280,7 +280,7 @@ func fetchShardMapFromController() {
 		myAssignedSlotsMu.Lock()
 		myAssignedSlots = newAssignedSlots
 		myAssignedSlotsMu.Unlock()
-		log.Printf("INFO: Storage Node %s fetched and cached %d assigned slot ranges.", myStorageNodeID, len(myAssignedSlots))
+		//log.Printf("INFO: Storage Node %s fetched and cached %d assigned slot ranges.", myStorageNodeID, len(myAssignedSlots))
 	}
 }
 
@@ -410,10 +410,17 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "ABORTED", Message: fmt.Sprintf("Txn %d aborted.", req.TxnID)}
 		}
 		response := "Result: "
-		for key, val, isNext, err := iterator.Next(); err == nil && isNext; {
-			response += "Key: " + key + " Value: " + val + "\n"
+		for {
+			key, val, isNext, err := iterator.Next()
+			if err != nil || !isNext {
+				log.Println("ITERATOR NEXT: ", isNext, err)
+				break
+			}
+			response += "Key: " + key + " Value: " + val + "	"
+			log.Println("RESPONSE: ", response)
 		}
 		resp = Response{Status: "OK", Message: response}
+		iterator.Close()
 	case "DELETE":
 		dbLock.Lock()                               // Acquire write lock for DELETE
 		err = dbInstance.Delete(req.Key, req.TxnID) // Pass TxnID

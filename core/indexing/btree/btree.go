@@ -1855,7 +1855,7 @@ func (bt *BTree[K, V]) Iterator(startKey K, endKey K) (BTreeIterator[K, V], erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to find starting leaf for iterator: %w", err)
 	}
-
+	log.Println("Iterator Node: ", node.keys, node.values)
 	iter.currentNode = node
 	iter.currentPage = page
 
@@ -1912,20 +1912,21 @@ func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
 	if iter.isExhausted {
 		return zeroK, zeroV, false, ErrIteratorInvalid
 	}
-
+	log.Println("NEXT ITERATOR: ", iter.currentNode.keys, iter.currentNode.values, iter.currentKeyIdx)
 	// Ensure current node is valid and within range
 	for iter.currentNode != nil {
 		// Check if current key index is valid within the node
 		if iter.currentKeyIdx < len(iter.currentNode.keys) {
 			key := iter.currentNode.keys[iter.currentKeyIdx]
 			value := iter.currentNode.values[iter.currentKeyIdx]
-
+			//log.Println("NEXT ITERATOR key and val: ", key, value)
 			// Check if the current key is within the desired endKey range
-			if iter.tree.keyOrder(key, iter.endKey) >= 0 && iter.tree.keyOrder(iter.endKey, zeroK) != 0 { // key >= endKey and endKey is not zero value
-				iter.isExhausted = true // Reached or exceeded endKey
-				iter.Close()            // Release resources
-				return zeroK, zeroV, false, nil
-			}
+			//if iter.tree.keyOrder(key, iter.startKey) >= 0 && iter.tree.keyOrder(key, iter.endKey) == 0 { // key >= endKey and endKey is not zero value
+			log.Println("NEXT ITERATOR KEY ORDER: ", key, value, iter.tree.keyOrder(key, iter.startKey), iter.tree.keyOrder(key, iter.endKey))
+			//	iter.isExhausted = true // Reached or exceeded endKey
+			//	iter.Close()            // Release resources
+			//	return zeroK, zeroV, false, nil
+			//}
 
 			// Return current key-value pair
 			iter.currentKeyIdx++ // Advance for next call
