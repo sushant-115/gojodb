@@ -57,10 +57,12 @@ var (
 
 // Request represents a parsed client request for single operations.
 type Request struct {
-	Command string
-	Key     string // Key is now string
-	Value   string // Only for PUT
-	TxnID   uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
+	Command  string
+	Key      string // Key is now string
+	Value    string // Only for PUT
+	TxnID    uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
+	StartKey string // For range query
+	EndKey   string // For range query
 }
 
 // Response represents a server's reply to a client request.
@@ -307,7 +309,14 @@ func parseRequest(raw string) (Request, error) {
 		req.Key = parts[1]
 	case "SIZE":
 		// No additional arguments needed
-	// --- NEW: 2PC Commands ---
+		// --- NEW: 2PC Commands ---
+	case "GET_RANGE":
+		log.Println("RANGE QUERY: ", raw, parts)
+		if len(parts) < 2 {
+			return Request{}, fmt.Errorf("Invalid range query")
+		}
+		req.StartKey = parts[0]
+		req.EndKey = parts[1]
 	case "PREPARE":
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
@@ -391,6 +400,20 @@ func handleRequest(req Request) Response {
 		} else {
 			resp = Response{Status: "NOT_FOUND", Message: fmt.Sprintf("Key '%s' not found.", req.Key)}
 		}
+	case "GET_RANGE":
+		dbLock.RLock() // Abort releases locks, not acquires DB lock
+		iterator, err := dbInstance.Iterator(req.StartKey, req.EndKey)
+		dbLock.RUnlock()
+		if err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("ABORT failed for Txn %d: %v", req.TxnID, err)}
+		} else {
+			resp = Response{Status: "ABORTED", Message: fmt.Sprintf("Txn %d aborted.", req.TxnID)}
+		}
+		response := "Result: "
+		for key, val, isNext, err := iterator.Next(); err == nil && isNext; {
+			response += "Key: " + key + " Value: " + val + "\n"
+		}
+		resp = Response{Status: "OK", Message: response}
 	case "DELETE":
 		dbLock.Lock()                               // Acquire write lock for DELETE
 		err = dbInstance.Delete(req.Key, req.TxnID) // Pass TxnID
