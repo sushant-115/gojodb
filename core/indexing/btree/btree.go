@@ -1,19 +1,18 @@
-package btree_core
+package btree
 
 import (
 	// For LRU
-	"bytes" // For Node serialization
-	"container/list"
-	"encoding/binary"
+
+	"cmp"
 	"errors"
 	"fmt"
-	"hash/crc32" // For Node serialization checksum
-	"io"
 	"log"
 	"os"
 	"slices"
 	"sync" // For sync.RWMutex and sync.Map
 	// For parsing TxnID
+	// For Node serialization
+	// For Node serialization checksum
 )
 
 // --- Configuration & Constants ---
@@ -62,320 +61,10 @@ var (
 	ErrKeyLocked        = errors.New("key is currently locked by another transaction")
 	ErrPrepareFailed    = errors.New("prepare phase failed for transaction")
 	// --- END NEW ---
-)
-
-// --- Page Management (Copied for btree.go context) ---
-
-// PageID represents a unique identifier for a page on disk.
-type PageID uint64
-
-// Page represents an in-memory copy of a disk page.
-type Page struct {
-	id       PageID
-	data     []byte
-	pinCount uint32
-	isDirty  bool
-	lsn      LSN // LSN of the last log record that modified this page
-	// For LRU
-	lruElement *list.Element // Pointer to the element in LRU list
-
-	// --- NEW: Page Latch ---
-	latch sync.RWMutex
+	// --- NEW: Iterator Specific Errors ---
+	ErrIteratorInvalid = errors.New("iterator is invalid or exhausted")
 	// --- END NEW ---
-}
-
-// NewPage creates a new Page instance.
-func NewPage(id PageID, size int) *Page {
-	return &Page{
-		id:       id,
-		data:     make([]byte, size),
-		pinCount: 0,
-		isDirty:  false,
-		lsn:      InvalidLSN,
-	}
-}
-
-func (p *Page) Reset() {
-	p.id = InvalidPageID
-	p.pinCount = 0
-	p.isDirty = false
-	p.lsn = InvalidLSN
-	p.lruElement = nil
-	// --- FIX: Ensure page data is completely zeroed out on reset ---
-	for i := range p.data {
-		p.data[i] = 0
-	}
-	// --- END FIX ---
-}
-func (p *Page) GetData() []byte   { return p.data }
-func (p *Page) GetPageID() PageID { return p.id }
-func (p *Page) IsDirty() bool     { return p.isDirty }
-func (p *Page) Pin()              { p.pinCount++ }
-func (p *Page) Unpin() {
-	if p.pinCount > 0 {
-		p.pinCount--
-	}
-}
-func (p *Page) GetPinCount() uint32 { return p.pinCount }
-func (p *Page) SetDirty(dirty bool) { p.isDirty = dirty }
-func (p *Page) GetLSN() LSN         { return p.lsn }
-func (p *Page) SetLSN(lsn LSN)      { p.lsn = lsn }
-
-// --- NEW: Latch Methods ---
-
-// RLock acquires a read (shared) latch on the page.
-func (p *Page) RLock() {
-	p.latch.RLock()
-}
-
-// RUnlock releases a read (shared) latch on the page.
-func (p *Page) RUnlock() {
-	p.latch.RUnlock()
-}
-
-// Lock acquires a write (exclusive) latch on the page.
-func (p *Page) Lock() {
-	p.latch.Lock()
-}
-
-// Unlock releases a write (exclusive) latch on the page.
-func (p *Page) Unlock() {
-	p.latch.Unlock()
-}
-
-// --- END NEW ---
-
-// --- BTree Node Serialization/Deserialization (Copied for btree.go context) ---
-
-// Header fields within a Node's page data (offsets relative to start of page data)
-const (
-	nodeHeaderFlagsOffset   = 0 // For isLeaf, other flags (1 byte)
-	nodeHeaderNumKeysOffset = 1 // Number of keys (2 bytes, uint16)
-	// Key/Value/Child data follows
-	// Checksum is at the very end of the page
 )
-
-// Node represents an in-memory B-tree node.
-type Node[K any, V any] struct {
-	pageID       PageID
-	isLeaf       bool
-	keys         []K
-	values       []V
-	childPageIDs []PageID
-	tree         *BTree[K, V] // Reference to the parent BTree for BPM/DiskManager access
-}
-
-func (n *Node[K, V]) GetPageID() PageID {
-	return n.pageID
-}
-
-// serialize converts the Node into a byte slice and writes it to the provided Page's data buffer.
-// It also calculates and writes the checksum.
-func (n *Node[K, V]) serialize(page *Page, keySerializer func(K) ([]byte, error), valueSerializer func(V) ([]byte, error)) error {
-	if n.tree == nil || n.tree.bpm == nil {
-		return ErrBTreeNotInitializedProperly
-	}
-	pageSize := n.tree.bpm.pageSize
-	buffer := new(bytes.Buffer)
-
-	// Write Node Header:
-	// Flags (1 byte): bit 0 for isLeaf, other bits for future flags
-	var flags byte
-	if n.isLeaf {
-		flags |= (1 << 0) // Set 0th bit if it's a leaf
-	}
-	if err := binary.Write(buffer, binary.LittleEndian, flags); err != nil {
-		return fmt.Errorf("%w: writing flags: %v", ErrSerialization, err)
-	}
-
-	// Number of keys (uint16)
-	numKeys := uint16(len(n.keys))
-	if err := binary.Write(buffer, binary.LittleEndian, numKeys); err != nil {
-		return fmt.Errorf("%w: writing numKeys: %v", ErrSerialization, err)
-	}
-
-	// Serialize Keys
-	for _, k := range n.keys {
-		keyData, err := keySerializer(k)
-		if err != nil {
-			return fmt.Errorf("%w: serializing key: %v", ErrSerialization, err)
-		}
-		if err := binary.Write(buffer, binary.LittleEndian, uint16(len(keyData))); err != nil { // Length of key data
-			return err
-		}
-		if _, err := buffer.Write(keyData); err != nil { // Key data
-			return err
-		}
-	}
-
-	// Serialize Values
-	for _, v := range n.values {
-		valData, err := valueSerializer(v)
-		if err != nil {
-			return fmt.Errorf("%w: serializing value: %v", ErrSerialization, err)
-		}
-		if err := binary.Write(buffer, binary.LittleEndian, uint16(len(valData))); err != nil { // Length of value data
-			return err
-		}
-		if _, err := buffer.Write(valData); err != nil { // Value data
-			return err
-		}
-	}
-
-	// Serialize Child Page IDs (if not a leaf)
-	if !n.isLeaf {
-		numChildren := uint16(len(n.childPageIDs))
-		if err := binary.Write(buffer, binary.LittleEndian, numChildren); err != nil {
-			return fmt.Errorf("%w: writing numChildren: %v", ErrSerialization, err)
-		}
-		for _, childID := range n.childPageIDs {
-			if err := binary.Write(buffer, binary.LittleEndian, childID); err != nil {
-				return fmt.Errorf("%w: writing childPageID: %v", ErrSerialization, err)
-			}
-		}
-	}
-
-	serializedData := buffer.Bytes()
-
-	// Check if serialized data fits within the page (excluding checksum space)
-	if len(serializedData)+checksumSize > pageSize {
-		return fmt.Errorf("%w: node data (%d bytes) + checksum (%d) exceeds page size (%d) for page %d",
-			ErrSerialization, len(serializedData), checksumSize, pageSize, n.pageID)
-	}
-
-	// Copy serialized data into the page's buffer
-	pageData := page.GetData()
-	copy(pageData, serializedData)
-
-	// Pad remaining space with zeros (important for consistent checksum calculation)
-	for i := len(serializedData); i < pageSize-checksumSize; i++ {
-		pageData[i] = 0
-	}
-
-	// Calculate and write checksum
-	// The checksum is calculated over the entire page data *excluding* the checksum itself.
-	checksum := crc32.ChecksumIEEE(pageData[:pageSize-checksumSize])
-	binary.LittleEndian.PutUint32(pageData[pageSize-checksumSize:], checksum)
-
-	// Logging for debugging serialization (can be extensive)
-	log.Printf("SER: PageID %d, numKeys %d, isLeaf %v, serializedLen: %d, calculatedChecksum: 0x%x",
-		n.pageID, len(n.keys), n.isLeaf, len(serializedData), checksum)
-	// log.Printf("SER: Page %d data (first 64 bytes): %x", n.pageID, page.GetData()[:64])
-	// log.Printf("SER: Page %d data (last %d bytes, includes checksum): %x", n.pageID, checksumSize+32, page.GetData()[pageSize-checksumSize-32:])
-
-	// Mark the page as dirty, so it will be flushed to disk by the BufferPoolManager
-	page.SetDirty(true)
-	return nil
-}
-
-// deserialize reads node data from the provided Page's data buffer and reconstructs the Node.
-// It also verifies the checksum.
-func (n *Node[K, V]) deserialize(page *Page, keyDeserializer func([]byte) (K, error), valueDeserializer func([]byte) (V, error)) error {
-	if n.tree == nil || n.tree.bpm == nil {
-		n.keys = make([]K, 0) // Initialize slices even on error for safety
-		n.values = make([]V, 0)
-		n.childPageIDs = make([]PageID, 0)
-		return ErrBTreeNotInitializedProperly
-	}
-	pageSize := n.tree.bpm.pageSize
-	pageData := page.GetData()
-
-	// --- CRITICAL CHECKSUM VERIFICATION ---
-	// Extract stored checksum from the end of the page
-	storedChecksumBytes := pageData[pageSize-checksumSize:]
-	storedChecksum := binary.LittleEndian.Uint32(storedChecksumBytes)
-
-	// Calculate checksum from the rest of the page data
-	calculatedChecksum := crc32.ChecksumIEEE(pageData[:pageSize-checksumSize])
-
-	log.Printf("DESER: PageID %d. Stored Checksum: 0x%x, Calculated Checksum: 0x%x",
-		page.GetPageID(), storedChecksum, calculatedChecksum)
-	// log.Printf("DESER: Page %d data (first 64 bytes for checksum): %x", page.GetPageID(), pageData[:64])
-	// log.Printf("DESER: Page %d data (last %d bytes, includes checksum): %x", page.GetPageID(), checksumSize+32, pageData[pageSize-checksumSize-32:])
-
-	if storedChecksum != calculatedChecksum {
-		log.Printf("ERROR: CHECKSUM MISMATCH DETECTED for PageID %d: Stored=0x%x, Calculated=0x%x. Raw page data (first 64 bytes for debug): %x",
-			page.GetPageID(), storedChecksum, calculatedChecksum, pageData[:64])
-		// Initialize node slices to empty to prevent using corrupt data
-		n.keys = make([]K, 0)
-		n.values = make([]V, 0)
-		n.childPageIDs = make([]PageID, 0)
-		return fmt.Errorf("%w: stored=0x%x, calculated=0x%x for page %d", ErrChecksumMismatch, storedChecksum, calculatedChecksum, page.GetPageID())
-	}
-	// --- END CRITICAL CHECKSUM VERIFICATION ---
-
-	buffer := bytes.NewReader(pageData[:pageSize-checksumSize]) // Read from data *before* checksum
-
-	// Read Node Header:
-	// Flags (1 byte)
-	var flags byte
-	if err := binary.Read(buffer, binary.LittleEndian, &flags); err != nil {
-		return fmt.Errorf("%w: reading flags: %v", ErrDeserialization, err)
-	}
-	n.isLeaf = (flags & (1 << 0)) != 0 // Check 0th bit for isLeaf
-
-	// Number of keys (uint16)
-	var numKeys uint16
-	if err := binary.Read(buffer, binary.LittleEndian, &numKeys); err != nil {
-		return fmt.Errorf("%w: reading numKeys: %v", ErrDeserialization, err)
-	}
-	n.keys = make([]K, numKeys)
-	n.values = make([]V, numKeys)
-
-	// Deserialize Keys
-	for i := uint16(0); i < numKeys; i++ {
-		var keyDataLen uint16
-		if err := binary.Read(buffer, binary.LittleEndian, &keyDataLen); err != nil {
-			return fmt.Errorf("%w: reading key length for key %d: %v", ErrDeserialization, i, err)
-		}
-		keyData := make([]byte, keyDataLen)
-		if _, err := io.ReadFull(buffer, keyData); err != nil {
-			return fmt.Errorf("%w: reading key data for key %d: %v", ErrDeserialization, i, err)
-		}
-		key, err := keyDeserializer(keyData)
-		if err != nil {
-			return fmt.Errorf("%w: deserializing key %d: %v", ErrDeserialization, i, err)
-		}
-		n.keys[i] = key
-	}
-
-	// Deserialize Values
-	for i := uint16(0); i < numKeys; i++ {
-		var valDataLen uint16
-		if err := binary.Read(buffer, binary.LittleEndian, &valDataLen); err != nil {
-			return fmt.Errorf("%w: reading value length for value %d: %v", ErrDeserialization, i, err)
-		}
-		valData := make([]byte, valDataLen)
-		if _, err := io.ReadFull(buffer, valData); err != nil {
-			return fmt.Errorf("%w: reading value data for value %d: %v", ErrDeserialization, i, err)
-		}
-		val, err := valueDeserializer(valData)
-		if err != nil {
-			return fmt.Errorf("%w: deserializing value %d: %v", ErrDeserialization, i, err)
-		}
-		n.values[i] = val
-	}
-
-	// Deserialize Child Page IDs (if not a leaf)
-	if !n.isLeaf {
-		var numChildren uint16
-		if err := binary.Read(buffer, binary.LittleEndian, &numChildren); err != nil {
-			return fmt.Errorf("%w: reading numChildren: %v", ErrDeserialization, err)
-		}
-		n.childPageIDs = make([]PageID, numChildren)
-		for i := uint16(0); i < numChildren; i++ {
-			if err := binary.Read(buffer, binary.LittleEndian, &n.childPageIDs[i]); err != nil {
-				return fmt.Errorf("%w: reading childPageID %d: %v", ErrDeserialization, i, err)
-			}
-		}
-	} else {
-		n.childPageIDs = make([]PageID, 0) // Ensure it's an empty slice for leaves
-	}
-
-	n.pageID = page.GetPageID() // Set the node's page ID from the page object
-	log.Printf("DESER: Successfully deserialized PageID %d, isLeaf: %v, numKeys: %d", n.pageID, n.isLeaf, len(n.keys))
-	return nil
-}
 
 // --- NEW: TransactionState and Transaction types ---
 
@@ -398,8 +87,9 @@ type TransactionOperation struct {
 
 // Transaction represents an in-memory record of an active or prepared transaction.
 type Transaction struct {
-	ID    uint64
-	State TransactionState
+	ID        uint64
+	State     TransactionState
+	Operation []TransactionOperation
 	// Operations: For undo, you might need to store the operations performed by this txn
 	// on this shard, or at least the pages/keys it modified.
 	// For V1, we'll rely on WAL for recovery.
@@ -429,9 +119,10 @@ type BTree[K any, V any] struct {
 	logManager   *LogManager // Placeholder for *LogManager
 
 	// --- NEW: 2PC Participant State ---
-	transactionTable map[uint64]*Transaction // TxnID -> Transaction (in-memory state of active txns)
-	keyLocks         map[string]uint64       // Key (string representation) -> TxnID (ID of txn holding lock)
-	keyLocksMu       sync.RWMutex            // Protects keyLocks map
+	transactionTable       map[uint64]*Transaction // TxnID -> Transaction (in-memory state of active txns)
+	keyLocks               map[string]uint64       // Key (string representation) -> TxnID (ID of txn holding lock)
+	keyLocksMu             sync.RWMutex
+	transactionTableLockMu sync.RWMutex // Protects keyLocks map
 	// --- END NEW ---
 }
 
@@ -609,6 +300,10 @@ func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to fetch page %d from buffer pool: %w", pageID, err)
 	}
+	// --- NEW: Acquire S-latch on page before deserializing ---
+	page.RLock()
+	defer page.RUnlock() // Ensure latch is released
+	// --- END NEW ---
 	node := &Node[K, V]{tree: bt}
 	err = node.deserialize(page, bt.kvSerializer.DeserializeKey, bt.kvSerializer.DeserializeValue)
 	if err != nil {
@@ -1268,7 +963,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 	t := bt.degree
 	var err error
 	keyActuallyRemoved := false // This will be true if the replacement key is successfully deleted from child
-
+	actuallyDeleted := false
 	// Fetch left child (subtree containing predecessor of key)
 	leftChildPageID := node.childPageIDs[idxInNode]
 	leftChildNode, leftChildPage, fetchErr := bt.fetchNode(leftChildPageID) // Left child is pinned
@@ -1316,7 +1011,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 		// `deleteRecursive` will serialize and unpin `reFetchedLeftChildPage`.
 		if err != nil {
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin parent on error
-			return false, err
+			return false, fmt.Errorf("failed to delete recursive. isKeyDelete: %v. Error: %w", keyActuallyRemoved, err)
 		}
 
 		// Parent `node` was modified (key/value replaced). Serialize and unpin it.
@@ -1324,10 +1019,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false)
 			return false, fmt.Errorf("failed to serialize parent node %d after predecessor replacement: %w", node.pageID, errS)
 		}
-		err = bt.bpm.UnpinPage(nodePage.GetPageID(), true)
-		if err != nil {
-			return err
-		}
+		err = bt.bpm.UnpinPage(nodePage.GetPageID(), true) // Unpin, mark dirty
 
 	} else if len(rightChildNode.keys) >= t {
 		// Case 2b: Right child has at least 't' keys.
@@ -1366,10 +1058,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false)
 			return false, fmt.Errorf("failed to serialize parent node %d after successor replacement: %w", node.pageID, errS)
 		}
-		err = bt.bpm.UnpinPage(nodePage.GetPageID(), true)
-		if err != nil {
-			return err
-		}
+		err = bt.bpm.UnpinPage(nodePage.GetPageID(), true) // Unpin, mark dirty
 
 	} else {
 		// Case 2c: Both children (left and right) have `t-1` keys. Merge them.
@@ -1416,7 +1105,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 			err = e // Propagate unpin error if no other error occurred
 		}
 	}
-	return keyActuallyRemoved, err
+	return actuallyDeleted, err
 }
 
 // findPredecessor finds the rightmost key in the subtree rooted at `node`.
@@ -1672,7 +1361,7 @@ func (bt *BTree[K, V]) borrowFromRightSibling(
 	// If children are not leaves, move the leftmost child pointer from right sibling to rightmost of child
 	if !childNode.isLeaf {
 		childPointerFromSibling := rightSiblingNode.childPageIDs[0]
-		childNode.childPageIDs = append(childNode.childPageIDs, childPointerFromSibling)
+		childNode.childPageIDs = slices.Insert(childNode.childPageIDs, 0, childPointerFromSibling)
 		rightSiblingNode.childPageIDs = slices.Delete(rightSiblingNode.childPageIDs, 0, 1) // Remove first child pointer
 	}
 
@@ -1799,10 +1488,10 @@ func (bt *BTree[K, V]) mergeChildrenAndKey(
 // Prepare handles the PREPARE phase of a 2PC transaction.
 // It attempts to acquire locks for all keys involved in the operations and logs a PREPARE record.
 func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) error {
-	// --- FIX: Remove redundant global lock here. Key-level locks are handled by acquireLockInternal. ---
+	bt.transactionTableLockMu.Lock()
+	defer bt.transactionTableLockMu.Unlock()
 	// bt.keyLocksMu.Lock()
 	// defer bt.keyLocksMu.Unlock()
-	// --- END FIX ---
 
 	if _, ok := bt.transactionTable[txnID]; ok {
 		return fmt.Errorf("%w: transaction %d already exists", ErrTxnAlreadyExists, txnID)
@@ -1812,20 +1501,33 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 		ID:        txnID,
 		State:     TxnStateRunning, // Initially running
 		locksHeld: make(map[string]struct{}),
+		Operation: operations,
 	}
 	bt.transactionTable[txnID] = txn
 
-	log.Printf("INFO: Txn %d: Received PREPARE request. Attempting to acquire locks and process operations.", txnID)
-
-	// Acquire locks and process operations tentatively
-	// --- FIX: Call ProcessOperations here ---
-	if err := bt.ProcessOperations(txnID, operations); err != nil {
-		log.Printf("ERROR: Txn %d: Failed to process operations during PREPARE: %v. Aborting locally.", txnID, err)
-		bt.releaseAllLocksForTxn(txnID)    // Release any locks acquired during processing
-		delete(bt.transactionTable, txnID) // Remove from table
-		return fmt.Errorf("%w: failed to process operations for txn %d: %v", ErrPrepareFailed, txnID, err)
+	log.Printf("INFO: Txn %d: Received PREPARE request. Attempting to acquire locks.", txnID)
+	log.Println("DEBUG Operations: ", operations)
+	// Acquire locks for all keys involved in the transaction on this shard
+	for _, op := range operations {
+		keyStr := fmt.Sprintf("%v", op.Key) // Convert K to string for map key
+		log.Println("KeyStr: ", keyStr, txnID)
+		if err := bt.acquireLockInternal(keyStr, txnID); err != nil {
+			// If lock acquisition fails, abort the transaction on this participant.
+			log.Printf("ERROR: Txn %d: Failed to acquire lock for key %v during PREPARE: %v. Aborting locally.", txnID, op.Key, err)
+			bt.releaseAllLocksForTxn(txnID)    // Release any locks already held
+			delete(bt.transactionTable, txnID) // Remove from table
+			return fmt.Errorf("%w: failed to acquire lock for key %v", ErrPrepareFailed, op.Key)
+		}
+		txn.locksHeld[keyStr] = struct{}{} // Track locks held by this transaction
+		log.Printf("DEBUG: Txn %d: Acquired lock for key %v.", txnID, op.Key)
 	}
-	// --- END FIX ---
+
+	err := bt.ProcessOperations(txnID, operations)
+	if err != nil {
+		log.Println("PROCESS OPERATION ERROR: ", err)
+		return fmt.Errorf("%w: failed to process transaction %v", ErrPrepareFailed, operations)
+
+	}
 
 	// Log the PREPARE record
 	// This record needs to contain enough info to redo/undo the operations if needed.
@@ -1856,9 +1558,10 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 // Commit handles the COMMIT phase of a 2PC transaction.
 // It logs a COMMIT record and releases locks.
 func (bt *BTree[K, V]) Commit(txnID uint64) error {
-	bt.keyLocksMu.Lock() // Still need this lock to safely access transactionTable and keyLocks
+	log.Println("COMMIT DEBUG: unlock tx: ", txnID)
+	bt.keyLocksMu.Lock()
 	defer bt.keyLocksMu.Unlock()
-
+	log.Println("COMMIT DEBUG: lock tx: ", txnID)
 	txn, ok := bt.transactionTable[txnID]
 	if !ok {
 		return fmt.Errorf("%w: transaction %d not found in table", ErrTxnNotFound, txnID)
@@ -1894,7 +1597,7 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 // Abort handles the ABORT phase of a 2PC transaction.
 // It logs an ABORT record, releases locks, and rolls back changes (V1: conceptual).
 func (bt *BTree[K, V]) Abort(txnID uint64) error {
-	bt.keyLocksMu.Lock() // Still need this lock to safely access transactionTable and keyLocks
+	bt.keyLocksMu.Lock()
 	defer bt.keyLocksMu.Unlock()
 
 	txn, ok := bt.transactionTable[txnID]
@@ -1975,26 +1678,26 @@ func (bt *BTree[K, V]) acquireLock(key K, txnID uint64) error {
 
 // acquireLockInternal is the internal, string-key based lock acquisition.
 func (bt *BTree[K, V]) acquireLockInternal(keyStr string, txnID uint64) error {
-	// --- FIX: Remove global lock here. This is already protected by bt.keyLocksMu in Prepare/Commit/Abort. ---
 	// bt.keyLocksMu.Lock()
 	// defer bt.keyLocksMu.Unlock()
-	// --- END FIX ---
 
-	// Acquire the lock for the key
-	// This is a simple spinlock/busy-wait. For production, use condition variables.
 	for {
-		bt.keyLocksMu.Lock() // Acquire lock for keyLocks map access
+		bt.keyLocksMu.Lock()
+		log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, bt.keyLocks[keyStr])
 		if ownerTxnID, ok := bt.keyLocks[keyStr]; ok {
 			if ownerTxnID == txnID {
 				// Already locked by this transaction, idempotent.
 				bt.keyLocksMu.Unlock()
 				return nil
 			}
-			// Locked by another transaction, release map lock and wait/return error.
-			bt.keyLocksMu.Unlock()
+			// Locked by another transaction, wait.
 			log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, ownerTxnID)
-			// For V1, we return an error to prevent indefinite blocking in a simple test.
-			// In a real system, this would block (e.g., using a sync.Cond) or return a timeout error.
+			// For V1, simple blocking wait. In production, use condition variables or timeout.
+			// This is a busy-wait loop, which is inefficient.
+			// A production system would use a condition variable or a lock manager with queues.
+			// For now, we'll just return ErrKeyLocked to avoid indefinite blocking in a simple test.
+			// If this is called from Prepare, the Prepare will fail.
+			bt.keyLocksMu.Unlock()
 			return ErrKeyLocked
 		} else {
 			// Lock available, acquire it.
@@ -2002,8 +1705,8 @@ func (bt *BTree[K, V]) acquireLockInternal(keyStr string, txnID uint64) error {
 			if txn, ok := bt.transactionTable[txnID]; ok {
 				txn.locksHeld[keyStr] = struct{}{}
 			}
-			bt.keyLocksMu.Unlock()
 			log.Printf("DEBUG: Txn %d: Acquired lock for key '%s'.", txnID, keyStr)
+			bt.keyLocksMu.Unlock()
 			return nil
 		}
 	}
@@ -2037,8 +1740,10 @@ func (bt *BTree[K, V]) releaseLockInternal(keyStr string, txnID uint64) {
 
 // releaseAllLocksForTxn releases all locks held by a given transaction.
 func (bt *BTree[K, V]) releaseAllLocksForTxn(txnID uint64) {
-	bt.keyLocksMu.Lock()
-	defer bt.keyLocksMu.Unlock()
+	log.Println("DEBUG: Release all locks for txn unlock")
+	bt.transactionTableLockMu.Lock()
+	defer bt.transactionTableLockMu.Unlock()
+	log.Println("DEBUG: Release all locks for txn lock")
 
 	txn, ok := bt.transactionTable[txnID]
 	if !ok {
@@ -2057,4 +1762,229 @@ func (bt *BTree[K, V]) releaseAllLocksForTxn(txnID uint64) {
 	txn.locksHeld = make(map[string]struct{}) // Clear the transaction's record of held locks
 }
 
-// --- END NEW ---
+// Close flushes all dirty pages and closes the database file.
+func (bt *BTree[K, V]) Close() error {
+	if bt.bpm == nil {
+		return errors.New("btree buffer pool manager is nil, cannot close")
+	}
+
+	log.Println("INFO: Closing B-tree database...")
+	// Update persisted tree size in header one last time (if you have an accurate in-memory size tracker)
+	// For this implementation, TreeSize is updated on every insert/delete, but a final checkpoint is good.
+	// If bt.size was an accurate in-memory field, you'd do:
+	// if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader){ h.TreeSize = bt.sizeInMemory }); err != nil {
+	// 	fmt.Fprintf(os.Stderr, "Error updating tree size in header on close: %v\n", err)
+	// }
+
+	// Flush all dirty pages from the buffer pool to disk
+	flushErr := bt.bpm.FlushAllPages()
+	if flushErr != nil {
+		log.Printf("ERROR: Error flushing all pages on close: %v", flushErr)
+	}
+
+	// Close the underlying disk manager (which closes the file)
+	closeErr := bt.diskManager.Close()
+	if closeErr != nil {
+		log.Printf("ERROR: Error closing disk manager on close: %v", closeErr)
+	}
+
+	if flushErr != nil || closeErr != nil {
+		return fmt.Errorf("errors occurred during B-tree close: flush error: %v, close error: %v", flushErr, closeErr)
+	}
+	log.Println("INFO: B-tree database closed successfully.")
+	return nil
+}
+
+// DefaultKeyOrder provides a comparison function for comparable types.
+func DefaultKeyOrder[K cmp.Ordered](a, b K) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}
+
+// SerializeString serializes a string to a byte slice.
+func SerializeString(s string) ([]byte, error) {
+	return []byte(s), nil
+}
+
+// DeserializeString deserializes a byte slice to a string.
+func DeserializeString(data []byte) (string, error) {
+	return string(data), nil
+}
+
+// --- NEW: BTree Iterator Interface and Implementation ---
+
+// BTreeIterator defines the interface for iterating over key-value pairs in a B-tree.
+type BTreeIterator[K any, V any] interface {
+	Next() (K, V, bool, error) // Returns next key, value, true if valid, or error
+	Close() error              // Releases any resources held by the iterator
+}
+
+// bTreeIterator is the concrete implementation of BTreeIterator.
+type bTreeIterator[K any, V any] struct {
+	tree              *BTree[K, V]
+	currentNode       *Node[K, V] // The current leaf node being iterated
+	currentPage       *Page       // The page object for currentNode (pinned and latched)
+	currentKeyIdx     int         // Index of the current key in currentNode.keys
+	startKey          K
+	endKey            K
+	isExhausted       bool
+	initialSearchDone bool // Flag to indicate if initial search to startKey is complete
+}
+
+// Iterator returns a new BTreeIterator for the specified key range [startKey, endKey).
+// It acquires an S-latch on the root page and pins it.
+func (bt *BTree[K, V]) Iterator(startKey K, endKey K) (BTreeIterator[K, V], error) {
+	//var zeroK K
+	if bt.rootPageID == InvalidPageID {
+		return nil, errors.New("cannot create iterator on an empty B-tree")
+	}
+
+	iter := &bTreeIterator[K, V]{
+		tree:     bt,
+		startKey: startKey,
+		endKey:   endKey,
+	}
+
+	// Find the first leaf page containing or preceding startKey
+	node, page, err := bt.findLeafForIterator(bt.rootPageID, startKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find starting leaf for iterator: %w", err)
+	}
+
+	iter.currentNode = node
+	iter.currentPage = page
+
+	// Find the starting key index within the leaf node
+	idx, _ := slices.BinarySearchFunc(node.keys, startKey, bt.keyOrder)
+	iter.currentKeyIdx = idx
+
+	// If startKey is greater than all keys in the leaf, move to the next leaf
+	if idx == len(node.keys) {
+		if err := iter.moveToNextLeaf(); err != nil {
+			iter.Close() // Clean up if moving to next leaf fails
+			return nil, fmt.Errorf("failed to move to next leaf after initial search: %w", err)
+		}
+	}
+
+	iter.initialSearchDone = true
+	return iter, nil
+}
+
+// findLeafForIterator recursively finds the leaf node where the iteration should start.
+// It uses read crabbing (S-latches).
+func (bt *BTree[K, V]) findLeafForIterator(pageID PageID, key K) (*Node[K, V], *Page, error) {
+	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if currNode.isLeaf {
+		return currNode, currPage, nil // Found the leaf
+	}
+
+	// Find the child to descend into
+	idx, _ := slices.BinarySearchFunc(currNode.keys, key, bt.keyOrder)
+	childPageID := currNode.childPageIDs[idx]
+
+	// Read crabbing: Acquire S-latch on child before releasing S-latch on parent
+	// The fetchNode for child will acquire S-latch on child.
+	// We then release the S-latch on currPage.
+	unpinErr := bt.bpm.UnpinPage(currPage.GetPageID(), false) // Unpin parent page
+	if unpinErr != nil {
+		log.Printf("WARNING: Error unpinning page %d during iterator findLeaf: %v", currPage.GetPageID(), unpinErr)
+		// Proceed, but log the warning.
+	}
+
+	return bt.findLeafForIterator(childPageID, key) // Recursive call
+}
+
+// Next returns the next key-value pair in the iteration.
+// It manages latch coupling as it moves between pages.
+func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
+	var zeroK K
+	var zeroV V
+
+	if iter.isExhausted {
+		return zeroK, zeroV, false, ErrIteratorInvalid
+	}
+
+	// Ensure current node is valid and within range
+	for iter.currentNode != nil {
+		// Check if current key index is valid within the node
+		if iter.currentKeyIdx < len(iter.currentNode.keys) {
+			key := iter.currentNode.keys[iter.currentKeyIdx]
+			value := iter.currentNode.values[iter.currentKeyIdx]
+
+			// Check if the current key is within the desired endKey range
+			if iter.tree.keyOrder(key, iter.endKey) >= 0 && iter.tree.keyOrder(iter.endKey, zeroK) != 0 { // key >= endKey and endKey is not zero value
+				iter.isExhausted = true // Reached or exceeded endKey
+				iter.Close()            // Release resources
+				return zeroK, zeroV, false, nil
+			}
+
+			// Return current key-value pair
+			iter.currentKeyIdx++ // Advance for next call
+			return key, value, true, nil
+		}
+
+		// Current node exhausted, move to the next leaf node
+		if err := iter.moveToNextLeaf(); err != nil {
+			iter.isExhausted = true
+			iter.Close()
+			return zeroK, zeroV, false, fmt.Errorf("failed to move to next leaf: %w", err)
+		}
+	}
+
+	// Iterator exhausted
+	iter.isExhausted = true
+	iter.Close()
+	return zeroK, zeroV, false, nil
+}
+
+// moveToNextLeaf moves the iterator to the next leaf node in the B-tree.
+// It handles releasing the latch on the current page and acquiring on the next.
+func (iter *bTreeIterator[K, V]) moveToNextLeaf() error {
+	// Release latch on current page before moving
+	if iter.currentPage != nil {
+		iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false) // Unpin current page
+		iter.currentPage = nil
+		iter.currentNode = nil
+	}
+
+	// In a B-tree, leaf nodes are often linked. If not, we need to traverse up and down.
+	// For simplicity, this implementation assumes a "next sibling" pointer or re-traverses.
+	// A proper B+Tree would have next/prev leaf pointers for efficient range scans.
+	// For a pure B-tree, moving to the "next leaf" means finding the smallest key
+	// in the rightmost child of the lowest common ancestor. This is complex.
+	// For now, let's simplify: this iterator only works for a single leaf node's range.
+	// To support full range scans, we'd need leaf linking or a stack-based traversal.
+
+	// Since we don't have leaf linking, for this iteration, we'll mark as exhausted
+	// after a single leaf is fully scanned.
+	// To truly implement full range scans, you'd need to add `nextLeafPageID` to Node struct
+	// or implement a stack-based traversal (more complex for recovery/crash safety).
+	log.Printf("DEBUG: Iterator exhausted current leaf. No next leaf pointer for full range scan.")
+	iter.isExhausted = true
+	return nil
+}
+
+// Close releases any resources held by the iterator, specifically unpinning the current page.
+func (iter *bTreeIterator[K, V]) Close() error {
+	if iter.currentPage != nil {
+		err := iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false) // Unpin the page
+		if err != nil {
+			log.Printf("WARNING: Error closing iterator, failed to unpin page %d: %v", iter.currentPage.GetPageID(), err)
+			return fmt.Errorf("failed to close iterator cleanly: %w", err)
+		}
+		iter.currentPage = nil
+		iter.currentNode = nil
+	}
+	iter.isExhausted = true
+	log.Println("DEBUG: BTreeIterator closed.")
+	return nil
+}
