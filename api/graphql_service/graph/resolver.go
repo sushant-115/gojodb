@@ -1,4 +1,4 @@
-package graphql_service
+package graph
 
 import (
 	"bytes"
@@ -9,12 +9,18 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/sushant-115/gojodb/api/graphql_service/graph/model"
 )
 
 // API_SERVICE_URL is the endpoint of your GojoDB API Service.
 const API_SERVICE_URL = "http://localhost:8090/api/data"
 const CLIENT_TIMEOUT = 10 * time.Second
 
+// Resolver is the root resolver for your GraphQL schema.
+type Resolver struct{}
+
+// APIRequest represents a client request received by the API service.
 type APIRequest struct {
 	Command string `json:"command"`
 	Key     string `json:"key"`
@@ -27,19 +33,16 @@ type APIResponse struct {
 	Message string `json:"message,omitempty"` // Details or value for GET, or target node address for REDIRECT
 }
 
-// Resolver is the root resolver for your GraphQL schema.
-type Resolver struct{}
-
 // Query returns the QueryResolver implementation.
-func (r *Resolver) Query() QueryResolver { return QueryResolver{r} }
+func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 
 // Mutation returns the MutationResolver implementation.
-func (r *Resolver) Mutation() MutationResolver { return MutationResolver{r} }
+func (r *Resolver) Mutation() MutationResolver { return &mutationResolver{r} }
 
-type QueryResolver struct{ *Resolver }
+type queryResolver struct{ *Resolver }
 
 // Get resolves the 'get' query. It calls the GojoDB API Service.
-func (r *QueryResolver) Get(ctx context.Context, key string) (*Entry, error) {
+func (r *queryResolver) Get(ctx context.Context, key string) (*model.Entry, error) {
 	log.Printf("GraphQL: Resolving GET for key: %s", key)
 
 	reqBody := APIRequest{
@@ -70,7 +73,7 @@ func (r *QueryResolver) Get(ctx context.Context, key string) (*Entry, error) {
 	}
 
 	if apiResp.Status == "OK" {
-		return &Entry{Key: key, Value: apiResp.Message}, nil
+		return &model.Entry{Key: key, Value: apiResp.Message}, nil
 	} else if apiResp.Status == "NOT_FOUND" {
 		return nil, nil // Return nil Entry, nil error for not found
 	} else {
@@ -78,10 +81,10 @@ func (r *QueryResolver) Get(ctx context.Context, key string) (*Entry, error) {
 	}
 }
 
-type MutationResolver struct{ *Resolver }
+type mutationResolver struct{ *Resolver }
 
 // Put resolves the 'put' mutation. It calls the GojoDB API Service.
-func (r *MutationResolver) Put(ctx context.Context, key string, value string) (*Entry, error) {
+func (r *mutationResolver) Put(ctx context.Context, key string, value string) (*model.Entry, error) {
 	log.Printf("GraphQL: Resolving PUT for key: %s, value: %s", key, value)
 
 	reqBody := APIRequest{
@@ -113,14 +116,14 @@ func (r *MutationResolver) Put(ctx context.Context, key string, value string) (*
 	}
 
 	if apiResp.Status == "OK" {
-		return &Entry{Key: key, Value: value}, nil
+		return &model.Entry{Key: key, Value: value}, nil
 	} else {
 		return nil, fmt.Errorf("API Service error for PUT %s=%s: %s", key, value, apiResp.Message)
 	}
 }
 
 // Delete resolves the 'delete' mutation. It calls the GojoDB API Service.
-func (r *MutationResolver) Delete(ctx context.Context, key string) (bool, error) {
+func (r *mutationResolver) Delete(ctx context.Context, key string) (bool, error) {
 	log.Printf("GraphQL: Resolving DELETE for key: %s", key)
 
 	reqBody := APIRequest{
