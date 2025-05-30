@@ -551,7 +551,7 @@ func (s *APIService) handleTransactionRequest(w http.ResponseWriter, r *http.Req
 		http.Error(w, fmt.Sprintf("Invalid transaction request format: %v", err), http.StatusBadRequest)
 		return
 	}
-
+	log.Println("DEBUG: Transaction request: ", txReq)
 	s.nextTxnIDMu.Lock()
 	txnID := fmt.Sprintf("%d", s.nextTxnID)
 	s.nextTxnID++
@@ -722,15 +722,12 @@ func (s *APIService) sendStorageNodeCommand(nodeAddr string, command string) (AP
 
 // serializeOperations is a helper to serialize a list of operations for sending to Storage Nodes.
 func serializeOperations(ops []TransactionOperation) string {
-	var builder strings.Builder
-	for i, op := range ops {
-		opJSON, _ := json.Marshal(op) // Should handle errors in production
-		builder.WriteString(string(opJSON))
-		if i < len(ops)-1 {
-			builder.WriteString("|") // Delimiter between operations
-		}
+	req := TransactionRequest{
+		Operations: ops,
 	}
-	return builder.String()
+	b, _ := json.Marshal(req)
+	log.Println("Serialized Request: ", string(b))
+	return string(b)
 }
 
 // deserializeOperations is a helper to deserialize a list of operations from a string.

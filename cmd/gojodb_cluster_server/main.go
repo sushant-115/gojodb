@@ -69,6 +69,10 @@ type Response struct {
 	Message string // Details or value for GET, or target node for REDIRECT
 }
 
+type TransactionOperations struct {
+	Operations []btree_core.TransactionOperation `json:"operations"`
+}
+
 // initStorageNode initializes the Storage Node's database, identity, and background tasks.
 func initStorageNode() error {
 	var err error
@@ -193,7 +197,7 @@ func sendHeartbeatsToController() {
 			if err != nil {
 				log.Printf("ERROR: Failed to send heartbeat to Controller %s (port %d): %v", addr, heartbeatTargetPort, err)
 			} else {
-				log.Printf("DEBUG: Storage Node %s sent heartbeat to Controller %s (port %d).", myStorageNodeID, addr, heartbeatTargetPort)
+				//log.Printf("DEBUG: Storage Node %s sent heartbeat to Controller %s (port %d).", myStorageNodeID, addr, heartbeatTargetPort)
 			}
 			conn.Close() // Close connection after sending
 		}
@@ -239,7 +243,7 @@ func fetchShardMapFromController() {
 		}
 
 		if leaderAddr == "" {
-			log.Printf("WARNING: No Controller leader found. Cannot fetch shard map.")
+			//log.Printf("WARNING: No Controller leader found. Cannot fetch shard map.")
 			continue
 		}
 		log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
@@ -409,15 +413,17 @@ func handleRequest(req Request) Response {
 	// --- NEW: 2PC Command Handlers ---
 	case "PREPARE":
 		// Operations are passed as a JSON string in req.Value
+		log.Println("Server Operations: ", req.Value)
 		ops, jsonErr := deserializeOperations(req.Value)
 		if jsonErr != nil {
 			resp = Response{Status: "VOTE_ABORT", Message: fmt.Sprintf("Invalid operations JSON for PREPARE: %v", jsonErr)}
 			return resp
 		}
-		// dbLock.Lock() // Prepare needs to acquire locks on keys, not the whole DB
+		log.Println("DEBUG: deserialize: ", ops, jsonErr)
+		dbLock.Lock() // Prepare needs to acquire locks on keys, not the whole DB
 		// The B-tree's Prepare method will handle key-level locking.
 		err = dbInstance.Prepare(req.TxnID, ops)
-		// dbLock.Unlock()
+		dbLock.Unlock()
 		if err != nil {
 			resp = Response{Status: "VOTE_ABORT", Message: fmt.Sprintf("PREPARE failed for Txn %d: %v", req.TxnID, err)}
 		} else {
@@ -430,7 +436,9 @@ func handleRequest(req Request) Response {
 		if err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("COMMIT failed for Txn %d: %v", req.TxnID, err)}
 		} else {
+
 			resp = Response{Status: "COMMITTED", Message: fmt.Sprintf("Txn %d committed.", req.TxnID)}
+
 		}
 	case "ABORT":
 		// dbLock.Lock() // Abort releases locks, not acquires DB lock
@@ -512,19 +520,12 @@ func serializeOperations(ops []btree_core.TransactionOperation) string {
 // deserializeOperations is a helper to deserialize a list of operations from a string.
 // This is used by the Storage Node (Participant) to receive operations from the Coordinator.
 func deserializeOperations(s string) ([]btree_core.TransactionOperation, error) {
-	parts := strings.Split(s, "|")
-	var ops []btree_core.TransactionOperation
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		var op btree_core.TransactionOperation
-		if err := json.Unmarshal([]byte(part), &op); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal operation part '%s': %w", part, err)
-		}
-		ops = append(ops, op)
+	var ops TransactionOperations
+	if err := json.Unmarshal([]byte(s), &ops); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal operation part '%s': %w", s, err)
 	}
-	return ops, nil
+
+	return ops.Operations, nil
 }
 
 func main() {
