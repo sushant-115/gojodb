@@ -1,0 +1,19 @@
+# Defines a simple key-value entry
+type Entry {
+  key: String!
+  value: String!
+}
+
+# Defines the queries available
+type Query {
+  # Retrieves a single entry by its key
+  get(key: String!): Entry
+}
+
+# Defines the mutations available (write operations)
+type Mutation {
+  # Puts (inserts or updates) a key-value entry
+  put(key: String!, value: String!): Entry! # Returns the entry that was put
+  # Deletes an entry by its key
+  delete(key: String!): Boolean! # Returns true if deleted, false otherwise
+}
