@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json" // Needed for (de)serializing TransactionOperations
 	"fmt"
 	"io"
 	"log"
@@ -14,9 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm"      // FSM package for sharding info
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree" // B-tree core package
-
-	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm" // FSM package for sharding info
 )
 
 const (
@@ -56,16 +55,17 @@ var (
 	myAssignedSlots   map[string]fsm.SlotRangeInfo // Cache of slot ranges assigned to THIS node
 )
 
-// Request represents a parsed client request.
+// Request represents a parsed client request for single operations.
 type Request struct {
 	Command string
 	Key     string // Key is now string
 	Value   string // Only for PUT
+	TxnID   uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
 }
 
 // Response represents a server's reply to a client request.
 type Response struct {
-	Status  string // OK, ERROR, NOT_FOUND, REDIRECT
+	Status  string // OK, ERROR, NOT_FOUND, REDIRECT, VOTE_COMMIT, VOTE_ABORT, COMMITTED, ABORTED
 	Message string // Details or value for GET, or target node for REDIRECT
 }
 
@@ -279,6 +279,7 @@ func fetchShardMapFromController() {
 }
 
 // parseRequest parses a raw string command into a Request struct.
+// It's updated to handle 2PC commands.
 func parseRequest(raw string) (Request, error) {
 	parts := strings.Fields(raw)
 	if len(parts) == 0 {
@@ -286,22 +287,43 @@ func parseRequest(raw string) (Request, error) {
 	}
 
 	command := strings.ToUpper(parts[0])
-	req := Request{Command: command}
+	req := Request{Command: command, TxnID: 0} // Default TxnID to 0 for auto-commit
 
 	switch command {
 	case "PUT":
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PUT requires key and value")
 		}
-		req.Key = parts[1]                       // Key is string
-		req.Value = strings.Join(parts[2:], " ") // Value can contain spaces
+		req.Key = parts[1]
+		req.Value = strings.Join(parts[2:], " ")
 	case "GET", "DELETE":
 		if len(parts) < 2 {
 			return Request{}, fmt.Errorf("%s requires a key", command)
 		}
-		req.Key = parts[1] // Key is string
+		req.Key = parts[1]
 	case "SIZE":
 		// No additional arguments needed
+	// --- NEW: 2PC Commands ---
+	case "PREPARE":
+		if len(parts) < 3 {
+			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
+		}
+		txnID, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid TxnID format: %w", err)
+		}
+		req.TxnID = txnID
+		req.Value = strings.Join(parts[2:], " ") // Operations JSON string
+	case "COMMIT", "ABORT":
+		if len(parts) < 2 {
+			return Request{}, fmt.Errorf("%s requires TxnID", command)
+		}
+		txnID, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid TxnID format: %w", err)
+		}
+		req.TxnID = txnID
+	// --- END NEW ---
 	default:
 		return Request{}, fmt.Errorf("unknown command: %s", command)
 	}
@@ -309,15 +331,16 @@ func parseRequest(raw string) (Request, error) {
 }
 
 // handleRequest processes a parsed Request and returns a Response.
-// This includes basic transaction semantics (each operation is atomic via WAL)
-// and global B-Tree locking for concurrency control.
-// It now also includes sharding awareness.
+// It now includes 2PC command handling and passes TxnID to B-tree operations.
 func handleRequest(req Request) Response {
 	var resp Response
 	var err error
 
-	// --- Sharding Awareness: Check if key belongs to this node ---
-	if req.Command == "PUT" || req.Command == "GET" || req.Command == "DELETE" {
+	// --- Sharding Awareness: Check if key belongs to this node (for data ops) ---
+	// 2PC commands (PREPARE, COMMIT, ABORT) are sent directly to the participant,
+	// so they don't need shard routing check here.
+	isDataOperation := req.Command == "PUT" || req.Command == "GET" || req.Command == "DELETE"
+	if isDataOperation {
 		targetSlot := fsm.GetSlotForHashKey(req.Key)
 
 		myAssignedSlotsMu.RLock()
@@ -329,7 +352,6 @@ func handleRequest(req Request) Response {
 					break
 				}
 				// If assigned to another node, we could return a REDIRECT message here
-				// For now, we'll just indicate it's not for this node.
 				resp = Response{Status: "REDIRECT", Message: fmt.Sprintf("Key '%s' (slot %d) belongs to node %s.", req.Key, targetSlot, slotInfo.AssignedNodeID)}
 				myAssignedSlotsMu.RUnlock()
 				return resp
@@ -346,9 +368,9 @@ func handleRequest(req Request) Response {
 
 	switch req.Command {
 	case "PUT":
-		dbLock.Lock() // Acquire write lock for PUT
-		err = dbInstance.Insert(req.Key, req.Value)
-		dbLock.Unlock() // Release write lock
+		dbLock.Lock()                                          // Acquire write lock for PUT
+		err = dbInstance.Insert(req.Key, req.Value, req.TxnID) // Pass TxnID
+		dbLock.Unlock()                                        // Release write lock
 		if err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT failed: %v", err)}
 		} else {
@@ -366,9 +388,9 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "NOT_FOUND", Message: fmt.Sprintf("Key '%s' not found.", req.Key)}
 		}
 	case "DELETE":
-		dbLock.Lock() // Acquire write lock for DELETE
-		err = dbInstance.Delete(req.Key)
-		dbLock.Unlock() // Release write lock
+		dbLock.Lock()                               // Acquire write lock for DELETE
+		err = dbInstance.Delete(req.Key, req.TxnID) // Pass TxnID
+		dbLock.Unlock()                             // Release write lock
 		if err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE failed: %v", err)}
 		} else {
@@ -384,6 +406,42 @@ func handleRequest(req Request) Response {
 		} else {
 			resp = Response{Status: "OK", Message: fmt.Sprintf("%d", size)}
 		}
+	// --- NEW: 2PC Command Handlers ---
+	case "PREPARE":
+		// Operations are passed as a JSON string in req.Value
+		ops, jsonErr := deserializeOperations(req.Value)
+		if jsonErr != nil {
+			resp = Response{Status: "VOTE_ABORT", Message: fmt.Sprintf("Invalid operations JSON for PREPARE: %v", jsonErr)}
+			return resp
+		}
+		// dbLock.Lock() // Prepare needs to acquire locks on keys, not the whole DB
+		// The B-tree's Prepare method will handle key-level locking.
+		err = dbInstance.Prepare(req.TxnID, ops)
+		// dbLock.Unlock()
+		if err != nil {
+			resp = Response{Status: "VOTE_ABORT", Message: fmt.Sprintf("PREPARE failed for Txn %d: %v", req.TxnID, err)}
+		} else {
+			resp = Response{Status: "VOTE_COMMIT", Message: fmt.Sprintf("Txn %d prepared.", req.TxnID)}
+		}
+	case "COMMIT":
+		// dbLock.Lock() // Commit releases locks, not acquires DB lock
+		err = dbInstance.Commit(req.TxnID)
+		// dbLock.Unlock()
+		if err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("COMMIT failed for Txn %d: %v", req.TxnID, err)}
+		} else {
+			resp = Response{Status: "COMMITTED", Message: fmt.Sprintf("Txn %d committed.", req.TxnID)}
+		}
+	case "ABORT":
+		// dbLock.Lock() // Abort releases locks, not acquires DB lock
+		err = dbInstance.Abort(req.TxnID)
+		// dbLock.Unlock()
+		if err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("ABORT failed for Txn %d: %v", req.TxnID, err)}
+		} else {
+			resp = Response{Status: "ABORTED", Message: fmt.Sprintf("Txn %d aborted.", req.TxnID)}
+		}
+	// --- END NEW ---
 	default:
 		resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Command)}
 	}
@@ -437,6 +495,38 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+// serializeOperations is a helper to serialize a list of operations for sending to Storage Nodes.
+// This is used by the API Service (Coordinator) to send operations to participants.
+func serializeOperations(ops []btree_core.TransactionOperation) string {
+	var builder strings.Builder
+	for i, op := range ops {
+		opJSON, _ := json.Marshal(op) // Should handle errors in production
+		builder.WriteString(string(opJSON))
+		if i < len(ops)-1 {
+			builder.WriteString("|") // Delimiter between operations
+		}
+	}
+	return builder.String()
+}
+
+// deserializeOperations is a helper to deserialize a list of operations from a string.
+// This is used by the Storage Node (Participant) to receive operations from the Coordinator.
+func deserializeOperations(s string) ([]btree_core.TransactionOperation, error) {
+	parts := strings.Split(s, "|")
+	var ops []btree_core.TransactionOperation
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		var op btree_core.TransactionOperation
+		if err := json.Unmarshal([]byte(part), &op); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal operation part '%s': %w", part, err)
+		}
+		ops = append(ops, op)
+	}
+	return ops, nil
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
 
@@ -455,6 +545,7 @@ func main() {
 
 	log.Printf("INFO: GojoDB Storage Node %s listening for client traffic on %s", myStorageNodeID, myStorageNodeAddr)
 	log.Println("INFO: Commands: PUT <key> <value>, GET <key>, DELETE <key>, SIZE")
+	log.Println("INFO: 2PC Commands (from Coordinator only): PREPARE <TxnID> <ops_json>, COMMIT <TxnID>, ABORT <TxnID>")
 
 	for {
 		// Accept incoming connections

@@ -3,6 +3,7 @@ package btree
 import (
 	// For LRU
 
+	"cmp"
 	"errors"
 	"fmt"
 	"log"
@@ -1731,4 +1732,58 @@ func (bt *BTree[K, V]) releaseAllLocksForTxn(txnID uint64) {
 		}
 	}
 	txn.locksHeld = make(map[string]struct{}) // Clear the transaction's record of held locks
+}
+
+// Close flushes all dirty pages and closes the database file.
+func (bt *BTree[K, V]) Close() error {
+	if bt.bpm == nil {
+		return errors.New("btree buffer pool manager is nil, cannot close")
+	}
+
+	log.Println("INFO: Closing B-tree database...")
+	// Update persisted tree size in header one last time (if you have an accurate in-memory size tracker)
+	// For this implementation, TreeSize is updated on every insert/delete, but a final checkpoint is good.
+	// If bt.size was an accurate in-memory field, you'd do:
+	// if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader){ h.TreeSize = bt.sizeInMemory }); err != nil {
+	// 	fmt.Fprintf(os.Stderr, "Error updating tree size in header on close: %v\n", err)
+	// }
+
+	// Flush all dirty pages from the buffer pool to disk
+	flushErr := bt.bpm.FlushAllPages()
+	if flushErr != nil {
+		log.Printf("ERROR: Error flushing all pages on close: %v", flushErr)
+	}
+
+	// Close the underlying disk manager (which closes the file)
+	closeErr := bt.diskManager.Close()
+	if closeErr != nil {
+		log.Printf("ERROR: Error closing disk manager on close: %v", closeErr)
+	}
+
+	if flushErr != nil || closeErr != nil {
+		return fmt.Errorf("errors occurred during B-tree close: flush error: %v, close error: %v", flushErr, closeErr)
+	}
+	log.Println("INFO: B-tree database closed successfully.")
+	return nil
+}
+
+// DefaultKeyOrder provides a comparison function for comparable types.
+func DefaultKeyOrder[K cmp.Ordered](a, b K) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}
+
+// SerializeString serializes a string to a byte slice.
+func SerializeString(s string) ([]byte, error) {
+	return []byte(s), nil
+}
+
+// DeserializeString deserializes a byte slice to a string.
+func DeserializeString(data []byte) (string, error) {
+	return string(data), nil
 }
