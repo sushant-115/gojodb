@@ -4,233 +4,191 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort" // Required by slices.BinarySearchFunc and slices.Insert in btree.go
 
-	"btree/btree_core" // Adjust this import path to your actual module path
+	// Import your btree package
+	"github.com/sushant-115/gojodb/core/indexing/btree"
 )
 
-const (
-	dbFilePath     = "data/test_db.db"
-	logDir         = "data/logs"
-	archiveDir     = "data/archives"
-	logBufferSize  = 4096      // 4KB log buffer
-	logSegmentSize = 16 * 1024 // 16KB log segment size for quick rotation demo
-	bTreeDegree    = 3         // B-tree order (min degree)
-	bufferPoolSize = 10        // Number of pages in buffer pool
-	dbPageSize     = 4096      // Database page size
-)
-
-// cleanup removes the database file and log directories
-func cleanup() {
-	fmt.Println("\n--- Cleaning up previous test data ---")
-	if err := os.RemoveAll("data"); err != nil {
-		fmt.Printf("Warning: Failed to remove data directory: %v\n", err)
+// Helper function to create default serializers for int64 keys and string values
+func getDefaultSerializers() btree.KeyValueSerializer[int64, string] {
+	return btree.KeyValueSerializer[int64, string]{
+		SerializeKey:     btree.SerializeInt64,
+		DeserializeKey:   btree.DeserializeInt64,
+		SerializeValue:   btree.SerializeString,
+		DeserializeValue: btree.DeserializeString,
 	}
-	fmt.Println("Cleanup complete.")
+}
+
+// Function to print B-tree content for debugging
+func printBTreeContent(bt *btree.BTree[int64, string], name string) {
+	fmt.Printf("\n--- %s B-Tree Content ---\n", name)
+	size, err := bt.GetSize()
+	if err != nil {
+		fmt.Printf("Error getting tree size: %v\n", err)
+	} else {
+		fmt.Printf("Tree Size: %d\n", size)
+	}
+	fmt.Printf("%s\n", bt.String())
+	fmt.Printf("--------------------------\n")
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
+	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for better debugging
 
-	// --- Scenario 1: Initial Creation and Inserts (Simulate Crash) ---
-	fmt.Println("\n--- Scenario 1: Initial Creation and Inserts (Simulating Crash) ---")
-	cleanup() // Start fresh
+	dbFilePath := "test_gojodb.db"
+	logDir := "test_logs"
+	archiveDir := "test_archives"
+	poolSize := 10                         // Buffer pool size
+	pageSize := 4096                       // Page size in bytes
+	degree := 2                            // B-tree degree (minimum 2)
+	segmentSizeLimit := int64(1024 * 1024) // 1 MB log segment size limit
 
-	// Initialize LogManager
-	lm, err := btree_core.NewLogManager(logDir, archiveDir, logBufferSize, logSegmentSize)
+	// Clean up previous test files
+	os.Remove(dbFilePath)
+	os.RemoveAll(logDir)
+	os.RemoveAll(archiveDir)
+
+	fmt.Println("--- Starting B-Tree Persistence and WAL Test ---")
+
+	// 1. Initialize LogManager
+	logManager, err := btree.NewLogManager(logDir, archiveDir, 4096, segmentSizeLimit)
 	if err != nil {
 		log.Fatalf("Failed to create LogManager: %v", err)
 	}
 	defer func() {
-		if err := lm.Close(); err != nil {
+		if err := logManager.Close(); err != nil {
 			log.Printf("Error closing LogManager: %v", err)
 		}
 	}()
 
-	// Create a new B-tree database file
-	bTree, err := btree_core.NewBTreeFile[int64, string](
-		dbFilePath,
-		bTreeDegree,
-		btree_core.DefaultKeyOrder[int64],
-		btree_core.KeyValueSerializer[int64, string]{
-			SerializeKey:     btree_core.SerializeInt64,
-			DeserializeKey:   btree_core.DeserializeInt64,
-			SerializeValue:   btree_core.SerializeString,
-			DeserializeValue: btree_core.DeserializeString,
-		},
-		bufferPoolSize,
-		dbPageSize,
-		lm, // Pass the LogManager
-	)
+	kvSerializers := getDefaultSerializers()
+
+	// 2. Create a new B-tree database
+	fmt.Printf("\nAttempting to create a new B-tree at %s...\n", dbFilePath)
+	bt, err := btree.NewBTreeFile[int64, string](dbFilePath, degree, btree.DefaultKeyOrder[int64], kvSerializers, poolSize, pageSize, logManager)
 	if err != nil {
-		log.Fatalf("Failed to create BTree file: %v", err)
+		log.Fatalf("Failed to create new B-tree file: %v", err)
+	}
+	fmt.Println("B-tree database created successfully.")
+	printBTreeContent(bt, "Initial Empty")
+
+	// 3. Insert some data
+	fmt.Println("\n--- Inserting data ---")
+	dataToInsert := map[int64]string{
+		10: "Value_10",
+		20: "Value_20",
+		5:  "Value_5",
+		15: "Value_15",
+		30: "Value_30",
+		25: "Value_25",
+		1:  "Value_1",
+		7:  "Value_7",
+		22: "Value_22",
+		18: "Value_18",
 	}
 
-	fmt.Println("\n--- Inserting keys (Scenario 1) ---")
-	keysToInsert := []int64{10, 20, 5, 30, 15, 25, 35, 2, 7, 12, 18, 22, 28, 32, 38, 1, 3, 6, 8, 11, 13, 16, 19, 21, 23, 26, 29, 31, 33, 36, 39, 4, 9, 14, 17, 24, 27, 34, 37, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50}
-	for _, key := range keysToInsert {
-		value := fmt.Sprintf("value_%d", key)
-		if err := bTree.Insert(key, value); err != nil {
-			log.Fatalf("Failed to insert key %d: %v", key, err)
+	keys := make([]int64, 0, len(dataToInsert))
+	for k := range dataToInsert {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] }) // Insert in sorted order for easier debugging, though B-tree handles any order
+
+	for _, k := range keys {
+		v := dataToInsert[k]
+		fmt.Printf("Inserting (%d, %s)...\n", k, v)
+		if err := bt.Insert(k, v); err != nil {
+			log.Fatalf("Failed to insert key %d: %v", k, err)
 		}
-		fmt.Printf("Inserted: %d\n", key)
 	}
+	fmt.Println("Data insertion complete.")
+	printBTreeContent(bt, "After Inserts")
 
-	size, err := bTree.GetSize()
-	if err != nil {
-		log.Fatalf("Failed to get tree size: %v", err)
-	}
-	fmt.Printf("\nTree size after inserts: %d\n", size)
-	fmt.Println("\n--- B-Tree structure after inserts (Scenario 1) ---")
-	fmt.Println(bTree.String())
-
-	fmt.Println("\n--- Verifying inserts (Scenario 1) ---")
-	for _, key := range []int64{5, 15, 30, 1, 40, 99} {
-		val, found, err := bTree.Search(key)
+	// 4. Search for data
+	fmt.Println("\n--- Searching for data ---")
+	keysToSearch := []int64{5, 15, 22, 99} // 99 should not be found
+	for _, k := range keysToSearch {
+		val, found, err := bt.Search(k)
 		if err != nil {
-			log.Fatalf("Search for key %d failed: %v", key, err)
+			log.Fatalf("Error searching for key %d: %v", k, err)
 		}
 		if found {
-			fmt.Printf("Key %d found: %s\n", key, val)
+			fmt.Printf("Search for %d: Found! Value: %s\n", k, val)
 		} else {
-			fmt.Printf("Key %d not found.\n", key)
+			fmt.Printf("Search for %d: Not Found.\n", k)
 		}
 	}
 
-	fmt.Println("\n--- Simulating crash: NOT calling bTree.Close() ---")
-	// bTree.Close() is intentionally skipped here to simulate a crash.
-	// This leaves dirty pages in the buffer pool and un-synced log records.
-
-	// --- Scenario 2: Re-opening and Recovery (Simulating Restart after Crash) ---
-	fmt.Println("\n--- Scenario 2: Re-opening and Recovery ---")
-
-	// Re-initialize LogManager (it will find existing segments)
-	lm2, err := btree_core.NewLogManager(logDir, archiveDir, logBufferSize, logSegmentSize)
-	if err != nil {
-		log.Fatalf("Failed to create LogManager for restart: %v", err)
-	}
-	defer func() {
-		if err := lm2.Close(); err != nil {
-			log.Printf("Error closing LogManager on restart: %v", err)
-		}
-	}()
-
-	// Open the existing B-tree database file
-	bTree2, err := btree_core.OpenBTreeFile[int64, string](
-		dbFilePath,
-		btree_core.DefaultKeyOrder[int64],
-		btree_core.KeyValueSerializer[int64, string]{
-			SerializeKey:     btree_core.SerializeInt64,
-			DeserializeKey:   btree_core.DeserializeInt64,
-			SerializeValue:   btree_core.SerializeString,
-			DeserializeValue: btree_core.DeserializeString,
-		},
-		bufferPoolSize,
-		dbPageSize,
-		lm2, // Pass the new LogManager
-	)
-	if err != nil {
-		log.Fatalf("Failed to open BTree file: %v", err)
-	}
-	defer func() {
-		if err := bTree2.Close(); err != nil {
-			log.Printf("Error closing BTree on restart: %v", err)
-		}
-	}()
-
-	fmt.Println("\n--- Verifying data after simulated crash and restart (Recovery would happen here) ---")
-	// The recovery process (Analysis, Redo) would run within OpenBTreeFile if implemented.
-	// We'll rely on the WAL and BPM flushing to disk for durability here.
-	for _, key := range keysToInsert { // Verify all keys are still there
-		val, found, err := bTree2.Search(key)
+	// 5. Delete some data
+	fmt.Println("\n--- Deleting data ---")
+	keysToDelete := []int64{15, 5, 30, 2} // 2 should not be found for deletion
+	for _, k := range keysToDelete {
+		fmt.Printf("Deleting key %d...\n", k)
+		err := bt.Delete(k)
 		if err != nil {
-			log.Fatalf("Search for key %d failed after restart: %v", key, err)
-		}
-		fmt.Printf("Search key val: ", key, val)
-		if found {
-			// fmt.Printf("Key %d found: %s (after restart)\n", key, val)
-		} else {
-			fmt.Printf("ERROR: Key %d NOT found after restart (expected to be present).\n", key)
-		}
-	}
-	size2, err := bTree2.GetSize()
-	if err != nil {
-		log.Fatalf("Failed to get tree size after restart: %v", err)
-	}
-	fmt.Printf("\nTree size after restart: %d (Expected: %d)\n", size2, len(keysToInsert))
-	fmt.Println("\n--- B-Tree structure after restart ---")
-	fmt.Println(bTree2.String())
-
-	// --- Scenario 3: Deletions and Free Space Management ---
-	fmt.Println("\n--- Scenario 3: Deletions and Free Space Management ---")
-	keysToDelete := []int64{10, 20, 5, 30, 15, 25, 35, 2, 7, 12, 18, 22, 28, 32, 38, 4, 9, 14, 17, 24, 27, 34, 37, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50} // Delete many keys
-	for _, key := range keysToDelete {
-		if err := bTree2.Delete(key); err != nil {
-			if err == btree_core.ErrKeyNotFound {
-				fmt.Printf("Key %d not found for deletion (might have been deleted by merge).\n", key)
+			if err == btree.ErrKeyNotFound {
+				fmt.Printf("Key %d not found for deletion.\n", k)
 			} else {
-				log.Fatalf("Failed to delete key %d: %v", key, err)
+				log.Fatalf("Failed to delete key %d: %v", k, err)
 			}
 		} else {
-			fmt.Printf("Deleted: %d\n", key)
+			fmt.Printf("Successfully deleted key %d.\n", k)
 		}
 	}
+	printBTreeContent(bt, "After Deletions")
 
-	size3, err := bTree2.GetSize()
-	if err != nil {
-		log.Fatalf("Failed to get tree size after deletions: %v", err)
-	}
-	fmt.Printf("\nTree size after deletions: %d\n", size3)
-	fmt.Println("\n--- B-Tree structure after deletions ---")
-	fmt.Println(bTree2.String())
-
+	// 6. Verify deletions
 	fmt.Println("\n--- Verifying deletions ---")
-	for _, key := range []int64{10, 20, 5, 1, 3, 6, 8, 11, 13, 16, 19, 21, 23, 26, 29, 31, 33, 36, 39, 99} { // Some remaining, some deleted, some never existed
-		val, found, err := bTree2.Search(key)
+	keysToVerify := []int64{5, 15, 30, 10, 20}
+	for _, k := range keysToVerify {
+		_, found, err := bt.Search(k)
 		if err != nil {
-			log.Fatalf("Search for key %d failed after deletion: %v", key, err)
+			log.Fatalf("Error verifying key %d: %v", k, err)
 		}
 		if found {
-			fmt.Printf("Key %d found (expected deleted): %s\n", key, val) // Should ideally not be found if deleted
+			fmt.Printf("Verification for %d: STILL FOUND (Expected to be deleted: %t)\n", k, (k == 5 || k == 15 || k == 30))
 		} else {
-			fmt.Printf("Key %d not found (expected not found or deleted).\n", key)
+			fmt.Printf("Verification for %d: NOT FOUND (Expected to be deleted: %t)\n", k, (k == 5 || k == 15 || k == 30))
 		}
 	}
 
-	fmt.Println("\n--- Attempting to deallocate a page (Free Space Management TODO) ---")
-	// This will call the DiskManager.DeallocatePage, which is a TODO.
-	// You'd observe log messages about this.
-	if err := bTree2.DeallocatePage(btree_core.PageID(100)); err != nil {
-		fmt.Printf("DeallocatePage (expected TODO error): %v\n", err)
-	}
+	// 7. Simulate a "crash" - do not call bt.Close()
+	fmt.Println("\n--- Simulating crash (not calling bt.Close()) ---")
+	fmt.Println("The B-tree will now be reopened, and recovery should ensure data consistency.")
+	// Set bt to nil to ensure we're not using the old instance
+	bt = nil
 
-	fmt.Println("\n--- Cleanly closing B-tree and LogManager ---")
-	// This will trigger FlushAllPages and final log segment roll/sync.
-	if err := bTree2.Close(); err != nil {
-		log.Fatalf("Failed to cleanly close BTree: %v", err)
-	}
-	fmt.Println("Database closed cleanly.")
-
-	fmt.Println("\n--- Listing log files and archive files ---")
-	listFilesInDir(logDir)
-	listFilesInDir(archiveDir)
-
-	fmt.Println("\n--- Test complete. ---")
-}
-
-func listFilesInDir(dir string) {
-	fmt.Printf("Contents of %s:\n", dir)
-	files, err := os.ReadDir(dir)
+	// 8. Re-open the database, triggering recovery via LogManager
+	fmt.Printf("\nAttempting to re-open B-tree at %s with recovery...\n", dbFilePath)
+	btRecovered, err := btree.OpenBTreeFile[int64, string](dbFilePath, btree.DefaultKeyOrder[int64], kvSerializers, poolSize, pageSize, logManager)
 	if err != nil {
-		fmt.Printf("  Error reading directory: %v\n", err)
-		return
+		log.Fatalf("Failed to open existing B-tree file for recovery: %v", err)
 	}
-	if len(files) == 0 {
-		fmt.Println("  (empty)")
-		return
-	}
-	for _, file := range files {
-		if !file.IsDir() {
-			fmt.Printf("  - %s\n", file.Name())
+	fmt.Println("B-tree database reopened successfully. Recovery (Redo Pass) should have completed.")
+
+	// 9. Verify state after recovery
+	printBTreeContent(btRecovered, "After Recovery")
+	fmt.Println("\n--- Verifying data consistency after recovery ---")
+	keysAfterRecovery := []int64{1, 7, 10, 18, 20, 22, 25, 5, 15, 30} // Check original, deleted, and remaining
+	for _, k := range keysAfterRecovery {
+		val, found, err := btRecovered.Search(k)
+		if err != nil {
+			log.Fatalf("Error searching for key %d after recovery: %v", k, err)
+		}
+		expectedFound := !(k == 5 || k == 15 || k == 30) // These keys were deleted
+		if found != expectedFound {
+			fmt.Printf("Recovery check for %d: Mismatch! Found: %t, Expected Found: %t\n", k, found, expectedFound)
+		} else if found {
+			fmt.Printf("Recovery check for %d: OK. Found: %s\n", k, val)
+		} else {
+			fmt.Printf("Recovery check for %d: OK. Not Found.\n", k)
 		}
 	}
+
+	// Final close of the recovered B-tree
+	if err := btRecovered.Close(); err != nil {
+		log.Printf("Error closing recovered B-tree: %v", err)
+	}
+
+	fmt.Println("\n--- B-Tree Persistence and WAL Test Complete ---")
 }
