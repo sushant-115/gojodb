@@ -32,6 +32,11 @@ const (
 	OpAssignSlotRange = "assign_slot_range" // Assigns a range of slots to a storage node
 	OpSplitSlotRange  = "split_slot_range"  // Splits an existing slot range into new ones
 	OpRemoveSlotRange = "remove_slot_range" // Removes a slot range (e.g., after merge or rebalance)
+
+	// Replication Operations ---
+	OpSetPrimaryReplica = "set_primary_replica" // Assigns primary and replica(s) for a slot range
+	OpPromoteReplica    = "promote_replica"     // Promotes a replica to primary
+	OpRemoveReplica     = "remove_replica"      // Removes a replica from a slot range
 )
 
 // TotalHashSlots defines the fixed number of hash slots for sharding.
@@ -46,6 +51,9 @@ type SlotRangeInfo struct {
 	AssignedNodeID string    `json:"assigned_node_id"` // ID of the Storage Node currently hosting this slot range
 	Status         string    `json:"status"`           // e.g., "active", "migrating_in", "migrating_out", "offline"
 	LastUpdated    time.Time `json:"last_updated"`     // Timestamp of last update
+	// Replication Fields
+	PrimaryNodeID  string   `json:"primary_node_id"`  // ID of the Storage Node acting as primary for this slot range
+	ReplicaNodeIDs []string `json:"replica_node_ids"` // IDs of Storage Nodes acting as replicas for this slot range
 }
 
 // GojoDBFSM implements the raft.FSM interface.
@@ -139,7 +147,79 @@ func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
 		delete(f.slotAssignments, cmd.Key)
 		log.Printf("DEBUG: FSM applied: Removed Slot Range '%s' (Index: %d)", cmd.Key, logEntry.Index)
 		return nil
-	// --- End Hash Sharding Operations Apply Logic ---
+		// --- End Hash Sharding Operations Apply Logic ---
+
+		// --- NEW: Replication Operations Apply Logic ---
+	case OpSetPrimaryReplica:
+		var slotInfo SlotRangeInfo // Expecting a full SlotRangeInfo with Primary/Replicas
+		if err := json.Unmarshal([]byte(cmd.Value), &slotInfo); err != nil {
+			log.Printf("ERROR: FSM failed to unmarshal SlotRangeInfo for OpSetPrimaryReplica: %v", err)
+			return fmt.Errorf("invalid SlotRangeInfo format for OpSetPrimaryReplica: %w", err)
+		}
+		if existing, ok := f.slotAssignments[slotInfo.RangeID]; ok {
+			existing.PrimaryNodeID = slotInfo.PrimaryNodeID
+			existing.ReplicaNodeIDs = slotInfo.ReplicaNodeIDs
+			existing.Status = slotInfo.Status // Update status if provided (e.g., "active")
+			existing.LastUpdated = time.Now()
+			f.slotAssignments[slotInfo.RangeID] = existing
+			log.Printf("DEBUG: FSM applied: Set Primary '%s' and Replicas %v for slot range '%s' (Index: %d)",
+				slotInfo.PrimaryNodeID, slotInfo.ReplicaNodeIDs, slotInfo.RangeID, logEntry.Index)
+		} else {
+			log.Printf("WARNING: FSM tried to set primary/replica for non-existent slot range '%s' (Index: %d)", slotInfo.RangeID, logEntry.Index)
+			return fmt.Errorf("slot range %s not found for primary/replica assignment", slotInfo.RangeID)
+		}
+		return nil
+	case OpPromoteReplica:
+		// cmd.Key: RangeID
+		// cmd.Value: New PrimaryNodeID
+		newPrimaryNodeID := cmd.Value
+		if existing, ok := f.slotAssignments[cmd.Key]; ok {
+			// Remove old primary if it exists in replicas
+			newReplicas := []string{}
+			if existing.PrimaryNodeID != "" {
+				newReplicas = append(newReplicas, existing.PrimaryNodeID)
+			}
+			// Add existing replicas, excluding the new primary
+			for _, replicaID := range existing.ReplicaNodeIDs {
+				if replicaID != newPrimaryNodeID {
+					newReplicas = append(newReplicas, replicaID)
+				}
+			}
+
+			existing.PrimaryNodeID = newPrimaryNodeID
+			existing.ReplicaNodeIDs = newReplicas
+			existing.Status = "active" // Or "recovering"
+			existing.LastUpdated = time.Now()
+			f.slotAssignments[cmd.Key] = existing
+			log.Printf("DEBUG: FSM applied: Promoted Node '%s' to Primary for slot range '%s' (Index: %d)",
+				newPrimaryNodeID, cmd.Key, logEntry.Index)
+		} else {
+			log.Printf("WARNING: FSM tried to promote replica for non-existent slot range '%s' (Index: %d)", cmd.Key, logEntry.Index)
+			return fmt.Errorf("slot range %s not found for replica promotion", cmd.Key)
+		}
+		return nil
+	case OpRemoveReplica:
+		// cmd.Key: RangeID
+		// cmd.Value: ReplicaNodeID to remove
+		replicaToRemoveID := cmd.Value
+		if existing, ok := f.slotAssignments[cmd.Key]; ok {
+			newReplicas := []string{}
+			for _, replicaID := range existing.ReplicaNodeIDs {
+				if replicaID != replicaToRemoveID {
+					newReplicas = append(newReplicas, replicaID)
+				}
+			}
+			existing.ReplicaNodeIDs = newReplicas
+			existing.LastUpdated = time.Now()
+			f.slotAssignments[cmd.Key] = existing
+			log.Printf("DEBUG: FSM applied: Removed Replica '%s' from slot range '%s' (Index: %d)",
+				replicaToRemoveID, cmd.Key, logEntry.Index)
+		} else {
+			log.Printf("WARNING: FSM tried to remove replica for non-existent slot range '%s' (Index: %d)", cmd.Key, logEntry.Index)
+			return fmt.Errorf("slot range %s not found for replica removal", cmd.Key)
+		}
+		return nil
+		// --- END NEW ---
 
 	default:
 		log.Printf("WARNING: Unknown FSM command operation: %s (Index: %d)", cmd.Op, logEntry.Index)

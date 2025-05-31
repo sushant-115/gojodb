@@ -33,15 +33,18 @@ const (
 
 // APIRequest represents a client request received by the API service.
 type APIRequest struct {
-	Command string `json:"command"`
-	Key     string `json:"key"`
-	Value   string `json:"value,omitempty"` // Optional for GET/DELETE
+	Command  string `json:"command"`
+	Key      string `json:"key"`
+	Value    string `json:"value,omitempty"`     // Optional for GET/DELETE
+	StartKey string `json:"start_key,omitempty"` // For range ops
+	EndKey   string `json:"end_key,omitempty"`   // For range ops
 }
 
 // APIResponse represents a response sent by the API service to the client.
 type APIResponse struct {
-	Status  string `json:"status"`            // OK, ERROR, NOT_FOUND, REDIRECT, COMMITTED, ABORTED
-	Message string `json:"message,omitempty"` // Details or value for GET, or target node address for REDIRECT
+	Status  string          `json:"status"`            // OK, ERROR, NOT_FOUND, REDIRECT, COMMITTED, ABORTED
+	Message string          `json:"message,omitempty"` // Details or value for GET, or target node address for REDIRECT
+	Data    json.RawMessage `json:"data,omitempty"`    // Flexible field for returning structured data (e.g., array of entries, aggregation result)
 }
 
 // TransactionOperation defines a single operation within a distributed transaction.
@@ -316,6 +319,9 @@ func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if path == "/api/transaction" { // New endpoint for distributed transactions
 		s.handleTransactionRequest(w, r)
+		return
+	} else if path == "/api/query" { // NEW: Endpoint for range queries and aggregations
+		s.handleQueryRequest(w, r)
 		return
 	} else {
 		http.Error(w, "Not Found", http.StatusNotFound)
@@ -747,6 +753,113 @@ func deserializeOperations(s string) ([]TransactionOperation, error) {
 	return ops, nil
 }
 
+// --- NEW: handleQueryRequest for range queries and aggregations ---
+// handleQueryRequest processes client range query and aggregation requests.
+func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var apiReq APIRequest
+	if err := json.NewDecoder(r.Body).Decode(&apiReq); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request format: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("INFO: API Service: Received query command: %s StartKey: '%s' EndKey: '%s'", apiReq.Command, apiReq.StartKey, apiReq.EndKey)
+
+	// Leader check already done in handleAPIRequest
+
+	// 1. Determine target slot(s) for the range
+	startSlot := fsm.GetSlotForHashKey(apiReq.StartKey)
+	//endSlot := fsm.GetSlotForHashKey(apiReq.EndKey) // Note: EndKey is exclusive for range, but for slot it's inclusive
+
+	// --- V1 Sharding Routing for Range Queries: Only support single-shard ranges ---
+	s.slotAssignmentsMu.RLock()
+	var responsibleNodeID string
+	//var responsibleNodeAddr string
+	foundResponsibleShard := false
+
+	// Find the shard that contains the StartKey
+	var startKeySlotInfo fsm.SlotRangeInfo
+	foundStartKeyShard := false
+	for _, slotInfo := range s.slotAssignments {
+		if startSlot >= slotInfo.StartSlot && startSlot <= slotInfo.EndSlot {
+			startKeySlotInfo = slotInfo
+			foundStartKeyShard = true
+			break
+		}
+	}
+	s.slotAssignmentsMu.RUnlock()
+
+	if !foundStartKeyShard {
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("No assignment found for start_key '%s' (slot %d).", apiReq.StartKey, startSlot)}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Check if the entire range falls within this single shard
+	// if endSlot > startKeySlotInfo.EndSlot || endSlot < startKeySlotInfo.StartSlot { // End slot outside this shard's range
+	// 	resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Range query spans multiple shards or is invalid. StartKey slot %d (shard %s) and EndKey slot %d. V1 only supports single-shard range queries.", startSlot, startKeySlotInfo.RangeID, endSlot)}
+	// 	json.NewEncoder(w).Encode(resp)
+	// 	return
+	// }
+
+	responsibleNodeID = startKeySlotInfo.AssignedNodeID
+	s.storageNodeAddressesMu.RLock()
+	actualStorageNodeAddr, storageNodeFound := s.storageNodeAddresses[responsibleNodeID]
+	s.storageNodeAddressesMu.RUnlock()
+
+	if !storageNodeFound || actualStorageNodeAddr == "" {
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Storage Node %s (for range) address not found in Controller cache. Node might be down or not registered.", responsibleNodeID)}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	foundResponsibleShard = true // Confirmed single shard and node found
+	// --- END V1 Sharding Routing ---
+
+	if !foundResponsibleShard {
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Could not determine responsible storage node for range %s-%s.", apiReq.StartKey, apiReq.EndKey)}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// 2. Send query command to the responsible Storage Node
+	// Format: COMMAND <start_key> <end_key>
+	storageQueryCmd := fmt.Sprintf("%s %s %s\n", apiReq.Command, apiReq.StartKey, apiReq.EndKey)
+
+	log.Printf("DEBUG: API Service: Routing range query '%s' to Storage Node %s (%s)", apiReq.Command, responsibleNodeID, actualStorageNodeAddr)
+	respFromSN, err := s.sendStorageNodeCommand(actualStorageNodeAddr, storageQueryCmd)
+	if err != nil {
+		log.Printf("ERROR: API Service: Failed to get response from Storage Node %s for query: %v", responsibleNodeID, err)
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to query Storage Node %s: %v", responsibleNodeID, err)}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// 3. Parse and return response from Storage Node
+	// Assuming Storage Node will return JSON data in its message for queries.
+	// For example, for GET_RANGE, it might return "OK [{"key":"a","value":"1"},{"key":"b","value":"2"}]"
+	// For COUNT_RANGE, it might return "OK 5"
+	apiResp := APIResponse{Status: respFromSN.Status}
+	if respFromSN.Status == "OK" {
+		// Attempt to unmarshal message into Data field, if it's JSON
+		if json.Valid([]byte(respFromSN.Message)) {
+			apiResp.Data = json.RawMessage(respFromSN.Message)
+		} else {
+			apiResp.Message = respFromSN.Message // Fallback to plain message
+		}
+	} else {
+		apiResp.Message = respFromSN.Message
+	}
+
+	json.NewEncoder(w).Encode(apiResp)
+	log.Printf("INFO: API Service: Range query '%s' completed with status: %s", apiReq.Command, apiResp.Status)
+}
+
+// --- END NEW ---
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
 
@@ -760,6 +873,7 @@ func main() {
 	log.Println("INFO: API Endpoints:")
 	log.Println("  - /api/data (POST): { \"command\": \"PUT/GET/DELETE\", \"key\": \"...\", \"value\": \"...\" }")
 	log.Println("  - /api/transaction (POST): { \"operations\": [ {\"command\":\"PUT/DELETE\", \"key\":\"...\", \"value\":\"...\"}, ... ] }")
+	log.Println("  - /api/query (POST): { \"command\": \"GET_RANGE/COUNT_RANGE/SUM_RANGE/MIN_RANGE/MAX_RANGE\", \"start_key\": \"...\", \"end_key\": \"...\" }")
 	log.Println("  - /admin/assign_slot_range (POST, authenticated): Proxy to Controller Leader")
 	log.Println("  - /admin/get_node_for_key (GET, authenticated): Proxy to Controller Leader")
 	log.Println("  - /admin/set_metadata (POST, authenticated): Proxy to Controller Leader")

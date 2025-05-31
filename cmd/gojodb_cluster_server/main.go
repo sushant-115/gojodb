@@ -5,6 +5,7 @@ import (
 	"encoding/json" // Needed for (de)serializing TransactionOperations
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -34,10 +35,12 @@ const (
 	storageNodeListenPort = "9000"      // Default listen port for Storage Node
 
 	// Controller interaction configuration
-	controllerHeartbeatTargetPort = 8086             // Default UDP port on Controller for heartbeats
-	controllerHTTPAddresses       = "localhost:8080" // Comma-separated list of Controller HTTP addresses
-	heartbeatInterval             = 5 * time.Second  // How often to send heartbeats
-	shardMapFetchInterval         = 10 * time.Second // How often to fetch shard map
+	controllerHeartbeatTargetPort = 8086                   // Default UDP port on Controller for heartbeats
+	controllerHTTPAddresses       = "localhost:8080"       // Comma-separated list of Controller HTTP addresses
+	heartbeatInterval             = 5 * time.Second        // How often to send heartbeats
+	shardMapFetchInterval         = 10 * time.Second       // How often to fetch shard map
+	replicationStreamInterval     = 100 * time.Millisecond // How often primary checks for new logs to send
+	storageNodeDialTimeout        = 2 * time.Second        // Timeout for connecting to a storage node
 )
 
 // Global database instance and its lock for simple concurrency control
@@ -53,14 +56,19 @@ var (
 	// Sharding awareness
 	myAssignedSlotsMu sync.RWMutex
 	myAssignedSlots   map[string]fsm.SlotRangeInfo // Cache of slot ranges assigned to THIS node
+	// Replication Manager instance
+	replicationManager *ReplicationManager
 )
 
 // Request represents a parsed client request for single operations.
 type Request struct {
-	Command string
-	Key     string // Key is now string
-	Value   string // Only for PUT
-	TxnID   uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
+	Command  string
+	Key      string // Key is now string
+	Value    string // Only for PUT
+	TxnID    uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
+	StartKey string // For range query
+	EndKey   string // For range query
+
 }
 
 // Response represents a server's reply to a client request.
@@ -71,6 +79,321 @@ type Response struct {
 
 type TransactionOperations struct {
 	Operations []btree_core.TransactionOperation `json:"operations"`
+}
+
+// ReplicationManager manages sending and receiving log streams for replication.
+type ReplicationManager struct {
+	nodeID                string
+	logManager            *btree_core.LogManager
+	dbInstance            *btree_core.BTree[string, string]
+	dbLock                *sync.RWMutex
+	replicationListenPort string
+
+	// State for Primary role (sending logs)
+	primaryForSlots        map[string]fsm.SlotRangeInfo // SlotRangeID -> SlotRangeInfo (where this node is primary)
+	replicaClients         map[string]net.Conn          // ReplicaNodeAddr -> TCP connection to replica
+	lastSentLSN            map[string]btree_core.LSN    // ReplicaNodeAddr -> Last LSN sent to this replica
+	primaryMu              sync.Mutex                   // Protects primary role state
+	storageNodeAddressesMu sync.RWMutex
+	storageNodeAddresses   map[string]string
+
+	// State for Replica role (receiving logs)
+	replicationListener net.Listener // TCP listener for incoming replication streams
+	stopChan            chan struct{}
+	wg                  sync.WaitGroup
+}
+
+// NewReplicationManager creates and initializes a ReplicationManager.
+func NewReplicationManager(nodeID string, lm *btree_core.LogManager, db *btree_core.BTree[string, string], lock *sync.RWMutex) *ReplicationManager {
+	return &ReplicationManager{
+		nodeID:                nodeID,
+		logManager:            lm,
+		dbInstance:            db,
+		dbLock:                lock,
+		primaryForSlots:       make(map[string]fsm.SlotRangeInfo),
+		replicaClients:        make(map[string]net.Conn),
+		lastSentLSN:           make(map[string]btree_core.LSN),
+		stopChan:              make(chan struct{}),
+		storageNodeAddresses:  make(map[string]string),
+		replicationListenPort: "9115",
+	}
+}
+
+// Start initiates the replication manager's background goroutines.
+func (rm *ReplicationManager) Start() {
+	// Start listener for incoming replication streams (for Replica role)
+	rm.wg.Add(1)
+	go rm.startReplicationListener()
+
+	// Start goroutine to manage outbound replication streams (for Primary role)
+	rm.wg.Add(1)
+	go rm.manageOutboundReplication()
+}
+
+// Stop gracefully shuts down the replication manager.
+func (rm *ReplicationManager) Stop() {
+	close(rm.stopChan)
+	rm.wg.Wait() // Wait for all goroutines to finish
+
+	// Close all active replica client connections
+	rm.primaryMu.Lock()
+	for addr, conn := range rm.replicaClients {
+		conn.Close()
+		delete(rm.replicaClients, addr)
+	}
+	rm.primaryMu.Unlock()
+
+	if rm.replicationListener != nil {
+		rm.replicationListener.Close()
+	}
+	log.Printf("INFO: ReplicationManager for %s stopped.", rm.nodeID)
+}
+
+// startReplicationListener starts a TCP listener for incoming replication streams (for Replica role).
+func (rm *ReplicationManager) startReplicationListener() {
+	defer rm.wg.Done()
+	log.Println("DEBUG: Listening logs from: ", rm.replicaClients)
+	addr := fmt.Sprintf(":%s", rm.replicationListenPort)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("FATAL: ReplicationManager: Failed to start replication listener on %s: %v", addr, err)
+	}
+	rm.replicationListener = listener
+	log.Printf("INFO: ReplicationManager: Listening for replication streams on TCP %s", listener.Addr().String())
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-rm.stopChan:
+				log.Println("INFO: Replication listener stopping.")
+				return
+			default:
+				log.Printf("ERROR: ReplicationManager: Error accepting replication connection: %v", err)
+				continue
+			}
+		}
+		rm.wg.Add(1)
+		go rm.handleInboundReplicationStream(conn)
+	}
+}
+
+// handleInboundReplicationStream processes a single incoming replication stream (for Replica role).
+// It reads log records from the primary and applies them locally.
+func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
+	defer rm.wg.Done()
+	defer conn.Close()
+	log.Printf("INFO: ReplicationManager: Accepted inbound replication stream from %s", conn.RemoteAddr().String())
+
+	reader := bufio.NewReader(conn)
+	for {
+		select {
+		case <-rm.stopChan:
+			log.Println("INFO: Replication inbound stream handler stopping.")
+			return
+		default:
+			// Read and deserialize log record
+			var lr btree_core.LogRecord
+			err := rm.logManager.ReadLogRecord(reader, &lr) // Assuming LogManager has a ReadLogRecord helper
+			if err == io.EOF {
+				log.Printf("INFO: ReplicationManager: Primary %s closed replication stream.", conn.RemoteAddr().String())
+				return
+			}
+			if err != nil {
+				log.Printf("ERROR: ReplicationManager: Failed to read log record from stream %s: %v", conn.RemoteAddr().String(), err)
+				return
+			}
+
+			log.Printf("DEBUG: ReplicationManager: Received log record LSN %d (Type: %v, Txn: %d, Page: %d) from Primary.",
+				lr.LSN, lr.Type, lr.TxnID, lr.PageID)
+
+			// --- Apply Log Record Locally (Redo Logic) ---
+			// This is similar to recovery's Redo Pass, but continuous.
+			// It should be idempotent.
+			rm.dbLock.Lock()                                      // Acquire DB write lock for applying replicated changes
+			pageData := make([]byte, rm.dbInstance.GetPageSize()) // Assuming GetPageSize is available on BTree
+
+			// Read page from disk (or get from BPM if already cached)
+			// For simplicity, we'll use DiskManager directly for now, bypassing BPM for direct application.
+			// In a real system, BPM would be used, but with specific flags to avoid pinning/LRU updates.
+			readErr := rm.dbInstance.ReadPage(lr.PageID, pageData)
+			if readErr != nil && lr.Type != btree_core.LogRecordTypeNewPage {
+				log.Printf("WARNING: ReplicationManager: Failed to read page %d for replay: %v. Skipping record LSN %d.", lr.PageID, readErr, lr.LSN)
+				rm.dbLock.Unlock()
+				continue
+			} else if readErr != nil && lr.Type == btree_core.LogRecordTypeNewPage {
+				log.Printf("DEBUG: ReplicationManager: Page %d not found on disk, but it's a new page record. Will allocate if needed.", lr.PageID)
+			}
+
+			switch lr.Type {
+			case btree_core.LogRecordTypeNewPage:
+				// Ensure the page exists on disk. If it was truncated, re-allocate.
+				if lr.PageID.GetID() >= rm.dbInstance.GetNumPages() { // Assuming numPages is public
+					log.Printf("INFO: ReplicationManager: Re-allocating page %d during replay.", lr.PageID)
+					emptyPage := make([]byte, rm.dbInstance.GetPageSize())
+					if writeErr := rm.dbInstance.WritePage(lr.PageID, emptyPage); writeErr != nil {
+						log.Printf("ERROR: ReplicationManager: Failed to re-allocate new page %d during replay: %v", lr.PageID, writeErr)
+						rm.dbLock.Unlock()
+						continue
+					}
+					// Update DiskManager's numPages if this extended the file
+					if lr.PageID >= btree_core.PageID(rm.dbInstance.GetNumPages()) {
+						rm.dbInstance.SetNumPages(uint64(lr.PageID) + 1)
+					}
+				}
+				if len(lr.NewData) > 0 { // Apply initial data if logged
+					if writeErr := rm.dbInstance.WritePage(lr.PageID, lr.NewData); writeErr != nil {
+						log.Printf("ERROR: ReplicationManager: Failed to write new page data for %d during replay: %v", lr.PageID, writeErr)
+						rm.dbLock.Unlock()
+						continue
+					}
+				}
+			case btree_core.LogRecordTypeUpdate:
+				copy(pageData, lr.NewData) // Overwrite page data with new data
+				if writeErr := rm.dbInstance.WritePage(lr.PageID, pageData); writeErr != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to write updated page %d during replay: %v", lr.PageID, writeErr)
+					rm.dbLock.Unlock()
+					continue
+				}
+			case btree_core.LogRecordTypePrepare:
+				// Replica receives PREPARE. It should record this txn as PREPARED.
+				// It doesn't need to acquire locks or re-run operations, just track state for recovery.
+				// This is complex. For V1, we'll just log it.
+				log.Printf("DEBUG: ReplicationManager: Replica received PREPARE for Txn %d. (V1: no active processing)", lr.TxnID)
+			case btree_core.LogRecordTypeCommitTxn:
+				// Replica receives COMMIT. It should mark this txn as COMMITTED.
+				log.Printf("DEBUG: ReplicationManager: Replica received COMMIT for Txn %d.", lr.TxnID)
+			case btree_core.LogRecordTypeAbortTxn:
+				// Replica receives ABORT. It should mark this txn as ABORTED.
+				log.Printf("DEBUG: ReplicationManager: Replica received ABORT for Txn %d.", lr.TxnID)
+			default:
+				log.Printf("WARNING: ReplicationManager: Unhandled log record type %v during replay for LSN %d. Skipping.", lr.Type, lr.LSN)
+			}
+			rm.dbLock.Unlock() // Release DB write lock
+		}
+	}
+}
+
+// manageOutboundReplication identifies primary roles and streams logs to replicas.
+func (rm *ReplicationManager) manageOutboundReplication() {
+	defer rm.wg.Done()
+
+	ticker := time.NewTicker(replicationStreamInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rm.stopChan:
+			log.Println("INFO: Outbound replication manager stopping.")
+			return
+		case <-ticker.C:
+			// 1. Get latest slot assignments from Controller (via main's fetchShardMapFromController)
+			// This is implicitly updated in `myAssignedSlots`.
+
+			// 2. Determine if this node is primary for any slot ranges
+			currentPrimarySlots := make(map[string]fsm.SlotRangeInfo)
+			myAssignedSlotsMu.RLock()
+			for rangeID, slotInfo := range myAssignedSlots {
+				if slotInfo.PrimaryNodeID == rm.nodeID { // This node is primary for this range
+					currentPrimarySlots[rangeID] = slotInfo
+				}
+			}
+			myAssignedSlotsMu.RUnlock()
+
+			rm.primaryMu.Lock()
+			rm.primaryForSlots = currentPrimarySlots // Update local primary role cache
+			rm.primaryMu.Unlock()
+
+			// 3. For each primary slot, stream logs to its replicas
+			for rangeID, slotInfo := range currentPrimarySlots {
+				for _, replicaID := range slotInfo.ReplicaNodeIDs {
+					// Get replica's address from storageNodeAddresses (from main's cache)
+					rm.storageNodeAddressesMu.RLock()
+					log.Println("DEBUG: storage nodes: ", rm.storageNodeAddresses)
+					replicaAddr, ok := rm.storageNodeAddresses[replicaID]
+					rm.storageNodeAddressesMu.RUnlock()
+
+					if !ok || replicaAddr == "" {
+						log.Printf("WARNING: ReplicationManager: Replica %s address not found for slot %s. Cannot stream logs.", replicaID, rangeID)
+						continue
+					}
+
+					// Get or establish connection to replica
+					rm.primaryMu.Lock()
+					conn, connExists := rm.replicaClients[replicaAddr]
+					if !connExists {
+						var err error
+						log.Println("Sending logstreams to: ", replicaAddr)
+						conn, err = net.DialTimeout("tcp", "localhost:9116", storageNodeDialTimeout)
+						if err != nil {
+							log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
+							rm.primaryMu.Unlock()
+							continue
+						}
+						rm.replicaClients[replicaAddr] = conn
+						rm.lastSentLSN[replicaAddr] = 0 // Start from beginning of log for new connection
+						log.Printf("INFO: ReplicationManager: Established new replication client connection to replica %s at %s.", replicaID, replicaAddr)
+					}
+					rm.primaryMu.Unlock()
+
+					// Stream logs to this replica
+					rm.streamLogsToReplica(conn, replicaAddr, replicaID)
+				}
+			}
+		}
+	}
+}
+
+// streamLogsToReplica sends new log records to a specific replica.
+func (rm *ReplicationManager) streamLogsToReplica(conn net.Conn, replicaAddr, replicaID string) {
+	rm.primaryMu.Lock()
+	lastLSN := rm.lastSentLSN[replicaAddr]
+	rm.primaryMu.Unlock()
+
+	log.Printf("DEBUG: ReplicationManager: Streaming logs to replica %s from LSN %d.", replicaID, lastLSN)
+
+	// Get a log stream from LogManager
+	logStream, err := rm.logManager.StartLogStream(lastLSN)
+	if err != nil {
+		log.Printf("ERROR: ReplicationManager: Failed to start log stream for replica %s: %v", replicaID, err)
+		rm.closeReplicaConnection(replicaAddr)
+		return
+	}
+
+	for lr := range logStream {
+		serializedRecord, err := lr.Serialize()
+		if err != nil {
+			log.Printf("ERROR: ReplicationManager: Failed to serialize log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
+			rm.closeReplicaConnection(replicaAddr)
+			return
+		}
+
+		// Send serialized log record over TCP
+		_, err = conn.Write(serializedRecord)
+		if err != nil {
+			log.Printf("ERROR: ReplicationManager: Failed to send log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
+			rm.closeReplicaConnection(replicaAddr)
+			return
+		}
+
+		rm.primaryMu.Lock()
+		rm.lastSentLSN[replicaAddr] = lr.LSN // Update last sent LSN
+		rm.primaryMu.Unlock()
+		log.Printf("DEBUG: ReplicationManager: Sent log record LSN %d to replica %s %s.", lr.LSN, replicaID, replicaAddr)
+	}
+	log.Printf("INFO: ReplicationManager: Log stream to replica %s ended.", replicaID)
+}
+
+// closeReplicaConnection closes an outbound connection to a replica.
+func (rm *ReplicationManager) closeReplicaConnection(addr string) {
+	rm.primaryMu.Lock()
+	defer rm.primaryMu.Unlock()
+	if conn, ok := rm.replicaClients[addr]; ok {
+		conn.Close()
+		delete(rm.replicaClients, addr)
+		delete(rm.lastSentLSN, addr)
+		log.Printf("INFO: ReplicationManager: Closed outbound connection to replica %s.", addr)
+	}
 }
 
 // initStorageNode initializes the Storage Node's database, identity, and background tasks.
@@ -141,9 +464,14 @@ func initStorageNode() error {
 	// 4. Initialize local shard map cache
 	myAssignedSlots = make(map[string]fsm.SlotRangeInfo)
 
+	// --- NEW: Initialize Replication Manager ---
+	replicationManager = NewReplicationManager(myStorageNodeID, logManager, dbInstance, &dbLock)
+	replicationManager.Start() // Start replication background tasks
+	// --- END NEW ---
+
 	// 5. Start background tasks
 	go sendHeartbeatsToController()
-	go fetchShardMapFromController()
+	go fetchShardMapFromController(replicationManager)
 
 	return nil
 }
@@ -205,7 +533,7 @@ func sendHeartbeatsToController() {
 }
 
 // fetchShardMapFromController periodically fetches the latest slot assignments from the Controller leader.
-func fetchShardMapFromController() {
+func fetchShardMapFromController(rm *ReplicationManager) {
 	ticker := time.NewTicker(shardMapFetchInterval)
 	defer ticker.Stop()
 
@@ -246,7 +574,7 @@ func fetchShardMapFromController() {
 			//log.Printf("WARNING: No Controller leader found. Cannot fetch shard map.")
 			continue
 		}
-		log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
+		//log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
 
 		// 2. Fetch all slot assignments from the leader
 		resp, err := http.Get(fmt.Sprintf("http://%s/admin/get_all_slot_assignments", leaderAddr)) // New endpoint needed
@@ -273,12 +601,26 @@ func fetchShardMapFromController() {
 			if slotInfo.AssignedNodeID == myStorageNodeID {
 				newAssignedSlots[rangeID] = slotInfo
 			}
+			// 2. Fetch all slot assignments from the leader
+			for _, nodeID := range slotInfo.ReplicaNodeIDs {
+				resp, err = http.Get(fmt.Sprintf("http://%s/admin/get_storage_node_address?nodeID=%s", leaderAddr, nodeID)) // New endpoint needed
+				if err != nil {
+					log.Printf("ERROR: Failed to fetch slot assignments from Controller leader %s: %v", leaderAddr, err)
+					continue
+				}
+				body, _ := ioutil.ReadAll(resp.Body)
+				rm.storageNodeAddressesMu.Lock()
+				rm.storageNodeAddresses[nodeID] = string(body)
+				rm.storageNodeAddressesMu.Unlock()
+			}
 		}
 
 		myAssignedSlotsMu.Lock()
 		myAssignedSlots = newAssignedSlots
 		myAssignedSlotsMu.Unlock()
-		log.Printf("INFO: Storage Node %s fetched and cached %d assigned slot ranges.", myStorageNodeID, len(myAssignedSlots))
+
+		//rm.primaryForSlots = newAssignedSlots
+		//log.Printf("INFO: Storage Node %s fetched and cached %d assigned slot ranges.", myStorageNodeID, len(myAssignedSlots))
 	}
 }
 
@@ -307,7 +649,15 @@ func parseRequest(raw string) (Request, error) {
 		req.Key = parts[1]
 	case "SIZE":
 		// No additional arguments needed
-	// --- NEW: 2PC Commands ---
+
+	case "GET_RANGE":
+		log.Println("RANGE QUERY: ", raw, parts)
+		if len(parts) < 2 {
+			return Request{}, fmt.Errorf("Invalid range query")
+		}
+		req.StartKey = parts[0]
+		req.EndKey = parts[1]
+
 	case "PREPARE":
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
@@ -362,11 +712,11 @@ func handleRequest(req Request) Response {
 			}
 		}
 		myAssignedSlotsMu.RUnlock()
-
-		if !assignedToMe {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Key '%s' (slot %d) does not belong to this node. No assignment found or assigned to unknown node.", req.Key, targetSlot)}
-			return resp
-		}
+		log.Println("DEBUG: assignedToMe: ", assignedToMe)
+		// if !assignedToMe {
+		// 	resp = Response{Status: "ERROR", Message: fmt.Sprintf("Key '%s' (slot %d) does not belong to this node. No assignment found or assigned to unknown node.", req.Key, targetSlot)}
+		// 	return resp
+		// }
 	}
 	// --- End Sharding Awareness ---
 
@@ -391,6 +741,27 @@ func handleRequest(req Request) Response {
 		} else {
 			resp = Response{Status: "NOT_FOUND", Message: fmt.Sprintf("Key '%s' not found.", req.Key)}
 		}
+	case "GET_RANGE":
+		dbLock.RLock() // Abort releases locks, not acquires DB lock
+		iterator, err := dbInstance.Iterator(req.StartKey, req.EndKey)
+		dbLock.RUnlock()
+		if err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("ABORT failed for Txn %d: %v", req.TxnID, err)}
+		} else {
+			resp = Response{Status: "ABORTED", Message: fmt.Sprintf("Txn %d aborted.", req.TxnID)}
+		}
+		response := "Result: "
+		for {
+			key, val, isNext, err := iterator.Next()
+			if err != nil || !isNext {
+				log.Println("ITERATOR NEXT: ", isNext, err)
+				break
+			}
+			response += "Key: " + key + " Value: " + val + "	"
+			log.Println("RESPONSE: ", response)
+		}
+		resp = Response{Status: "OK", Message: response}
+		iterator.Close()
 	case "DELETE":
 		dbLock.Lock()                               // Acquire write lock for DELETE
 		err = dbInstance.Delete(req.Key, req.TxnID) // Pass TxnID

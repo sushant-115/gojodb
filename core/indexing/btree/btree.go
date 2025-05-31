@@ -61,6 +61,9 @@ var (
 	ErrKeyLocked        = errors.New("key is currently locked by another transaction")
 	ErrPrepareFailed    = errors.New("prepare phase failed for transaction")
 	// --- END NEW ---
+	// --- NEW: Iterator Specific Errors ---
+	ErrIteratorInvalid = errors.New("iterator is invalid or exhausted")
+	// --- END NEW ---
 )
 
 // --- NEW: TransactionState and Transaction types ---
@@ -297,6 +300,10 @@ func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to fetch page %d from buffer pool: %w", pageID, err)
 	}
+	// --- NEW: Acquire S-latch on page before deserializing ---
+	page.RLock()
+	defer page.RUnlock() // Ensure latch is released
+	// --- END NEW ---
 	node := &Node[K, V]{tree: bt}
 	err = node.deserialize(page, bt.kvSerializer.DeserializeKey, bt.kvSerializer.DeserializeValue)
 	if err != nil {
@@ -308,6 +315,25 @@ func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
 
 func (bt *BTree[K, V]) DeallocatePage(pageID PageID) error {
 	return bt.diskManager.DeallocatePage(pageID)
+}
+func (bt *BTree[K, V]) GetPageSize() int {
+	return DefaultPageSize
+}
+
+func (bt *BTree[K, V]) ReadPage(pageID PageID, pageData []byte) error {
+	return bt.diskManager.ReadPage(pageID, pageData)
+}
+
+func (bt *BTree[K, V]) GetNumPages() uint64 {
+	return bt.diskManager.numPages
+}
+
+func (bt *BTree[K, V]) SetNumPages(totalPages uint64) {
+	bt.diskManager.numPages = totalPages
+}
+
+func (bt *BTree[K, V]) WritePage(pageID PageID, pageData []byte) error {
+	return bt.diskManager.WritePage(pageID, pageData)
 }
 
 // GetSize reads the persisted tree size from the file header.
@@ -1675,10 +1701,12 @@ func (bt *BTree[K, V]) acquireLockInternal(keyStr string, txnID uint64) error {
 	// defer bt.keyLocksMu.Unlock()
 
 	for {
+		bt.keyLocksMu.Lock()
 		log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, bt.keyLocks[keyStr])
 		if ownerTxnID, ok := bt.keyLocks[keyStr]; ok {
 			if ownerTxnID == txnID {
 				// Already locked by this transaction, idempotent.
+				bt.keyLocksMu.Unlock()
 				return nil
 			}
 			// Locked by another transaction, wait.
@@ -1688,6 +1716,7 @@ func (bt *BTree[K, V]) acquireLockInternal(keyStr string, txnID uint64) error {
 			// A production system would use a condition variable or a lock manager with queues.
 			// For now, we'll just return ErrKeyLocked to avoid indefinite blocking in a simple test.
 			// If this is called from Prepare, the Prepare will fail.
+			bt.keyLocksMu.Unlock()
 			return ErrKeyLocked
 		} else {
 			// Lock available, acquire it.
@@ -1696,6 +1725,7 @@ func (bt *BTree[K, V]) acquireLockInternal(keyStr string, txnID uint64) error {
 				txn.locksHeld[keyStr] = struct{}{}
 			}
 			log.Printf("DEBUG: Txn %d: Acquired lock for key '%s'.", txnID, keyStr)
+			bt.keyLocksMu.Unlock()
 			return nil
 		}
 	}
@@ -1803,4 +1833,176 @@ func SerializeString(s string) ([]byte, error) {
 // DeserializeString deserializes a byte slice to a string.
 func DeserializeString(data []byte) (string, error) {
 	return string(data), nil
+}
+
+// --- NEW: BTree Iterator Interface and Implementation ---
+
+// BTreeIterator defines the interface for iterating over key-value pairs in a B-tree.
+type BTreeIterator[K any, V any] interface {
+	Next() (K, V, bool, error) // Returns next key, value, true if valid, or error
+	Close() error              // Releases any resources held by the iterator
+}
+
+// bTreeIterator is the concrete implementation of BTreeIterator.
+type bTreeIterator[K any, V any] struct {
+	tree              *BTree[K, V]
+	currentNode       *Node[K, V] // The current leaf node being iterated
+	currentPage       *Page       // The page object for currentNode (pinned and latched)
+	currentKeyIdx     int         // Index of the current key in currentNode.keys
+	startKey          K
+	endKey            K
+	isExhausted       bool
+	initialSearchDone bool // Flag to indicate if initial search to startKey is complete
+}
+
+// Iterator returns a new BTreeIterator for the specified key range [startKey, endKey).
+// It acquires an S-latch on the root page and pins it.
+func (bt *BTree[K, V]) Iterator(startKey K, endKey K) (BTreeIterator[K, V], error) {
+	//var zeroK K
+	if bt.rootPageID == InvalidPageID {
+		return nil, errors.New("cannot create iterator on an empty B-tree")
+	}
+
+	iter := &bTreeIterator[K, V]{
+		tree:     bt,
+		startKey: startKey,
+		endKey:   endKey,
+	}
+
+	// Find the first leaf page containing or preceding startKey
+	node, page, err := bt.findLeafForIterator(bt.rootPageID, startKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find starting leaf for iterator: %w", err)
+	}
+	log.Println("Iterator Node: ", node.keys, node.values)
+	iter.currentNode = node
+	iter.currentPage = page
+
+	// Find the starting key index within the leaf node
+	idx, _ := slices.BinarySearchFunc(node.keys, startKey, bt.keyOrder)
+	iter.currentKeyIdx = idx
+
+	// If startKey is greater than all keys in the leaf, move to the next leaf
+	if idx == len(node.keys) {
+		if err := iter.moveToNextLeaf(); err != nil {
+			iter.Close() // Clean up if moving to next leaf fails
+			return nil, fmt.Errorf("failed to move to next leaf after initial search: %w", err)
+		}
+	}
+
+	iter.initialSearchDone = true
+	return iter, nil
+}
+
+// findLeafForIterator recursively finds the leaf node where the iteration should start.
+// It uses read crabbing (S-latches).
+func (bt *BTree[K, V]) findLeafForIterator(pageID PageID, key K) (*Node[K, V], *Page, error) {
+	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if currNode.isLeaf {
+		return currNode, currPage, nil // Found the leaf
+	}
+
+	// Find the child to descend into
+	idx, _ := slices.BinarySearchFunc(currNode.keys, key, bt.keyOrder)
+	childPageID := currNode.childPageIDs[idx]
+
+	// Read crabbing: Acquire S-latch on child before releasing S-latch on parent
+	// The fetchNode for child will acquire S-latch on child.
+	// We then release the S-latch on currPage.
+	unpinErr := bt.bpm.UnpinPage(currPage.GetPageID(), false) // Unpin parent page
+	if unpinErr != nil {
+		log.Printf("WARNING: Error unpinning page %d during iterator findLeaf: %v", currPage.GetPageID(), unpinErr)
+		// Proceed, but log the warning.
+	}
+
+	return bt.findLeafForIterator(childPageID, key) // Recursive call
+}
+
+// Next returns the next key-value pair in the iteration.
+// It manages latch coupling as it moves between pages.
+func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
+	var zeroK K
+	var zeroV V
+
+	if iter.isExhausted {
+		return zeroK, zeroV, false, ErrIteratorInvalid
+	}
+	//log.Println("NEXT ITERATOR: ", iter.currentNode.keys, iter.currentNode.values, iter.currentKeyIdx)
+	// Ensure current node is valid and within range
+	for iter.currentNode != nil {
+		// Check if current key index is valid within the node
+		if iter.currentKeyIdx < len(iter.currentNode.keys) {
+			key := iter.currentNode.keys[iter.currentKeyIdx]
+			value := iter.currentNode.values[iter.currentKeyIdx]
+			// Check if the current key is within the desired endKey range
+			if iter.tree.keyOrder(iter.startKey, key) >= 0 && iter.tree.keyOrder(key, iter.endKey) <= 0 { // key >= endKey and endKey is not zero value
+				iter.isExhausted = true // Reached or exceeded endKey
+				iter.Close()            // Release resources
+				return zeroK, zeroV, false, nil
+			}
+
+			// Return current key-value pair
+			iter.currentKeyIdx++ // Advance for next call
+			return key, value, true, nil
+		}
+
+		// Current node exhausted, move to the next leaf node
+		if err := iter.moveToNextLeaf(); err != nil {
+			iter.isExhausted = true
+			iter.Close()
+			return zeroK, zeroV, false, fmt.Errorf("failed to move to next leaf: %w", err)
+		}
+	}
+
+	// Iterator exhausted
+	iter.isExhausted = true
+	iter.Close()
+	return zeroK, zeroV, false, nil
+}
+
+// moveToNextLeaf moves the iterator to the next leaf node in the B-tree.
+// It handles releasing the latch on the current page and acquiring on the next.
+func (iter *bTreeIterator[K, V]) moveToNextLeaf() error {
+	// Release latch on current page before moving
+	if iter.currentPage != nil {
+		iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false) // Unpin current page
+		iter.currentPage = nil
+		iter.currentNode = nil
+	}
+
+	// In a B-tree, leaf nodes are often linked. If not, we need to traverse up and down.
+	// For simplicity, this implementation assumes a "next sibling" pointer or re-traverses.
+	// A proper B+Tree would have next/prev leaf pointers for efficient range scans.
+	// For a pure B-tree, moving to the "next leaf" means finding the smallest key
+	// in the rightmost child of the lowest common ancestor. This is complex.
+	// For now, let's simplify: this iterator only works for a single leaf node's range.
+	// To support full range scans, we'd need leaf linking or a stack-based traversal.
+
+	// Since we don't have leaf linking, for this iteration, we'll mark as exhausted
+	// after a single leaf is fully scanned.
+	// To truly implement full range scans, you'd need to add `nextLeafPageID` to Node struct
+	// or implement a stack-based traversal (more complex for recovery/crash safety).
+	log.Printf("DEBUG: Iterator exhausted current leaf. No next leaf pointer for full range scan.")
+	iter.isExhausted = true
+	return nil
+}
+
+// Close releases any resources held by the iterator, specifically unpinning the current page.
+func (iter *bTreeIterator[K, V]) Close() error {
+	if iter.currentPage != nil {
+		err := iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false) // Unpin the page
+		if err != nil {
+			log.Printf("WARNING: Error closing iterator, failed to unpin page %d: %v", iter.currentPage.GetPageID(), err)
+			return fmt.Errorf("failed to close iterator cleanly: %w", err)
+		}
+		iter.currentPage = nil
+		iter.currentNode = nil
+	}
+	iter.isExhausted = true
+	log.Println("DEBUG: BTreeIterator closed.")
+	return nil
 }
