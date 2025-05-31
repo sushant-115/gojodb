@@ -77,6 +77,10 @@ type LogManager struct {
 	// Maps to track transaction states during recovery
 	recoveryTxnStates map[uint64]TransactionState // TxnID -> state (e.g., PREPARED, COMMITTED, ABORTED)
 	// --- END NEW ---
+	// --- NEW: For Log Streaming (Replication) ---
+	// Channel to signal new log records are available (for streaming readers)
+	newLogReady chan struct{}
+	// --- END NEW ---
 }
 
 // NewLogManager creates and initializes a new LogManager.
@@ -112,6 +116,9 @@ func NewLogManager(logDir string, archiveDir string, bufferSize int, segmentSize
 		stopChan:         make(chan struct{}),
 		// --- NEW: Initialize Recovery State ---
 		recoveryTxnStates: make(map[uint64]TransactionState),
+		// --- END NEW ---
+		// --- NEW: Initialize newLogReady channel ---
+		newLogReady: make(chan struct{}, 1), // Buffered channel to avoid blocking appends
 		// --- END NEW ---
 	}
 	lm.flushCond = sync.NewCond(&lm.mu)
@@ -261,6 +268,15 @@ func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
 	if lm.buffer.Len() >= lm.bufferSize/2 { // Signal at half full to trigger proactive flushing
 		lm.flushCond.Signal()
 	}
+
+	// --- NEW: Signal log stream readers that new log is ready ---
+	select {
+	case lm.newLogReady <- struct{}{}:
+		// Signal sent
+	default:
+		// Channel is full, reader is not ready, skip signal
+	}
+	// --- END NEW ---
 
 	log.Printf("DEBUG: Appended log record LSN %d (Type: %v, PageID: %d, Size: %d) to segment %d",
 		record.LSN, record.Type, record.PageID, len(serializedRecord), lm.currentSegmentID)
@@ -457,6 +473,12 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 
 // readLogRecord reads a single log record from the provided io.Reader.
 // It handles variable-length fields by reading lengths first.
+func (lm *LogManager) ReadLogRecord(reader *bufio.Reader, lr *LogRecord) error {
+	return lm.readLogRecord(reader, lr)
+}
+
+// readLogRecord reads a single log record from the provided io.Reader.
+// It handles variable-length fields by reading lengths first.
 func (lm *LogManager) readLogRecord(reader *bufio.Reader, lr *LogRecord) error {
 	// Read fixed-size fields into a buffer first
 	fixedHeaderBuf := make([]byte, 8+8+8+1+8+2) // LSN, PrevLSN, TxnID, Type, PageID, Offset
@@ -547,6 +569,135 @@ func (lm *LogManager) Flush(targetLSN LSN) error {
 
 	log.Printf("DEBUG: LogManager flushed and synced all buffered data up to LSN %d (in segment %d).", lm.currentLSN, lm.currentSegmentID)
 	return nil
+}
+
+// StartLogStream provides a channel to stream log records from a given LSN.
+// This is used by replication followers to catch up and stay in sync.
+func (lm *LogManager) StartLogStream(fromLSN LSN) (<-chan LogRecord, error) {
+	logStream := make(chan LogRecord)
+	currentGlobalLSN := LSN(0)
+	go func() {
+		defer close(logStream) // Ensure channel is closed when goroutine exits
+
+		lm.mu.Lock()
+		// Determine the starting segment and offset
+		// This simplified LSN (offset within current file) means we need to re-scan from start
+		// for any LSN that might be in an older segment. A global LSN would be better.
+		// For now, we'll assume `fromLSN` is an offset within the current active log segment
+		// or the start of the first archived segment if it's very old.
+		// A robust system would use a log index to find the correct segment.
+
+		// For simplicity, we'll open the current active log file and seek.
+		// If fromLSN is very old, it might be in an archived segment.
+		// This V1 will only stream from the current active segment for simplicity.
+		// A full implementation would iterate through archived segments first.
+
+		// Open the current active log file for reading
+		logFileForRead, err := os.Open(lm.getLogSegmentPath(lm.currentSegmentID))
+		if err != nil {
+			log.Printf("ERROR: Failed to open active log segment for streaming: %v", err)
+			lm.mu.Unlock()
+			return
+		}
+		defer logFileForRead.Close()
+
+		// Seek to the starting LSN
+		_, err = logFileForRead.Seek(int64(fromLSN), io.SeekStart)
+		if err != nil {
+			log.Printf("ERROR: Failed to seek log file to LSN %d for streaming: %v", fromLSN, err)
+			lm.mu.Unlock()
+			return
+		}
+		lm.mu.Unlock() // Release mutex while reading from file
+
+		reader := bufio.NewReader(logFileForRead)
+
+		for {
+			var lr LogRecord
+			err := lm.readLogRecord(reader, &lr)
+			if err == io.EOF {
+				// Reached end of current file. Now wait for new appends.
+				lm.mu.Lock()
+				// Check if new data is in buffer
+				if lm.buffer.Len() > 0 {
+					// If there's data in buffer, flush it and try reading again.
+					// This is complex. A simpler approach for V1:
+					// Just wait for new appends to be flushed to disk.
+					log.Printf("DEBUG: Log stream reached end of file. Waiting for new appends from LSN %d.", lm.currentLSN)
+					lm.mu.Unlock() // Release lock before waiting on channel
+					select {
+					case <-lm.newLogReady:
+						// New log records are ready, re-acquire lock and try reading again.
+						lm.mu.Lock()
+						// Re-open/re-seek file to ensure we get new data
+						logFileForRead.Close() // Close old handle
+						logFileForRead, err = os.Open(lm.getLogSegmentPath(lm.currentSegmentID))
+						if err != nil {
+							log.Printf("ERROR: Failed to re-open active log segment for streaming after signal: %v", err)
+							lm.mu.Unlock()
+							return
+						}
+						_, err = logFileForRead.Seek(int64(lr.LSN)+int64(lr.Size()), io.SeekStart) // Seek past last read record
+						if err != nil {
+							log.Printf("ERROR: Failed to re-seek log file after signal: %v", err)
+							lm.mu.Unlock()
+							return
+						}
+						reader = bufio.NewReader(logFileForRead)
+						lm.mu.Unlock() // Release lock to allow other operations
+						continue       // Try reading again
+					case <-lm.stopChan:
+						log.Println("INFO: Log stream goroutine stopping due to stop signal.")
+						return
+					}
+				} else {
+					lm.mu.Unlock()
+					log.Printf("DEBUG: Log stream reached end of file. No new data in buffer. Waiting for signal.")
+					select {
+					case <-lm.newLogReady:
+						// New log records are ready, re-acquire lock and try reading again.
+						lm.mu.Lock()
+						logFileForRead.Close() // Close old handle
+						logFileForRead, err = os.Open(lm.getLogSegmentPath(lm.currentSegmentID))
+						if err != nil {
+							log.Printf("ERROR: Failed to re-open active log segment for streaming after signal: %v", err)
+							lm.mu.Unlock()
+							return
+						}
+						// Seek to the LSN of the last record read, or the beginning if this is the first record.
+						// This is tricky. A robust solution needs global LSNs for seeking across segments.
+						// For now, assume current LSN of the manager is the end of what's written.
+						_, err = logFileForRead.Seek(int64(currentGlobalLSN), io.SeekStart)
+						if err != nil {
+							log.Printf("ERROR: Failed to re-seek log file after signal: %v", err)
+							lm.mu.Unlock()
+							return
+						}
+						reader = bufio.NewReader(logFileForRead)
+						lm.mu.Unlock()
+						continue
+					case <-lm.stopChan:
+						log.Println("INFO: Log stream goroutine stopping due to stop signal.")
+						return
+					}
+				}
+			}
+			if err != nil {
+				log.Printf("ERROR: Failed to read log record during streaming: %v", err)
+				return
+			}
+
+			select {
+			case logStream <- lr:
+				currentGlobalLSN += LSN(lr.Size())
+			case <-lm.stopChan:
+				log.Println("INFO: Log stream goroutine stopping due to stop signal.")
+				return
+			}
+		}
+	}()
+
+	return logStream, nil
 }
 
 // flushInternal writes the buffered log records to the log file.

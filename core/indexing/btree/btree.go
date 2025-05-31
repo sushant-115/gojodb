@@ -316,6 +316,25 @@ func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
 func (bt *BTree[K, V]) DeallocatePage(pageID PageID) error {
 	return bt.diskManager.DeallocatePage(pageID)
 }
+func (bt *BTree[K, V]) GetPageSize() int {
+	return DefaultPageSize
+}
+
+func (bt *BTree[K, V]) ReadPage(pageID PageID, pageData []byte) error {
+	return bt.diskManager.ReadPage(pageID, pageData)
+}
+
+func (bt *BTree[K, V]) GetNumPages() uint64 {
+	return bt.diskManager.numPages
+}
+
+func (bt *BTree[K, V]) SetNumPages(totalPages uint64) {
+	bt.diskManager.numPages = totalPages
+}
+
+func (bt *BTree[K, V]) WritePage(pageID PageID, pageData []byte) error {
+	return bt.diskManager.WritePage(pageID, pageData)
+}
 
 // GetSize reads the persisted tree size from the file header.
 func (bt *BTree[K, V]) GetSize() (uint64, error) {
@@ -1912,21 +1931,19 @@ func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
 	if iter.isExhausted {
 		return zeroK, zeroV, false, ErrIteratorInvalid
 	}
-	log.Println("NEXT ITERATOR: ", iter.currentNode.keys, iter.currentNode.values, iter.currentKeyIdx)
+	//log.Println("NEXT ITERATOR: ", iter.currentNode.keys, iter.currentNode.values, iter.currentKeyIdx)
 	// Ensure current node is valid and within range
 	for iter.currentNode != nil {
 		// Check if current key index is valid within the node
 		if iter.currentKeyIdx < len(iter.currentNode.keys) {
 			key := iter.currentNode.keys[iter.currentKeyIdx]
 			value := iter.currentNode.values[iter.currentKeyIdx]
-			//log.Println("NEXT ITERATOR key and val: ", key, value)
 			// Check if the current key is within the desired endKey range
-			//if iter.tree.keyOrder(key, iter.startKey) >= 0 && iter.tree.keyOrder(key, iter.endKey) == 0 { // key >= endKey and endKey is not zero value
-			log.Println("NEXT ITERATOR KEY ORDER: ", key, value, iter.tree.keyOrder(key, iter.startKey), iter.tree.keyOrder(key, iter.endKey))
-			//	iter.isExhausted = true // Reached or exceeded endKey
-			//	iter.Close()            // Release resources
-			//	return zeroK, zeroV, false, nil
-			//}
+			if iter.tree.keyOrder(iter.startKey, key) >= 0 && iter.tree.keyOrder(key, iter.endKey) <= 0 { // key >= endKey and endKey is not zero value
+				iter.isExhausted = true // Reached or exceeded endKey
+				iter.Close()            // Release resources
+				return zeroK, zeroV, false, nil
+			}
 
 			// Return current key-value pair
 			iter.currentKeyIdx++ // Advance for next call

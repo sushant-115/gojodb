@@ -773,7 +773,7 @@ func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) 
 
 	// 1. Determine target slot(s) for the range
 	startSlot := fsm.GetSlotForHashKey(apiReq.StartKey)
-	endSlot := fsm.GetSlotForHashKey(apiReq.EndKey) // Note: EndKey is exclusive for range, but for slot it's inclusive
+	//endSlot := fsm.GetSlotForHashKey(apiReq.EndKey) // Note: EndKey is exclusive for range, but for slot it's inclusive
 
 	// --- V1 Sharding Routing for Range Queries: Only support single-shard ranges ---
 	s.slotAssignmentsMu.RLock()

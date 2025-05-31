@@ -292,6 +292,9 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 			for _, sr := range sortedRanges {
 				response += fmt.Sprintf("  - RangeID: %s (%d-%d), Assigned To: %s, Status: %s\n",
 					sr.RangeID, sr.StartSlot, sr.EndSlot, sr.AssignedNodeID, sr.Status)
+
+				response += fmt.Sprintf("  		- Primary Node: %s , Replica Nodes: %s\n",
+					sr.PrimaryNodeID, strings.Join(sr.ReplicaNodeIDs, ","))
 			}
 		}
 
@@ -327,6 +330,8 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 		startSlotStr := r.URL.Query().Get("startSlot")
 		endSlotStr := r.URL.Query().Get("endSlot")
 		assignedNodeID := r.URL.Query().Get("assignedNodeID")
+		replicaNodes := r.URL.Query().Get("replicaNodes")
+		replicaNodeIDs := strings.Split(replicaNodes, ",")
 
 		if startSlotStr == "" || endSlotStr == "" || assignedNodeID == "" {
 			http.Error(w, "startSlot, endSlot, and assignedNodeID are required", http.StatusBadRequest)
@@ -357,6 +362,8 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 			AssignedNodeID: assignedNodeID,
 			Status:         "active", // Default status
 			LastUpdated:    time.Now(),
+			PrimaryNodeID:  assignedNodeID,
+			ReplicaNodeIDs: replicaNodeIDs,
 		}
 
 		slotInfoBytes, err := json.Marshal(slotInfo)
