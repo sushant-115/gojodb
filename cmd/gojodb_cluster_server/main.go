@@ -68,6 +68,7 @@ type Request struct {
 	TxnID    uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
 	StartKey string // For range query
 	EndKey   string // For range query
+
 }
 
 // Response represents a server's reply to a client request.
@@ -648,7 +649,7 @@ func parseRequest(raw string) (Request, error) {
 		req.Key = parts[1]
 	case "SIZE":
 		// No additional arguments needed
-		// --- NEW: 2PC Commands ---
+
 	case "GET_RANGE":
 		log.Println("RANGE QUERY: ", raw, parts)
 		if len(parts) < 2 {
@@ -656,6 +657,7 @@ func parseRequest(raw string) (Request, error) {
 		}
 		req.StartKey = parts[0]
 		req.EndKey = parts[1]
+
 	case "PREPARE":
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
