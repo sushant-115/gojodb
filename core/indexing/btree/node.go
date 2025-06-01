@@ -12,12 +12,12 @@ import (
 // --- BTree Node Serialization/Deserialization ---
 
 // Header fields within a Node's page data (offsets relative to start of page data)
-const (
-	nodeHeaderFlagsOffset   = 0 // For isLeaf, other flags (1 byte)
-	nodeHeaderNumKeysOffset = 1 // Number of keys (2 bytes, uint16)
-	// Key/Value/Child data follows
-	// Checksum is at the very end of the page
-)
+// const (
+// 	nodeHeaderFlagsOffset   = 0 // For isLeaf, other flags (1 byte)
+// 	nodeHeaderNumKeysOffset = 1 // Number of keys (2 bytes, uint16)
+// 	// Key/Value/Child data follows
+// 	// Checksum is at the very end of the page
+// )
 
 // Node represents an in-memory B-tree node.
 type Node[K any, V any] struct {

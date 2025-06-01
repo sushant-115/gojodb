@@ -401,11 +401,8 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 	// WAL INTEGRATION: Before flushing all pages, ensure all pending log records are flushed.
 	if bpm.logManager != nil {
 		log.Println("DEBUG: Flushing all pending log records before flushing all pages.")
-		if err := bpm.logManager.Flush(InvalidLSN); err != nil { // Flush all logs
-			log.Printf("ERROR: Failed to flush all log records before flushing all pages: %v", err)
-			if firstErr == nil {
-				firstErr = err
-			}
+		if firstErr = bpm.logManager.Flush(InvalidLSN); firstErr != nil { // Flush all logs
+			log.Printf("ERROR: Failed to flush all log records before flushing all pages: %v", firstErr)
 		}
 	}
 

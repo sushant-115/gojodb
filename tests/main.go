@@ -95,9 +95,9 @@ func main() {
 
 	for _, k := range keys {
 		v := dataToInsert[k]
-		fmt.Printf("Inserting (%d, %s)...\n", k, v)
+		fmt.Printf("Inserting (%s, %s)...\n", k, v)
 		if err := bt.Insert(k, v, 0); err != nil {
-			log.Fatalf("Failed to insert key %d: %v", k, err)
+			log.Fatalf("Failed to insert key %s: %v", k, err)
 		}
 	}
 	fmt.Println("Data insertion complete.")
@@ -109,12 +109,12 @@ func main() {
 	for _, k := range keysToSearch {
 		val, found, err := bt.Search(k)
 		if err != nil {
-			log.Fatalf("Error searching for key %d: %v", k, err)
+			log.Fatalf("Error searching for key %s: %v", k, err)
 		}
 		if found {
-			fmt.Printf("Search for %d: Found! Value: %s\n", k, val)
+			fmt.Printf("Search for %s: Found! Value: %s\n", k, val)
 		} else {
-			fmt.Printf("Search for %d: Not Found.\n", k)
+			fmt.Printf("Search for %s: Not Found.\n", k)
 		}
 	}
 
@@ -122,16 +122,16 @@ func main() {
 	fmt.Println("\n--- Deleting data ---")
 	keysToDelete := []string{"5", "15", "22", "99"} // 2 should not be found for deletion
 	for _, k := range keysToDelete {
-		fmt.Printf("Deleting key %d...\n", k)
+		fmt.Printf("Deleting key %s...\n", k)
 		err := bt.Delete(k, 0)
 		if err != nil {
 			if err == btree.ErrKeyNotFound {
-				fmt.Printf("Key %d not found for deletion.\n", k)
+				fmt.Printf("Key %s not found for deletion.\n", k)
 			} else {
-				log.Fatalf("Failed to delete key %d: %v", k, err)
+				log.Fatalf("Failed to delete key %s: %v", k, err)
 			}
 		} else {
-			fmt.Printf("Successfully deleted key %d.\n", k)
+			fmt.Printf("Successfully deleted key %s.\n", k)
 		}
 	}
 	printBTreeContent(bt, "After Deletions")
@@ -142,12 +142,12 @@ func main() {
 	for _, k := range keysToVerify {
 		_, found, err := bt.Search(k)
 		if err != nil {
-			log.Fatalf("Error verifying key %d: %v", k, err)
+			log.Fatalf("Error verifying key %s: %v", k, err)
 		}
 		if found {
-			fmt.Printf("Verification for %d: STILL FOUND (Expected to be deleted: %t)\n", k, (k == "5" || k == "15" || k == "30"))
+			fmt.Printf("Verification for %s: STILL FOUND (Expected to be deleted: %t)\n", k, (k == "5" || k == "15" || k == "30"))
 		} else {
-			fmt.Printf("Verification for %d: NOT FOUND (Expected to be deleted: %t)\n", k, (k == "5" || k == "15" || k == "30"))
+			fmt.Printf("Verification for %s: NOT FOUND (Expected to be deleted: %t)\n", k, (k == "5" || k == "15" || k == "30"))
 		}
 	}
 

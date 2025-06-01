@@ -442,7 +442,7 @@ func (s *APIService) handleClusterStatus(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, responseBuilder.String())
+	fmt.Fprint(w, responseBuilder.String())
 }
 
 // handleDataRequest processes client data requests (PUT/GET/DELETE) and routes them to Storage Nodes.

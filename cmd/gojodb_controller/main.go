@@ -299,7 +299,7 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, response)
+		fmt.Fprint(w, response)
 	})
 
 	// Endpoint to get all slot assignments
@@ -418,7 +418,7 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, addr) // Return just the address string
+		fmt.Fprint(w, addr) // Return just the address string
 	})
 
 	// Endpoint to get the assigned node for a specific key

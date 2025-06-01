@@ -175,7 +175,7 @@ func handleRequest(req Request) Response {
 		} else if found {
 			resp = Response{Status: "OK", Message: val}
 		} else {
-			resp = Response{Status: "NOT_FOUND", Message: fmt.Sprintf("Key %d not found.", req.Key)}
+			resp = Response{Status: "NOT_FOUND", Message: fmt.Sprintf("Key %s not found.", req.Key)}
 		}
 	case "DELETE":
 		dbLock.Lock() // Acquire write lock for DELETE

@@ -145,7 +145,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		dm.Close() // Ensure disk manager is closed on failure
 		// If the file already exists, it's an error for NewBTreeFile
 		if errors.Is(err, ErrDBFileExists) {
-			return nil, fmt.Errorf("%w: file %s already exists. Use OpenBTreeFile to open an existing database.", err, filePath)
+			return nil, fmt.Errorf("%w: file %s already exists. Use OpenBTreeFile to open an existing database", err, filePath)
 		}
 		return nil, fmt.Errorf("failed to open/create database file: %w", err)
 	}
@@ -812,7 +812,7 @@ func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *Page, chil
 
 	// TODO: WAL - Log modifications to parentNode, childToSplitNode, newSiblingNode with TxnID
 	log.Printf("DEBUG: Txn %d: Split child %d into new sibling %d. Promoted key %v to parent %d.",
-		txnID, childToSplitNode.pageID, newSiblingPageID, parentNode.pageID)
+		txnID, childToSplitNode.pageID, newSiblingPageID, middleKey, parentNode.pageID)
 
 	// 7. Serialize the modified child and the new sibling node
 	var firstErr error
@@ -1137,7 +1137,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 		}
 
 		// Recursively delete the successor from the right child's subtree.
-		keyActuallyRemoved, err = bt.deleteRecursive(reFetchedRightChildNode, reFetchedRightChildPage, succKey, txnID)
+		_, err = bt.deleteRecursive(reFetchedRightChildNode, reFetchedRightChildPage, succKey, txnID)
 		// `deleteRecursive` will serialize and unpin `reFetchedRightChildPage`.
 		if err != nil {
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin parent on error
@@ -1194,6 +1194,8 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 		}
 		if e := bt.bpm.UnpinPage(nodePage.GetPageID(), true); e != nil && err == nil {
 			err = e // Propagate unpin error if no other error occurred
+			log.Println("DiskManager: Failed to unpinpage. Error: ", err)
+
 		}
 	}
 	return actuallyDeleted, err
@@ -1753,7 +1755,7 @@ func (bt *BTree[K, V]) ProcessOperations(txnID uint64, operations []TransactionO
 			err = fmt.Errorf("unsupported operation command: %s", op.Command)
 		}
 		if err != nil {
-			return fmt.Errorf("Txn %d: failed to process operation %d (%s %s): %w", txnID, i, op.Command, op.Key, err)
+			return fmt.Errorf("txn %d: failed to process operation %d (%s %s): %w", txnID, i, op.Command, op.Key, err)
 		}
 	}
 	log.Printf("DEBUG: Txn %d: All operations processed successfully.", txnID)

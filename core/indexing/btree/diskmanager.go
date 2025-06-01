@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"sync"
-	"unsafe"
 )
 
 // --- DiskManager ---
@@ -28,20 +27,20 @@ type DBFileHeader struct {
 	_              [dbFileHeaderSize - (4*4 + 4*8)]byte // Explicit padding: Corrected calculation
 }
 
-var expectedSize uintptr
+// var expectedSize uintptr
 
 // Ensure DBFileHeader is exactly dbFileHeaderSize bytes long at compile time.
 // This helps prevent binary.Read/Write issues due to Go's struct padding.
 func init() {
 	// Calculate expected size of the defined fields
-	expectedSize = unsafe.Sizeof(DBFileHeader{}.Magic) +
-		unsafe.Sizeof(DBFileHeader{}.Version) +
-		unsafe.Sizeof(DBFileHeader{}.PageSize) +
-		unsafe.Sizeof(DBFileHeader{}.RootPageID) +
-		unsafe.Sizeof(DBFileHeader{}.Degree) +
-		unsafe.Sizeof(DBFileHeader{}.TreeSize) +
-		unsafe.Sizeof(DBFileHeader{}.FreeListPageID) +
-		unsafe.Sizeof(DBFileHeader{}.LastLSN)
+	// expectedSize = unsafe.Sizeof(DBFileHeader{}.Magic) +
+	// 	unsafe.Sizeof(DBFileHeader{}.Version) +
+	// 	unsafe.Sizeof(DBFileHeader{}.PageSize) +
+	// 	unsafe.Sizeof(DBFileHeader{}.RootPageID) +
+	// 	unsafe.Sizeof(DBFileHeader{}.Degree) +
+	// 	unsafe.Sizeof(DBFileHeader{}.TreeSize) +
+	// 	unsafe.Sizeof(DBFileHeader{}.FreeListPageID) +
+	// 	unsafe.Sizeof(DBFileHeader{}.LastLSN)
 
 	// This check will cause a compile-time error if the padding array size in the struct is wrong.
 	// It ensures that the struct's size matches the declared dbFileHeaderSize.
