@@ -390,10 +390,8 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 			// 3. For each primary slot, stream logs to its replicas
 			for rangeID, slotInfo := range currentPrimarySlots {
 				for _, replicaID := range slotInfo.ReplicaNodeIDs {
-					log.Println("Slot info for: ", rangeID, slotInfo)
 					// Get replica's address from storageNodeAddresses (from main's cache)
 					rm.storageNodeAddressesMu.RLock()
-					log.Println("DEBUG: storage nodes: ", rm.storageNodeAddresses)
 					replicaAddr, ok := rm.storageNodeAddresses[replicaID]
 					rm.storageNodeAddressesMu.RUnlock()
 

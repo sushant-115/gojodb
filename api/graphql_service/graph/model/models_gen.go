@@ -2,6 +2,13 @@
 
 package model
 
+type AssignSlotRangeInput struct {
+	StartSlot      int      `json:"startSlot"`
+	EndSlot        int      `json:"endSlot"`
+	AssignedNodeID string   `json:"assignedNodeID"`
+	ReplicaNodeIDs []string `json:"replicaNodeIDs,omitempty"`
+}
+
 type Entry struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -10,5 +17,32 @@ type Entry struct {
 type Mutation struct {
 }
 
+type NodeForKeyResponse struct {
+	NodeID string `json:"nodeID"`
+	Slot   int    `json:"slot"`
+}
+
 type Query struct {
 }
+
+type SetPrimaryReplicaInput struct {
+	RangeID        string   `json:"rangeID"`
+	PrimaryNodeID  string   `json:"primaryNodeID"`
+	ReplicaNodeIDs []string `json:"replicaNodeIDs"`
+}
+
+type StatusResponse struct {
+	Message string `json:"message"`
+}
+
+type TransactionOperationInput struct {
+	Command string `json:"command"`
+	Key     string `json:"key"`
+	Value   string `json:"value,omitempty"`
+}
+
+type TransactionResult struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+

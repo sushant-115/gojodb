@@ -10,10 +10,6 @@ exec:
   # Only for single-file layout:
   filename: graph/generated.go
 
-  # Only for follow-schema layout:
-  # dir: graph
-  # filename_template: "{name}.generated.go"
-
   # Optional: Maximum number of goroutines in concurrency to use per child resolvers(default: unlimited)
   # worker_limit: 1000
 
@@ -121,7 +117,7 @@ call_argument_directives_with_null: true
 # gqlgen will search for any type names in the schema in these go packages
 # if they match it will use them, otherwise it will generate them.
 autobind:
-#  - "github.com/sushant-115/gojodb/api/graphql_service/graph/model"
+   - "github.com/sushant-115/gojodb/api/graphql_service/graph/model" # Added for new models
 
 # This section declares type mapping between the GraphQL and go type systems
 #
@@ -157,3 +153,4 @@ models:
     model:
       - github.com/99designs/gqlgen/graphql.Int
       - github.com/99designs/gqlgen/graphql.Int64
+

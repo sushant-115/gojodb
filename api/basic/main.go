@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"sort"
@@ -28,7 +29,8 @@ const (
 	adminAPIKey = "GOJODB_ADMIN_KEY" // Replace with a strong, secret key in production
 
 	// 2PC Coordinator configuration
-	prepareTimeout = 5 * time.Second // Timeout for participants to respond to PREPARE
+	prepareTimeout      = 5 * time.Second // Timeout for participants to respond to PREPARE
+	healthCheckInterval = 5 * time.Second // How often to health check storage nodes
 )
 
 // APIRequest represents a client request received by the API service.
@@ -81,13 +83,17 @@ type APIService struct {
 	storageNodeAddressesMu sync.RWMutex
 	storageNodeAddresses   map[string]string // StorageNodeID -> StorageNodeAddress (e.g., "storage1" -> "localhost:9000")
 
+	// Storage Node Health
+	storageNodeHealthMu sync.RWMutex
+	storageNodeHealth   map[string]bool // StorageNodeAddress -> true (healthy) / false (unhealthy)
+
 	// Cached Shard Map
 	slotAssignmentsMu sync.RWMutex
 	slotAssignments   map[string]fsm.SlotRangeInfo // Cached slot ranges (RangeID -> SlotRangeInfo)
 
-	// Cache of active connections to Storage Nodes
-	storageNodeConnsMu sync.Mutex
-	storageNodeConns   map[string]net.Conn // storageNodeAddress -> net.Conn
+	// Connection Pool for Storage Nodes
+	storageNodePoolsMu sync.Mutex
+	storageNodePools   map[string]*sync.Pool // storageNodeAddress -> *sync.Pool of net.Conn
 
 	// Transaction Coordinator state (in-memory for V1)
 	nextTxnID   int64
@@ -100,16 +106,17 @@ func NewAPIService(controllerHTTPAddrs string) *APIService {
 		controllerAddrs:      strings.Split(controllerHTTPAddrs, ","),
 		controllerStates:     make(map[string]ControllerStatus),
 		storageNodeAddresses: make(map[string]string),
+		storageNodeHealth:    make(map[string]bool),
 		slotAssignments:      make(map[string]fsm.SlotRangeInfo),
-		storageNodeConns:     make(map[string]net.Conn),
+		storageNodePools:     make(map[string]*sync.Pool),
 		nextTxnID:            time.Now().UnixNano(), // Basic unique ID for transactions
 	}
 	go service.monitorControllerCluster() // Start monitoring controller cluster and fetching shard map
-	go service.manageStorageNodeConns()   // Start managing connections
+	go service.monitorStorageNodeHealth() // Start monitoring storage node health
 	return service
 }
 
-// findControllerLeader periodically pings controller nodes to find the current Raft leader,
+// monitorControllerCluster periodically pings controller nodes to find the current Raft leader,
 // fetch their status, and update the cached storage node addresses and shard map.
 func (s *APIService) monitorControllerCluster() {
 	ticker := time.NewTicker(controllerMonitorInterval)
@@ -179,7 +186,7 @@ func (s *APIService) monitorControllerCluster() {
 		s.leaderMu.Unlock()
 
 		if currentLeader == "" {
-			log.Println("WARNING: API Service: No Controller leader currently reachable or identified. Some operations may fail.")
+			log.Println("WARNING: API Service: No Controller leader currently reachable. Some operations may fail.")
 			// Clear shard map and storage node addresses if no leader
 			s.slotAssignmentsMu.Lock()
 			s.slotAssignments = make(map[string]fsm.SlotRangeInfo)
@@ -223,60 +230,142 @@ func (s *APIService) monitorControllerCluster() {
 	}
 }
 
-// getStorageNodeConn gets or establishes a TCP connection to a Storage Node.
-func (s *APIService) getStorageNodeConn(nodeAddr string) (net.Conn, error) {
-	s.storageNodeConnsMu.Lock()
-	defer s.storageNodeConnsMu.Unlock()
-
-	if conn, ok := s.storageNodeConns[nodeAddr]; ok {
-		// Basic check if connection is still alive (e.g., by sending a small ping)
-		// For now, assume it's alive. Real system would do more robust health checks.
-		return conn, nil
-	}
-
-	log.Printf("DEBUG: API Service: Dialing new connection to Storage Node at %s", nodeAddr)
-	conn, err := net.DialTimeout("tcp", nodeAddr, storageNodeDialTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial storage node %s: %w", nodeAddr, err)
-	}
-	s.storageNodeConns[nodeAddr] = conn
-	return conn, nil
-}
-
-// closeStorageNodeConn closes and removes a connection from the cache.
-func (s *APIService) closeStorageNodeConn(nodeAddr string) {
-	s.storageNodeConnsMu.Lock()
-	defer s.storageNodeConnsMu.Unlock()
-	if conn, ok := s.storageNodeConns[nodeAddr]; ok {
-		conn.Close()
-		delete(s.storageNodeConns, nodeAddr)
-		log.Printf("DEBUG: API Service: Closed connection to Storage Node at %s", nodeAddr)
-	}
-}
-
-// manageStorageNodeConns periodically checks and cleans up stale connections.
-func (s *APIService) manageStorageNodeConns() {
-	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+// monitorStorageNodeHealth periodically pings all known storage nodes to update their health status.
+func (s *APIService) monitorStorageNodeHealth() {
+	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		s.storageNodeConnsMu.Lock()
-		for addr, conn := range s.storageNodeConns {
-			// A simple check: attempt a non-blocking write or read.
-			// A real system would use a dedicated ping/pong or idle connection pool.
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			_, err := conn.Read(make([]byte, 1)) // Try a small non-blocking read
-			conn.SetReadDeadline(time.Time{})    // Clear deadline
-
-			if err != nil && !strings.Contains(err.Error(), "timeout") && !strings.Contains(err.Error(), "i/o timeout") {
-				log.Printf("WARNING: API Service: Stale connection detected to %s, closing: %v", addr, err)
-				conn.Close()
-				delete(s.storageNodeConns, addr)
-			}
+		s.storageNodeAddressesMu.RLock()
+		addresses := make([]string, 0, len(s.storageNodeAddresses))
+		for _, addr := range s.storageNodeAddresses {
+			addresses = append(addresses, addr)
 		}
-		s.storageNodeConnsMu.Unlock()
+		s.storageNodeAddressesMu.RUnlock()
+
+		for _, addr := range addresses {
+			// Perform a lightweight health check (e.g., try to establish a connection)
+			conn, err := net.DialTimeout("tcp", addr, storageNodeDialTimeout)
+			s.storageNodeHealthMu.Lock()
+			if err != nil {
+				if s.storageNodeHealth[addr] { // Only log if status changed
+					log.Printf("WARNING: Storage Node %s (%s) is unhealthy: %v", s.getNodeIDFromAddress(addr), addr, err)
+				} else {
+					log.Printf("DEBUG: Storage Node %s (%s) remains unhealthy: %v", s.getNodeIDFromAddress(addr), addr, err)
+				}
+				s.storageNodeHealth[addr] = false
+				// Close and remove any existing connections from the pool for this unhealthy node
+				s.storageNodePoolsMu.Lock()
+				if pool, ok := s.storageNodePools[addr]; ok {
+					for { // Drain the pool
+						if c := pool.Get(); c != nil {
+							c.(net.Conn).Close()
+						} else {
+							break
+						}
+					}
+					delete(s.storageNodePools, addr)
+				}
+				s.storageNodePoolsMu.Unlock()
+
+			} else {
+				if !s.storageNodeHealth[addr] { // Only log if status changed
+					log.Printf("INFO: Storage Node %s (%s) is now healthy.", s.getNodeIDFromAddress(addr), addr)
+				} else {
+					log.Printf("DEBUG: Storage Node %s (%s) remains healthy.", s.getNodeIDFromAddress(addr), addr)
+				}
+				s.storageNodeHealth[addr] = true
+				conn.Close() // Close the health check connection immediately
+			}
+			s.storageNodeHealthMu.Unlock()
+		}
 	}
 }
+
+// getNodeIDFromAddress is a helper to get the NodeID from its address.
+// This is a reverse lookup and might be inefficient for large numbers of nodes.
+// For logging purposes, it's acceptable.
+func (s *APIService) getNodeIDFromAddress(addr string) string {
+	s.storageNodeAddressesMu.RLock()
+	defer s.storageNodeAddressesMu.RUnlock()
+	for id, a := range s.storageNodeAddresses {
+		if a == addr {
+			return id
+		}
+	}
+	return "UNKNOWN_NODE"
+}
+
+// getStorageNodeConn gets or establishes a TCP connection to a Storage Node from the pool.
+func (s *APIService) getStorageNodeConn(nodeAddr string) (net.Conn, error) {
+	s.storageNodeHealthMu.RLock()
+	isHealthy := s.storageNodeHealth[nodeAddr]
+	s.storageNodeHealthMu.RUnlock()
+
+	if !isHealthy {
+		return nil, fmt.Errorf("storage node %s is unhealthy", nodeAddr)
+	}
+
+	s.storageNodePoolsMu.Lock()
+	pool, ok := s.storageNodePools[nodeAddr]
+	if !ok {
+		// Initialize pool for this node if it doesn't exist
+		pool = &sync.Pool{
+			New: func() interface{} {
+				log.Printf("DEBUG: API Service: Creating new connection for pool to Storage Node at %s", nodeAddr)
+				conn, err := net.DialTimeout("tcp", nodeAddr, storageNodeDialTimeout)
+				if err != nil {
+					log.Printf("ERROR: API Service: Failed to create new connection for pool to %s: %v", nodeAddr, err)
+					s.storageNodeHealthMu.Lock()
+					s.storageNodeHealth[nodeAddr] = false // Mark unhealthy if connection fails
+					s.storageNodeHealthMu.Unlock()
+					return nil // Return nil if connection failed
+				}
+				return conn
+			},
+		}
+		s.storageNodePools[nodeAddr] = pool
+	}
+	s.storageNodePoolsMu.Unlock()
+
+	// Get a connection from the pool
+	conn := pool.Get()
+	if conn != nil {
+		// Basic check if connection is still alive (e.g., by sending a small ping)
+		// For now, assume it's alive. Real system would do more robust health checks.
+		// If it's not alive, pool.Get() might return nil or a closed connection.
+		// We rely on the health monitor to mark nodes unhealthy.
+		return conn.(net.Conn), nil
+	}
+
+	// If pool.Get() returned nil (meaning New failed), try creating a fresh connection
+	// directly, but this should be rare if the health check is working.
+	log.Printf("WARNING: API Service: Pool for %s returned nil. Attempting direct dial.", nodeAddr)
+	directConn, err := net.DialTimeout("tcp", nodeAddr, storageNodeDialTimeout)
+	if err != nil {
+		log.Printf("ERROR: API Service: Failed to dial directly to %s: %v", nodeAddr, err)
+		s.storageNodeHealthMu.Lock()
+		s.storageNodeHealth[nodeAddr] = false // Mark unhealthy if direct dial fails
+		s.storageNodeHealthMu.Unlock()
+		return nil, fmt.Errorf("failed to get or create connection to %s: %w", nodeAddr, err)
+	}
+	return directConn, nil
+}
+
+// returnStorageNodeConn returns a connection to its pool.
+func (s *APIService) returnStorageNodeConn(nodeAddr string, conn net.Conn) {
+	s.storageNodePoolsMu.Lock()
+	defer s.storageNodePoolsMu.Unlock()
+
+	if pool, ok := s.storageNodePools[nodeAddr]; ok {
+		pool.Put(conn)
+	} else {
+		// Should not happen if pools are managed correctly, but close if no pool exists.
+		conn.Close()
+	}
+}
+
+// manageStorageNodeConns is removed, replaced by monitorStorageNodeHealth and sync.Pool.
 
 // authenticate checks for a valid API key for admin requests.
 func authenticate(next http.HandlerFunc) http.HandlerFunc {
@@ -300,7 +389,7 @@ func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
 	s.leaderMu.RUnlock()
 
 	// Operations that depend on leader or shard map:
-	isCriticalPath := strings.HasPrefix(path, "/admin/") || path == "/api/data"
+	isCriticalPath := strings.HasPrefix(path, "/admin/") || path == "/api/data" || path == "/api/transaction" || path == "/api/query"
 	if isCriticalPath && leaderAddr == "" {
 		http.Error(w, "ERROR: No Controller leader available. Cannot process request.", http.StatusServiceUnavailable)
 		log.Printf("ERROR: Request for %s failed: No Controller leader available.", path)
@@ -404,6 +493,10 @@ func (s *APIService) handleClusterStatus(w http.ResponseWriter, r *http.Request)
 	storageNodes := s.storageNodeAddresses
 	s.storageNodeAddressesMu.RUnlock()
 
+	s.storageNodeHealthMu.RLock()
+	storageNodeHealth := s.storageNodeHealth
+	s.storageNodeHealthMu.RUnlock()
+
 	responseBuilder.WriteString(fmt.Sprintf("\nRegistered Storage Nodes (%d):\n", len(storageNodes)))
 	if len(storageNodes) == 0 {
 		responseBuilder.WriteString("  (None)\n")
@@ -414,7 +507,16 @@ func (s *APIService) handleClusterStatus(w http.ResponseWriter, r *http.Request)
 		}
 		sort.Strings(sortedStorageIDs)
 		for _, id := range sortedStorageIDs {
-			responseBuilder.WriteString(fmt.Sprintf("  - ID: %s, Addr: %s\n", id, storageNodes[id]))
+			addr := storageNodes[id]
+			healthStatus := "UNKNOWN"
+			if healthy, ok := storageNodeHealth[addr]; ok {
+				if healthy {
+					healthStatus = "HEALTHY"
+				} else {
+					healthStatus = "UNHEALTHY"
+				}
+			}
+			responseBuilder.WriteString(fmt.Sprintf("  - ID: %s, Addr: %s, Health: %s\n", id, addr, healthStatus))
 		}
 	}
 
@@ -436,13 +538,90 @@ func (s *APIService) handleClusterStatus(w http.ResponseWriter, r *http.Request)
 		})
 
 		for _, sr := range sortedRanges {
-			responseBuilder.WriteString(fmt.Sprintf("  - RangeID: %s (%d-%d), Assigned To: %s, Status: %s\n",
-				sr.RangeID, sr.StartSlot, sr.EndSlot, sr.AssignedNodeID, sr.Status))
+			responseBuilder.WriteString(fmt.Sprintf("  - RangeID: %s (%d-%d), Assigned To: %s, Status: %s, Primary: %s, Replicas: %s\n",
+				sr.RangeID, sr.StartSlot, sr.EndSlot, sr.AssignedNodeID, sr.Status, sr.PrimaryNodeID, strings.Join(sr.ReplicaNodeIDs, ",")))
 		}
 	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, responseBuilder.String())
+}
+
+// getResponsibleNodesForSlot returns a list of healthy storage node addresses responsible for a given slot.
+// If `forWrite` is true, it returns only the primary. If false, it returns primary + replicas.
+func (s *APIService) getResponsibleNodesForSlot(slot int, forWrite bool) ([]string, error) {
+	log.Printf("DEBUG: getResponsibleNodesForSlot called for slot %d, forWrite: %t", slot, forWrite)
+
+	s.slotAssignmentsMu.RLock()
+	var targetSlotInfo fsm.SlotRangeInfo
+	foundAssignment := false
+	for _, slotInfo := range s.slotAssignments {
+		if slot >= slotInfo.StartSlot && slot <= slotInfo.EndSlot {
+			targetSlotInfo = slotInfo
+			foundAssignment = true
+			break
+		}
+	}
+	s.slotAssignmentsMu.RUnlock()
+
+	if !foundAssignment {
+		log.Printf("ERROR: No slot assignment found for slot %d", slot)
+		return nil, fmt.Errorf("no assignment found for slot %d", slot)
+	}
+	log.Printf("DEBUG: Slot %d assigned to RangeID %s (Primary: %s, Replicas: %v)", slot, targetSlotInfo.RangeID, targetSlotInfo.PrimaryNodeID, targetSlotInfo.ReplicaNodeIDs)
+
+	s.storageNodeAddressesMu.RLock()
+	defer s.storageNodeAddressesMu.RUnlock()
+
+	s.storageNodeHealthMu.RLock()
+	defer s.storageNodeHealthMu.RUnlock()
+
+	var candidateNodes []string
+
+	// Check Primary
+	primaryAddr, primaryOk := s.storageNodeAddresses[targetSlotInfo.PrimaryNodeID]
+	if primaryOk {
+		if s.storageNodeHealth[primaryAddr] {
+			candidateNodes = append(candidateNodes, primaryAddr)
+			log.Printf("DEBUG: Added primary %s (%s) to candidates (healthy).", targetSlotInfo.PrimaryNodeID, primaryAddr)
+		} else {
+			log.Printf("WARNING: Primary %s (%s) for slot %d is unhealthy. Not adding to candidates.", targetSlotInfo.PrimaryNodeID, primaryAddr, slot)
+		}
+	} else {
+		log.Printf("WARNING: Primary %s address not found in cache for slot %d.", targetSlotInfo.PrimaryNodeID, slot)
+	}
+
+	if forWrite {
+		if len(candidateNodes) == 0 { // Primary is unhealthy or not found
+			log.Printf("ERROR: No healthy primary available for write to slot %d.", slot)
+			return nil, fmt.Errorf("primary node for slot %d is unhealthy or not found", slot)
+		}
+		log.Printf("DEBUG: For write, returning only primary: %v", candidateNodes)
+		return candidateNodes, nil // For writes, only primary
+	}
+
+	// For reads, add healthy replicas
+	for _, replicaID := range targetSlotInfo.ReplicaNodeIDs {
+		replicaAddr, replicaOk := s.storageNodeAddresses[replicaID]
+		if replicaOk {
+			if s.storageNodeHealth[replicaAddr] {
+				candidateNodes = append(candidateNodes, replicaAddr)
+				log.Printf("DEBUG: Added replica %s (%s) to candidates (healthy).", replicaID, replicaAddr)
+			} else {
+				log.Printf("WARNING: Replica %s (%s) for slot %d is unhealthy. Not adding to candidates.", replicaID, replicaAddr, slot)
+			}
+		} else {
+			log.Printf("WARNING: Replica %s address not found in cache for slot %d.", replicaID, slot)
+		}
+	}
+
+	if len(candidateNodes) == 0 {
+		log.Printf("ERROR: No healthy storage nodes (primary or replicas) found for read to slot %d.", slot)
+		return nil, fmt.Errorf("no healthy storage nodes found for slot %d", slot)
+	}
+
+	log.Printf("INFO: Final healthy candidate nodes for slot %d (forWrite: %t): %v", slot, forWrite, candidateNodes)
+	return candidateNodes, nil
 }
 
 // handleDataRequest processes client data requests (PUT/GET/DELETE) and routes them to Storage Nodes.
@@ -460,59 +639,63 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("INFO: API Service: Received data command: %s Key: '%s' Value: '%s'", apiReq.Command, apiReq.Key, apiReq.Value)
 
-	// Leader check already done in handleAPIRequest
-
-	// 1. Determine target slot
 	targetSlot := fsm.GetSlotForHashKey(apiReq.Key)
-	log.Printf("DEBUG: API Service: Key '%s' maps to slot %d", apiReq.Key, targetSlot)
+	var responsibleNodes []string
+	var err error
 
-	// 2. Look up slot assignment in local cache
-	s.slotAssignmentsMu.RLock()
-	var targetSlotInfo fsm.SlotRangeInfo
-	foundAssignment := false
-	for _, slotInfo := range s.slotAssignments {
-		if targetSlot >= slotInfo.StartSlot && targetSlot <= slotInfo.EndSlot {
-			targetSlotInfo = slotInfo
-			foundAssignment = true
-			break
-		}
+	isWriteOperation := (apiReq.Command == "PUT" || apiReq.Command == "DELETE")
+	log.Printf("DEBUG: handleDataRequest: Command '%s', isWriteOperation: %t", apiReq.Command, isWriteOperation)
+
+	if isWriteOperation {
+		responsibleNodes, err = s.getResponsibleNodesForSlot(targetSlot, true) // Get only primary for writes
+	} else { // Read operations (GET)
+		responsibleNodes, err = s.getResponsibleNodesForSlot(targetSlot, false) // Get primary + replicas for reads
 	}
-	s.slotAssignmentsMu.RUnlock()
 
-	if !foundAssignment {
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("No assignment found for slot %d (key '%s'). Cluster not fully sharded or shard map not yet fetched.", targetSlot, apiReq.Key)}
+	if err != nil {
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Routing error for key '%s' (slot %d): %v", apiReq.Key, targetSlot, err)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
-	// 3. Get Storage Node address for the assigned slot
-	storageNodeID := targetSlotInfo.AssignedNodeID
-	s.storageNodeAddressesMu.RLock()
-	actualStorageNodeAddr, storageNodeFound := s.storageNodeAddresses[storageNodeID]
-	s.storageNodeAddressesMu.RUnlock()
-
-	if !storageNodeFound || actualStorageNodeAddr == "" {
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Storage Node %s (for slot %d) address not found in Controller cache. Node might be down or not registered.", storageNodeID, targetSlot)}
+	if len(responsibleNodes) == 0 {
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("No healthy storage nodes found for key '%s' (slot %d).", apiReq.Key, targetSlot)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
+
+	// Select a target node (primary for writes, random for reads)
+	targetNodeAddr := ""
+	if isWriteOperation {
+		targetNodeAddr = responsibleNodes[0] // Primary is always the first element
+	} else {
+		// Randomly select a node for reads
+		rand.Seed(time.Now().UnixNano()) // once in init()
+		index := rand.Intn(len(responsibleNodes))
+		targetNodeAddr = responsibleNodes[index]
+	}
+	log.Printf("INFO: handleDataRequest: Selected target node %s for command '%s' (key '%s').", targetNodeAddr, apiReq.Command, apiReq.Key)
 
 	// 4. Get or establish connection to the target Storage Node
-	conn, err := s.getStorageNodeConn(actualStorageNodeAddr)
+	conn, err := s.getStorageNodeConn(targetNodeAddr)
 	if err != nil {
-		log.Printf("ERROR: API Service: Failed to connect to Storage Node %s at %s: %v", storageNodeID, actualStorageNodeAddr, err)
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to connect to Storage Node %s: %v", storageNodeID, err)}
+		log.Printf("ERROR: API Service: Failed to get connection to Storage Node %s: %v", targetNodeAddr, err)
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to connect to Storage Node %s: %v", targetNodeAddr, err)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
+	defer s.returnStorageNodeConn(targetNodeAddr, conn) // Return connection to pool
 
 	// 5. Send request to Storage Node
 	storageReq := fmt.Sprintf("%s %s %s\n", apiReq.Command, apiReq.Key, apiReq.Value) // Format matches Storage Node's expected input
 	_, err = conn.Write([]byte(storageReq))
 	if err != nil {
-		log.Printf("ERROR: API Service: Failed to send request to Storage Node %s: %v", storageNodeID, err)
-		s.closeStorageNodeConn(actualStorageNodeAddr) // Close stale connection
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to send request to Storage Node %s: %v", storageNodeID, err)}
+		log.Printf("ERROR: API Service: Failed to send request to Storage Node %s: %v", targetNodeAddr, err)
+		// Mark node unhealthy if write fails (connection issue)
+		s.storageNodeHealthMu.Lock()
+		s.storageNodeHealth[targetNodeAddr] = false
+		s.storageNodeHealthMu.Unlock()
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to send request to Storage Node %s: %v", targetNodeAddr, err)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
@@ -521,9 +704,12 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 	reader := bufio.NewReader(conn)
 	storageRespRaw, err := reader.ReadString('\n')
 	if err != nil {
-		log.Printf("ERROR: API Service: Failed to read response from Storage Node %s: %v", storageNodeID, err)
-		s.closeStorageNodeConn(actualStorageNodeAddr)
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to read response from Storage Node %s: %v", storageNodeID, err)}
+		log.Printf("ERROR: API Service: Failed to read response from Storage Node %s: %v", targetNodeAddr, err)
+		// Mark node unhealthy if read fails (connection issue)
+		s.storageNodeHealthMu.Lock()
+		s.storageNodeHealth[targetNodeAddr] = false
+		s.storageNodeHealthMu.Unlock()
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to read response from Storage Node %s: %v", targetNodeAddr, err)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
@@ -541,7 +727,7 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 		apiResp.Message = strings.Join(storageRespParts[1:], " ")
 	}
 
-	log.Printf("INFO: API Service: Routed key '%s' to %s, received response status: %s", apiReq.Key, storageNodeID, apiResp.Status)
+	log.Printf("INFO: API Service: Routed key '%s' to %s in responsible nodes %v, received response status: %s, isWrite: %v", apiReq.Key, targetNodeAddr, responsibleNodes, apiResp.Status, isWriteOperation)
 	json.NewEncoder(w).Encode(apiResp) // Send JSON response to original client
 }
 
@@ -564,76 +750,62 @@ func (s *APIService) handleTransactionRequest(w http.ResponseWriter, r *http.Req
 	s.nextTxnIDMu.Unlock()
 	log.Printf("INFO: API Service: Starting new distributed transaction: %s", txnID)
 
-	// Map to track unique participants involved in this transaction
-	participants := make(map[string]string) // storageNodeID -> storageNodeAddr
+	// Map to track unique participants involved in this transaction and their relevant operations
+	participantsOps := make(map[string][]TransactionOperation) // storageNodeAddress -> []TransactionOperation
+	participantAddrs := make(map[string]struct{})              // Set of unique participant addresses
 
-	// 1. Pre-check: Determine all participants and ensure key assignments are known
+	// 1. Pre-check: Determine all participants and their operations
 	for i, op := range txReq.Operations {
 		targetSlot := fsm.GetSlotForHashKey(op.Key)
-		s.slotAssignmentsMu.RLock()
-		var targetSlotInfo fsm.SlotRangeInfo
-		foundAssignment := false
-		for _, slotInfo := range s.slotAssignments {
-			if targetSlot >= slotInfo.StartSlot && targetSlot <= slotInfo.EndSlot {
-				targetSlotInfo = slotInfo
-				foundAssignment = true
-				break
-			}
-		}
-		s.slotAssignmentsMu.RUnlock()
 
-		if !foundAssignment {
-			resp := APIResponse{Status: "ABORTED", Message: fmt.Sprintf("Txn %s: No assignment found for slot %d (key '%s') in operation %d.", txnID, targetSlot, op.Key, i)}
+		// Get primary node address for the slot (writes always go to primary)
+		primaryNodes, err := s.getResponsibleNodesForSlot(targetSlot, true)
+		if err != nil || len(primaryNodes) == 0 {
+			resp := APIResponse{Status: "ABORTED", Message: fmt.Sprintf("Txn %s: No healthy primary found for slot %d (key '%s') in operation %d: %v.", txnID, targetSlot, op.Key, i, err)}
 			json.NewEncoder(w).Encode(resp)
-			log.Printf("ERROR: Txn %s aborted due to unknown slot assignment.", txnID)
+			log.Printf("ERROR: Txn %s aborted due to unhealthy or missing primary for key '%s'.", txnID, op.Key)
 			return
 		}
+		primaryAddr := primaryNodes[0] // Always the primary for writes
 
-		storageNodeID := targetSlotInfo.AssignedNodeID
-		s.storageNodeAddressesMu.RLock()
-		actualStorageNodeAddr, storageNodeFound := s.storageNodeAddresses[storageNodeID]
-		s.storageNodeAddressesMu.RUnlock()
-
-		if !storageNodeFound || actualStorageNodeAddr == "" {
-			resp := APIResponse{Status: "ABORTED", Message: fmt.Sprintf("Txn %s: Storage Node %s address not found for operation %d.", txnID, storageNodeID, i)}
-			json.NewEncoder(w).Encode(resp)
-			log.Printf("ERROR: Txn %s aborted due to unknown storage node address.", txnID)
-			return
-		}
-		participants[storageNodeID] = actualStorageNodeAddr
+		participantsOps[primaryAddr] = append(participantsOps[primaryAddr], op)
+		participantAddrs[primaryAddr] = struct{}{}
 	}
 
 	// --- Phase 1: Prepare ---
-	log.Printf("INFO: Txn %s: Phase 1 (Prepare) initiated with %d participants.", txnID, len(participants))
-	prepareVotes := make(chan bool, len(participants))
+	log.Printf("INFO: Txn %s: Phase 1 (Prepare) initiated with %d unique participants.", txnID, len(participantAddrs))
+	prepareVotes := make(chan bool, len(participantAddrs))
 	var wg sync.WaitGroup
 
-	for nodeID, nodeAddr := range participants {
+	for addr := range participantAddrs {
 		wg.Add(1)
-		go func(id, addr string, ops []TransactionOperation) {
+		go func(pAddr string, ops []TransactionOperation) {
 			defer wg.Done()
 
 			// Send PREPARE command to Storage Node
-			prepareCmd := fmt.Sprintf("PREPARE %s %s\n", txnID, serializeOperations(ops)) // ops need to be serialized
-
-			// This command will go to the Storage Node which needs to parse it
-			// For simplicity, we are passing all operations to each participant for now.
-			// A smarter coordinator would send only relevant ops per participant.
-
-			resp, err := s.sendStorageNodeCommand(addr, prepareCmd)
+			// The operations are serialized as a JSON array within the command string.
+			opsJSON, err := json.Marshal(ops)
 			if err != nil {
-				log.Printf("ERROR: Txn %s: Participant %s failed to PREPARE: %v", txnID, id, err)
+				log.Printf("ERROR: Txn %s: Failed to marshal operations for participant %s: %v", txnID, pAddr, err)
+				prepareVotes <- false
+				return
+			}
+			prepareCmd := fmt.Sprintf("PREPARE %s %s\n", txnID, string(opsJSON))
+
+			resp, err := s.sendStorageNodeCommand(pAddr, prepareCmd)
+			if err != nil {
+				log.Printf("ERROR: Txn %s: Participant %s failed to PREPARE: %v", txnID, pAddr, err)
 				prepareVotes <- false
 				return
 			}
 			if resp.Status == "VOTE_COMMIT" {
-				log.Printf("DEBUG: Txn %s: Participant %s VOTE_COMMIT.", txnID, id)
+				log.Printf("DEBUG: Txn %s: Participant %s VOTE_COMMIT.", txnID, pAddr)
 				prepareVotes <- true
 			} else {
-				log.Printf("INFO: Txn %s: Participant %s VOTE_ABORT: %s", txnID, id, resp.Message)
+				log.Printf("INFO: Txn %s: Participant %s VOTE_ABORT: %s", txnID, pAddr, resp.Message)
 				prepareVotes <- false
 			}
-		}(nodeID, nodeAddr, txReq.Operations) // Pass all operations for now, SN will filter
+		}(addr, participantsOps[addr])
 	}
 
 	// Wait for all prepare responses or timeout
@@ -677,16 +849,16 @@ func (s *APIService) handleTransactionRequest(w http.ResponseWriter, r *http.Req
 	}
 
 	// Send final command to all participants
-	for nodeID, nodeAddr := range participants {
-		go func(id, addr string, cmd string) {
-			resp, err := s.sendStorageNodeCommand(addr, cmd)
+	for addr := range participantAddrs {
+		go func(pAddr string, cmd string) {
+			resp, err := s.sendStorageNodeCommand(pAddr, cmd)
 			if err != nil {
-				log.Printf("ERROR: Txn %s: Participant %s failed to send %s command: %v", txnID, id, strings.TrimSpace(cmd), err)
+				log.Printf("ERROR: Txn %s: Participant %s failed to send %s command: %v", txnID, pAddr, strings.TrimSpace(cmd), err)
 				// Coordinator crash recovery (later) needed if this fails.
 				return
 			}
-			log.Printf("DEBUG: Txn %s: Participant %s responded to %s with: %s", txnID, id, strings.TrimSpace(cmd), resp.Status)
-		}(nodeID, nodeAddr, commitCmd)
+			log.Printf("DEBUG: Txn %s: Participant %s responded to %s with: %s", txnID, pAddr, strings.TrimSpace(cmd), resp.Status)
+		}(addr, commitCmd)
 	}
 
 	// Respond to original client
@@ -698,19 +870,26 @@ func (s *APIService) handleTransactionRequest(w http.ResponseWriter, r *http.Req
 func (s *APIService) sendStorageNodeCommand(nodeAddr string, command string) (APIResponse, error) {
 	conn, err := s.getStorageNodeConn(nodeAddr)
 	if err != nil {
-		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to connect to storage node %s: %w", nodeAddr, err)
+		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to get connection to storage node %s: %w", nodeAddr, err)
 	}
+	defer s.returnStorageNodeConn(nodeAddr, conn) // Return connection to pool
 
 	_, err = conn.Write([]byte(command))
 	if err != nil {
-		s.closeStorageNodeConn(nodeAddr)
+		// Mark node unhealthy if write fails (connection issue)
+		s.storageNodeHealthMu.Lock()
+		s.storageNodeHealth[nodeAddr] = false
+		s.storageNodeHealthMu.Unlock()
 		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to send command to storage node %s: %w", nodeAddr, err)
 	}
 
 	reader := bufio.NewReader(conn)
 	respRaw, err := reader.ReadString('\n')
 	if err != nil {
-		s.closeStorageNodeConn(nodeAddr)
+		// Mark node unhealthy if read fails (connection issue)
+		s.storageNodeHealthMu.Lock()
+		s.storageNodeHealth[nodeAddr] = false
+		s.storageNodeHealthMu.Unlock()
 		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to read response from storage node %s: %w", nodeAddr, err)
 	}
 
@@ -727,28 +906,21 @@ func (s *APIService) sendStorageNodeCommand(nodeAddr string, command string) (AP
 }
 
 // serializeOperations is a helper to serialize a list of operations for sending to Storage Nodes.
+// This is used by the API Service (Coordinator) to send operations to participants.
 func serializeOperations(ops []TransactionOperation) string {
-	req := TransactionRequest{
-		Operations: ops,
-	}
-	b, _ := json.Marshal(req)
+	// For 2PC, the Storage Node expects a JSON array of operations directly.
+	b, _ := json.Marshal(ops) // Marshal the slice of operations directly
 	log.Println("Serialized Request: ", string(b))
 	return string(b)
 }
 
 // deserializeOperations is a helper to deserialize a list of operations from a string.
+// This is used by the Storage Node (Participant) to receive operations from the Coordinator.
+// NOTE: This function is in cmd/gojodb_cluster_server/main.go. This one is for the API service.
 func deserializeOperations(s string) ([]TransactionOperation, error) {
-	parts := strings.Split(s, "|")
 	var ops []TransactionOperation
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		var op TransactionOperation
-		if err := json.Unmarshal([]byte(part), &op); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal operation part '%s': %w", part, err)
-		}
-		ops = append(ops, op)
+	if err := json.Unmarshal([]byte(s), &ops); err != nil { // Unmarshal directly into slice
+		return nil, fmt.Errorf("failed to unmarshal operations JSON: %w", err)
 	}
 	return ops, nil
 }
@@ -769,79 +941,40 @@ func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) 
 
 	log.Printf("INFO: API Service: Received query command: %s StartKey: '%s' EndKey: '%s'", apiReq.Command, apiReq.StartKey, apiReq.EndKey)
 
-	// Leader check already done in handleAPIRequest
-
-	// 1. Determine target slot(s) for the range
+	// Determine target slot(s) for the range
 	startSlot := fsm.GetSlotForHashKey(apiReq.StartKey)
-	//endSlot := fsm.GetSlotForHashKey(apiReq.EndKey) // Note: EndKey is exclusive for range, but for slot it's inclusive
 
-	// --- V1 Sharding Routing for Range Queries: Only support single-shard ranges ---
-	s.slotAssignmentsMu.RLock()
-	var responsibleNodeID string
-	//var responsibleNodeAddr string
-	foundResponsibleShard := false
-
-	// Find the shard that contains the StartKey
-	var startKeySlotInfo fsm.SlotRangeInfo
-	foundStartKeyShard := false
-	for _, slotInfo := range s.slotAssignments {
-		if startSlot >= slotInfo.StartSlot && startSlot <= slotInfo.EndSlot {
-			startKeySlotInfo = slotInfo
-			foundStartKeyShard = true
-			break
-		}
-	}
-	s.slotAssignmentsMu.RUnlock()
-
-	if !foundStartKeyShard {
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("No assignment found for start_key '%s' (slot %d).", apiReq.StartKey, startSlot)}
+	// Get healthy nodes for read (primary + replicas)
+	responsibleNodes, err := s.getResponsibleNodesForSlot(startSlot, false)
+	if err != nil {
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Routing error for range query (start key '%s', slot %d): %v", apiReq.StartKey, startSlot, err)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
-	// Check if the entire range falls within this single shard
-	// if endSlot > startKeySlotInfo.EndSlot || endSlot < startKeySlotInfo.StartSlot { // End slot outside this shard's range
-	// 	resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Range query spans multiple shards or is invalid. StartKey slot %d (shard %s) and EndKey slot %d. V1 only supports single-shard range queries.", startSlot, startKeySlotInfo.RangeID, endSlot)}
-	// 	json.NewEncoder(w).Encode(resp)
-	// 	return
-	// }
-
-	responsibleNodeID = startKeySlotInfo.AssignedNodeID
-	s.storageNodeAddressesMu.RLock()
-	actualStorageNodeAddr, storageNodeFound := s.storageNodeAddresses[responsibleNodeID]
-	s.storageNodeAddressesMu.RUnlock()
-
-	if !storageNodeFound || actualStorageNodeAddr == "" {
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Storage Node %s (for range) address not found in Controller cache. Node might be down or not registered.", responsibleNodeID)}
-		json.NewEncoder(w).Encode(resp)
-		return
-	}
-	foundResponsibleShard = true // Confirmed single shard and node found
-	// --- END V1 Sharding Routing ---
-
-	if !foundResponsibleShard {
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Could not determine responsible storage node for range %s-%s.", apiReq.StartKey, apiReq.EndKey)}
+	if len(responsibleNodes) == 0 {
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("No healthy storage nodes found for range query (start key '%s', slot %d).", apiReq.StartKey, startSlot)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
-	// 2. Send query command to the responsible Storage Node
+	// Select a random healthy node for the query
+	targetNodeAddr := responsibleNodes[time.Now().Nanosecond()%len(responsibleNodes)]
+
+	// Send query command to the responsible Storage Node
 	// Format: COMMAND <start_key> <end_key>
 	storageQueryCmd := fmt.Sprintf("%s %s %s\n", apiReq.Command, apiReq.StartKey, apiReq.EndKey)
 
-	log.Printf("DEBUG: API Service: Routing range query '%s' to Storage Node %s (%s)", apiReq.Command, responsibleNodeID, actualStorageNodeAddr)
-	respFromSN, err := s.sendStorageNodeCommand(actualStorageNodeAddr, storageQueryCmd)
+	log.Printf("DEBUG: API Service: Routing range query '%s' to Storage Node %s", apiReq.Command, targetNodeAddr)
+	respFromSN, err := s.sendStorageNodeCommand(targetNodeAddr, storageQueryCmd)
 	if err != nil {
-		log.Printf("ERROR: API Service: Failed to get response from Storage Node %s for query: %v", responsibleNodeID, err)
-		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to query Storage Node %s: %v", responsibleNodeID, err)}
+		log.Printf("ERROR: API Service: Failed to get response from Storage Node %s for query: %v", targetNodeAddr, err)
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to query Storage Node %s: %v", targetNodeAddr, err)}
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
-	// 3. Parse and return response from Storage Node
-	// Assuming Storage Node will return JSON data in its message for queries.
-	// For example, for GET_RANGE, it might return "OK [{"key":"a","value":"1"},{"key":"b","value":"2"}]"
-	// For COUNT_RANGE, it might return "OK 5"
+	// Parse and return response from Storage Node
 	apiResp := APIResponse{Status: respFromSN.Status}
 	if respFromSN.Status == "OK" {
 		// Attempt to unmarshal message into Data field, if it's JSON

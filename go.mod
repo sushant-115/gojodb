@@ -4,6 +4,7 @@ go 1.24.3
 
 require (
 	github.com/99designs/gqlgen v0.17.73
+	github.com/chzyer/readline v1.5.1
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb v0.0.0-20250528070419-144f8b0a1edb
 	github.com/vektah/gqlparser/v2 v2.5.26

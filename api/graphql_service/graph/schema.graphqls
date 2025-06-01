@@ -1,19 +1,115 @@
-# Defines a simple key-value entry
+# GraphQL schema for GojoDB
+
 type Entry {
   key: String!
   value: String!
 }
 
-# Defines the queries available
 type Query {
-  # Retrieves a single entry by its key
+  """
+  Retrieves the value for a given key.
+  """
   get(key: String!): Entry
+
+  """
+  Retrieves key-value pairs within a specified range.
+  """
+  getRange(startKey: String!, endKey: String!): [Entry!]!
+
+  """
+  Retrieves the overall cluster status.
+  """
+  status: StatusResponse!
+
+  """
+  Admin: Finds the storage node responsible for a given key.
+  Requires X-API-Key header.
+  """
+  adminGetNodeForKey(key: String!): NodeForKeyResponse!
 }
 
-# Defines the mutations available (write operations)
 type Mutation {
-  # Puts (inserts or updates) a key-value entry
-  put(key: String!, value: String!): Entry! # Returns the entry that was put
-  # Deletes an entry by its key
-  delete(key: String!): Boolean! # Returns true if deleted, false otherwise
+  """
+  Inserts or updates a key-value pair.
+  """
+  put(key: String!, value: String!): Entry!
+
+  """
+  Deletes a key-value pair.
+  """
+  delete(key: String!): Boolean!
+
+  """
+  Executes a distributed transaction with multiple operations.
+  """
+  executeTransaction(operations: [TransactionOperationInput!]!): TransactionResult!
+
+  """
+  Admin: Assigns a slot range to a primary node with optional replicas.
+  Requires X-API-Key header.
+  """
+  adminAssignSlotRange(input: AssignSlotRangeInput!): Boolean!
+
+  """
+  Admin: Sets cluster-wide metadata.
+  Requires X-API-Key header.
+  """
+  adminSetMetadata(key: String!, value: String!): Boolean!
+
+  """
+  Admin: Sets primary and replica nodes for a given slot range.
+  Requires X-API-Key header.
+  """
+  adminSetPrimaryReplica(input: SetPrimaryReplicaInput!): Boolean!
+}
+
+"""
+Input for a single operation within a distributed transaction.
+"""
+input TransactionOperationInput {
+  command: String! # e.g., "PUT", "DELETE"
+  key: String!
+  value: String # Optional for DELETE operations
+}
+
+"""
+Result of a distributed transaction.
+"""
+type TransactionResult {
+  status: String! # e.g., "COMMITTED", "ABORTED", "ERROR"
+  message: String!
+}
+
+"""
+Response containing overall cluster status message.
+"""
+type StatusResponse {
+  message: String!
+}
+
+"""
+Response containing information about the node responsible for a key.
+"""
+type NodeForKeyResponse {
+  nodeID: String!
+  slot: Int!
+}
+
+"""
+Input for assigning a slot range.
+"""
+input AssignSlotRangeInput {
+  startSlot: Int!
+  endSlot: Int!
+  assignedNodeID: String!
+  replicaNodeIDs: [String!] # Optional list of replica node IDs
+}
+
+"""
+Input for setting primary and replica nodes for a slot range.
+"""
+input SetPrimaryReplicaInput {
+  rangeID: String!
+  primaryNodeID: String!
+  replicaNodeIDs: [String!]!
 }
