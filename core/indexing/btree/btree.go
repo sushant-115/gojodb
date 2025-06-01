@@ -1,18 +1,14 @@
 package btree
 
 import (
-	// For LRU
-
 	"cmp"
+	"encoding/binary" // For serializing PageID to bytes
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"slices"
 	"sync" // For sync.RWMutex and sync.Map
-	// For parsing TxnID
-	// For Node serialization
-	// For Node serialization checksum
 )
 
 // --- Configuration & Constants ---
@@ -295,6 +291,61 @@ func (bt *BTree[K, V]) GetRootPageID() PageID {
 	return bt.rootPageID
 }
 
+// SetRootPageID updates the B-tree's in-memory rootPageID and logs the change.
+// It also updates the disk header immediately to ensure durability of root changes.
+func (bt *BTree[K, V]) SetRootPageID(newRootPageID PageID, txnID uint64) error {
+	oldRootPageID := bt.rootPageID
+	bt.rootPageID = newRootPageID
+
+	// Log the root page ID change
+	newRootPageIDBytes := make([]byte, 8) // PageID is uint64
+	binary.LittleEndian.PutUint64(newRootPageIDBytes, uint64(newRootPageID))
+
+	logRecord := &LogRecord{
+		TxnID:   txnID,
+		Type:    LogRecordTypeRootChange,
+		PageID:  newRootPageID,   // New root page ID
+		OldData: make([]byte, 8), // Store old root for undo, if needed
+		NewData: newRootPageIDBytes,
+	}
+	binary.LittleEndian.PutUint64(logRecord.OldData, uint64(oldRootPageID))
+
+	lsn, err := bt.logManager.Append(logRecord)
+	if err != nil {
+		log.Printf("ERROR: Failed to log root page ID change from %d to %d: %v", oldRootPageID, newRootPageID, err)
+		// This is a critical error, as root change might not be recoverable.
+		// Revert in-memory change for safety, though disk might be inconsistent.
+		bt.rootPageID = oldRootPageID
+		return fmt.Errorf("failed to log root page ID change: %w", err)
+	}
+
+	// Flush the log immediately to ensure durability of the root change record
+	if err := bt.logManager.Flush(lsn); err != nil {
+		log.Printf("ERROR: Failed to flush log for root page ID change LSN %d: %v", lsn, err)
+		// This is also critical.
+		bt.rootPageID = oldRootPageID
+		return fmt.Errorf("failed to flush root page ID change log: %w", err)
+	}
+
+	// Update the file header with the new root page ID
+	if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader) {
+		h.RootPageID = newRootPageID
+	}); err != nil {
+		log.Printf("ERROR: Failed to update disk header with new root page ID %d: %v", newRootPageID, err)
+		// This is critical. The log record is there, but disk header is not.
+		// Recovery will fix this, but current state is inconsistent.
+		bt.rootPageID = oldRootPageID // Revert in-memory for consistency with disk
+		return fmt.Errorf("failed to update disk header for root change: %w", err)
+	}
+
+	log.Printf("INFO: B-tree root page ID changed from %d to %d (Txn %d). Logged and flushed.", oldRootPageID, newRootPageID, txnID)
+	return nil
+}
+
+func (bt *BTree[K, V]) GetDiskManager() *DiskManager {
+	return bt.diskManager
+}
+
 func (bt *BTree[K, V]) FetchPage(pageID PageID) (*Page, error) {
 	return bt.bpm.FetchPage(pageID)
 }
@@ -485,12 +536,11 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		if err != nil {
 			return fmt.Errorf("failed to create first root page for insert: %w", err)
 		}
-		bt.rootPageID = rootPgID // Update tree's root reference
-		// Update header immediately so the root is persisted
-		if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader) { h.RootPageID = rootPgID; h.TreeSize = 0 }); err != nil {
+		// Use SetRootPageID to update and log the change
+		if err := bt.SetRootPageID(rootPgID, txnID); err != nil {
 			bt.bpm.UnpinPage(rootPgID, false)           // Unpin even on error
 			_ = bt.diskManager.DeallocatePage(rootPgID) // Try to free the orphaned page
-			return fmt.Errorf("failed to update header with new root page ID: %w", err)
+			return fmt.Errorf("failed to set initial root page ID: %w", err)
 		}
 		rootNode := &Node[K, V]{pageID: rootPgID, isLeaf: true, tree: bt, keys: make([]K, 0), values: make([]V, 0), childPageIDs: make([]PageID, 0)}
 		// TODO: WAL Log creation of new root page with TxnID
@@ -513,14 +563,12 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		}
 
 		oldRootPageID := bt.rootPageID // Store old root ID
-		bt.rootPageID = newRootPageID  // Update tree's root to the new page ID
-
-		// Update file header with the new root page ID
-		if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader) { h.RootPageID = newRootPageID }); err != nil {
+		// Use SetRootPageID to update and log the change
+		if err := bt.SetRootPageID(newRootPageID, txnID); err != nil {
 			bt.bpm.UnpinPage(rootPage.GetPageID(), false)        // Unpin old root
 			bt.bpm.UnpinPage(newRootDiskPage.GetPageID(), false) // Unpin new root
 			_ = bt.diskManager.DeallocatePage(newRootPageID)     // Try to free orphaned new root page
-			return fmt.Errorf("failed to update header with new root page ID during split: %w", err)
+			return fmt.Errorf("failed to set new root page ID during split: %w", err)
 		}
 
 		// Create the new in-memory root node
@@ -842,19 +890,17 @@ func (bt *BTree[K, V]) Delete(key K, txnID uint64) error {
 		return fmt.Errorf("failed to fetch root page post-delete for root check: %w", fetchErr)
 	}
 
-	rootChanged := false
 	// Case: Root has 0 keys and is not a leaf (meaning it has only one child left after merges/deletions)
 	if len(currentRootNode.keys) == 0 && !currentRootNode.isLeaf {
 		if len(currentRootNode.childPageIDs) == 1 {
 			oldRootPageID := bt.rootPageID
-			bt.rootPageID = currentRootNode.childPageIDs[0] // The only child becomes the new root
-			log.Printf("DEBUG: Txn %d: Root %d has 0 keys and 1 child. New root is child %d.", txnID, oldRootPageID, bt.rootPageID)
+			newRootPageID := currentRootNode.childPageIDs[0] // The only child becomes the new root
+			log.Printf("DEBUG: Txn %d: Root %d has 0 keys and 1 child. New root is child %d.", txnID, oldRootPageID, newRootPageID)
 
-			// Update the file header with the new root PageID
-			if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader) { h.RootPageID = bt.rootPageID }); err != nil {
-				bt.rootPageID = oldRootPageID                        // Revert on error
+			// Use SetRootPageID to update and log the change
+			if err := bt.SetRootPageID(newRootPageID, txnID); err != nil {
 				bt.bpm.UnpinPage(currentRootPage.GetPageID(), false) // Unpin old root
-				return fmt.Errorf("failed to update header for new root after deletion: %w", err)
+				return fmt.Errorf("failed to set new root page ID after deletion: %w", err)
 			}
 			// TODO: Deallocate the oldRootPageID from disk using the free list manager
 			// This is critical to reclaim space.
@@ -862,7 +908,6 @@ func (bt *BTree[K, V]) Delete(key K, txnID uint64) error {
 				log.Printf("ERROR: Failed to deallocate old root page %d: %v", oldRootPageID, err)
 				// This is a soft error, but indicates a resource leak.
 			}
-			rootChanged = true
 		} else if len(currentRootNode.childPageIDs) == 0 {
 			// This state usually means the tree became completely empty (last key deleted from a root that was also a leaf).
 			// The root should remain a single empty leaf page. No change to bt.rootPageID needed if it's already pointing to this empty leaf.
@@ -872,7 +917,11 @@ func (bt *BTree[K, V]) Delete(key K, txnID uint64) error {
 	}
 
 	// Unpin the current (potentially new) root page. It's only dirty if its ID changed in the header.
-	unpinErr := bt.bpm.UnpinPage(currentRootPage.GetPageID(), rootChanged)
+	// The `SetRootPageID` already handles logging and updating the header.
+	// The `currentRootPage` might be the old root or the new one.
+	// If the root actually changed, `SetRootPageID` already flushed the log and updated the header.
+	// We just need to unpin this page if it was pinned by this function.
+	unpinErr := bt.bpm.UnpinPage(currentRootPage.GetPageID(), currentRootPage.IsDirty()) // Check if it's dirty before unpinning
 	if unpinErr != nil {
 		log.Printf("WARNING: Error unpinning root page %d after deletion check: %v", currentRootPage.GetPageID(), unpinErr)
 	}
@@ -1867,7 +1916,7 @@ type BTreeIterator[K any, V any] interface {
 }
 
 // bTreeIterator is the concrete implementation of BTreeIterator.
-type bTreeIterator[K any, V any] struct {
+type bTreeIterator[K, V any] struct {
 	tree              *BTree[K, V]
 	currentNode       *Node[K, V] // The current leaf node being iterated
 	currentPage       *Page       // The page object for currentNode (pinned and latched)
@@ -1962,15 +2011,14 @@ func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
 			key := iter.currentNode.keys[iter.currentKeyIdx]
 			value := iter.currentNode.values[iter.currentKeyIdx]
 			// Check if the current key is within the desired endKey range
-			if iter.tree.keyOrder(iter.startKey, key) >= 0 && iter.tree.keyOrder(key, iter.endKey) <= 0 { // key >= endKey and endKey is not zero value
+			if iter.tree.keyOrder(iter.startKey, key) <= 0 && iter.tree.keyOrder(key, iter.endKey) < 0 { // key >= startKey and key < endKey
+				iter.currentKeyIdx++ // Advance for next call
+				return key, value, true, nil
+			} else if iter.tree.keyOrder(key, iter.endKey) >= 0 { // Reached or exceeded endKey
 				iter.isExhausted = true // Reached or exceeded endKey
 				iter.Close()            // Release resources
 				return zeroK, zeroV, false, nil
 			}
-
-			// Return current key-value pair
-			iter.currentKeyIdx++ // Advance for next call
-			return key, value, true, nil
 		}
 
 		// Current node exhausted, move to the next leaf node

@@ -39,6 +39,7 @@ const (
 	LogRecordTypeCommitTxn // Transaction Commit record (final phase 2)
 	LogRecordTypeAbortTxn  // Transaction Abort record (final phase 2)
 	// --- END NEW ---
+	LogRecordTypeRootChange // NEW: Log record for B-tree root page ID change
 )
 
 // LogRecord represents a single entry in the Write-Ahead Log.
@@ -431,6 +432,20 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 					// TODO: Add cases for other LogRecordTypes (InsertKey, DeleteKey, NodeSplit, NodeMerge)
 					// These would require understanding the byte format within the page.
 					// For now, LogRecordTypeUpdate is a generic page overwrite.
+
+				case LogRecordTypeRootChange: // NEW: Handle root page ID changes during recovery
+					newRootPageID := PageID(binary.LittleEndian.Uint64(lr.NewData))
+					log.Printf("INFO: Recovery: Applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
+					if err := dm.UpdateHeaderField(func(h *DBFileHeader) {
+						h.RootPageID = newRootPageID
+					}); err != nil {
+						return fmt.Errorf("failed to update root page ID in header during recovery: %w", err)
+					}
+					// Also update the in-memory rootPageID of the BTree if it's directly accessible here.
+					// The BTree instance is passed to Recover, so we can set its rootPageID.
+					// This requires a setter on BTree or direct access.
+					// Assuming `dm` has a reference to the BTree or can update its root.
+					// For now, we'll rely on the BTree re-reading the header after recovery.
 				}
 			}
 			currentLocalOffset += LSN(lr.Size()) // Advance local offset

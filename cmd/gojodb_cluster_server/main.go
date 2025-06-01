@@ -2,7 +2,8 @@ package main
 
 import (
 	"bufio"
-	"encoding/json" // Needed for (de)serializing TransactionOperations
+	"encoding/binary" // Added for PageID serialization/deserialization
+	"encoding/json"   // Needed for (de)serializing TransactionOperations
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -249,12 +250,20 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
 					continue
 				}
 
+				// The 'page' is already pinned by FetchPage.
+				// Apply the new data.
+				page.Lock()              // Acquire X-latch for writing to the page
+				page.SetData(lr.NewData) // Overwrite page data with new data
+				page.SetDirty(true)      // Mark page as dirty
+				page.Unlock()            // Release X-latch
+
 				if errUnpin := rm.dbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
-					log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
+					log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after NEW_PAGE application: %v", page.GetPageID(), errUnpin)
 				}
 
+				// UNCOMMENT THIS LINE: Ensure the page is flushed to disk immediately.
 				if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
+					log.Printf("ERROR: ReplicationManager: Failed to flush page %d after NEW_PAGE application: %v", page.GetPageID(), errFlush)
 				}
 
 			case btree_core.LogRecordTypeUpdate:
@@ -279,45 +288,33 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
 					log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
 				}
 
-				// if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-				// 	log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
-				// }
+				// UNCOMMENT THIS LINE: Ensure the page is flushed to disk immediately.
+				if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
+				}
+
+			case btree_core.LogRecordTypeRootChange: // NEW: Handle root page ID changes
+				newRootPageID := btree_core.PageID(binary.LittleEndian.Uint64(lr.NewData))
+				log.Printf("INFO: ReplicationManager: Replica applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
+
+				// Update the B-tree's in-memory rootPageID
+				rm.dbInstance.SetRootPageID(newRootPageID, lr.TxnID) // Pass TxnID
+
+				// Update the disk header for persistence
+				if err := rm.dbInstance.GetDiskManager().UpdateHeaderField(func(h *btree_core.DBFileHeader) {
+					h.RootPageID = newRootPageID
+				}); err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to update disk header with new root page ID %d: %v", newRootPageID, err)
+				}
 
 			case btree_core.LogRecordTypePrepare:
-				log.Println("DEBUG Applying prepare page for: ", lr.PageID)
-				// Replica receives PREPARE. It should record this txn as PREPARED.
-				// This implies the replica should also have a transaction table.
-				// For V1, the original code just logs this. If the primary sends
-				// data modifications and then PREPARE, the replica needs to
-				// apply the data first, then update transaction state.
-				// Current implementation applies data first, then handles 2PC records.
 				log.Printf("DEBUG: ReplicationManager: Replica received PREPARE for Txn %d. (V1: no active processing beyond data apply)", lr.TxnID)
 			case btree_core.LogRecordTypeCommitTxn:
-				log.Println("DEBUG Applying commit page for: ", lr.PageID)
-				// Mark transaction as committed on replica if it has a transaction table.
 				log.Printf("DEBUG: ReplicationManager: Replica received COMMIT for Txn %d.", lr.TxnID)
 			case btree_core.LogRecordTypeAbortTxn:
-				log.Println("DEBUG Applying Abort for: ", lr.PageID)
-				// Mark transaction as aborted on replica. If undo is implemented, perform undo.
 				log.Printf("DEBUG: ReplicationManager: Replica received ABORT for Txn %d.", lr.TxnID)
-			case btree_core.LogRecordTypeInsertKey:
-				log.Println("DEBUG Applying Insert Key page for: ", lr.PageID)
-			case btree_core.LogRecordTypeDeleteKey:
-				log.Println("DEBUG Applying Delete key page for: ", lr.PageID)
-				// These are higher-level B-tree operations.
-				// In a full logical replication, we might replay these.
-				// But since we are getting page-level REDO logs (LogRecordTypeUpdate/NewPage),
-				// these high-level logs are mostly for debugging or logical undo/recovery.
-				// For physical REDO, we apply page-level changes directly.
-				log.Printf("WARNING: ReplicationManager: Received logical log record type %v (LSN %d). Applying physical page changes already handled by UPDATE/NEW_PAGE. Skipping.", lr.Type, lr.LSN)
-			case btree_core.LogRecordTypeNodeSplit:
-				log.Println("DEBUG Applying node split for: ", lr.PageID)
-			case btree_core.LogRecordTypeNodeMerge:
-				log.Println("DEBUG Node merge for: ", lr.PageID)
-				// These are structural changes.
-				// Physical REDO logs (UPDATE/NEW_PAGE) should cover the page content changes.
-				// If these logs are purely informational or for logical recovery, they might be skipped for physical replication.
-				log.Printf("WARNING: ReplicationManager: Received structural log record type %v (LSN %d). Applying physical page changes already handled by UPDATE/NEW_PAGE. Skipping.", lr.Type, lr.LSN)
+			case btree_core.LogRecordTypeInsertKey, btree_core.LogRecordTypeDeleteKey, btree_core.LogRecordTypeNodeSplit, btree_core.LogRecordTypeNodeMerge:
+				log.Printf("WARNING: ReplicationManager: Received structural/logical log record type %v (LSN %d). Physical page changes should already be covered by UPDATE/NEW_PAGE. Skipping.", lr.Type, lr.LSN)
 			default:
 				log.Printf("WARNING: ReplicationManager: Unhandled log record type %v during replay for LSN %d. Skipping.", lr.Type, lr.LSN)
 			}
@@ -801,22 +798,21 @@ func handleRequest(req Request) Response {
 		iterator, err := dbInstance.Iterator(req.StartKey, req.EndKey)
 		dbLock.RUnlock()
 		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("ABORT failed for Txn %d: %v", req.TxnID, err)}
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Failed to create iterator: %v", err)}
 		} else {
-			resp = Response{Status: "ABORTED", Message: fmt.Sprintf("Txn %d aborted.", req.TxnID)}
-		}
-		response := "Result: "
-		for {
-			key, val, isNext, err := iterator.Next()
-			if err != nil || !isNext {
-				log.Println("ITERATOR NEXT: ", isNext, err)
-				break
+			response := "Result: "
+			for {
+				key, val, isNext, iterErr := iterator.Next()
+				if iterErr != nil || !isNext {
+					log.Println("ITERATOR NEXT: ", isNext, iterErr)
+					break
+				}
+				response += "Key: " + key + " Value: " + val + "	"
+				log.Println("RESPONSE: ", response)
 			}
-			response += "Key: " + key + " Value: " + val + "	"
-			log.Println("RESPONSE: ", response)
+			resp = Response{Status: "OK", Message: response}
+			iterator.Close()
 		}
-		resp = Response{Status: "OK", Message: response}
-		iterator.Close()
 	case "DELETE":
 		dbLock.Lock()                               // Acquire write lock for DELETE
 		err = dbInstance.Delete(req.Key, req.TxnID) // Pass TxnID
