@@ -159,7 +159,7 @@ func handleRequest(req Request) Response {
 	switch req.Command {
 	case "PUT":
 		dbLock.Lock() // Acquire write lock for PUT
-		err = dbInstance.Insert(req.Key, req.Value)
+		err = dbInstance.Insert(req.Key, req.Value, 0)
 		dbLock.Unlock() // Release write lock
 		if err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT failed: %v", err)}
@@ -179,7 +179,7 @@ func handleRequest(req Request) Response {
 		}
 	case "DELETE":
 		dbLock.Lock() // Acquire write lock for DELETE
-		err = dbInstance.Delete(req.Key)
+		err = dbInstance.Delete(req.Key, 0)
 		dbLock.Unlock() // Release write lock
 		if err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE failed: %v", err)}

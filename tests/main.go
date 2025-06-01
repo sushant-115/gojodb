@@ -11,17 +11,17 @@ import (
 )
 
 // Helper function to create default serializers for int64 keys and string values
-func getDefaultSerializers() btree.KeyValueSerializer[int64, string] {
-	return btree.KeyValueSerializer[int64, string]{
-		SerializeKey:     btree.SerializeInt64,
-		DeserializeKey:   btree.DeserializeInt64,
+func getDefaultSerializers() btree.KeyValueSerializer[string, string] {
+	return btree.KeyValueSerializer[string, string]{
+		SerializeKey:     btree.SerializeString,
+		DeserializeKey:   btree.DeserializeString,
 		SerializeValue:   btree.SerializeString,
 		DeserializeValue: btree.DeserializeString,
 	}
 }
 
 // Function to print B-tree content for debugging
-func printBTreeContent(bt *btree.BTree[int64, string], name string) {
+func printBTreeContent(bt *btree.BTree[string, string], name string) {
 	fmt.Printf("\n--- %s B-Tree Content ---\n", name)
 	size, err := bt.GetSize()
 	if err != nil {
@@ -29,7 +29,6 @@ func printBTreeContent(bt *btree.BTree[int64, string], name string) {
 	} else {
 		fmt.Printf("Tree Size: %d\n", size)
 	}
-	fmt.Printf("%s\n", bt.String())
 	fmt.Printf("--------------------------\n")
 }
 
@@ -66,7 +65,7 @@ func main() {
 
 	// 2. Create a new B-tree database
 	fmt.Printf("\nAttempting to create a new B-tree at %s...\n", dbFilePath)
-	bt, err := btree.NewBTreeFile[int64, string](dbFilePath, degree, btree.DefaultKeyOrder[int64], kvSerializers, poolSize, pageSize, logManager)
+	bt, err := btree.NewBTreeFile[string, string](dbFilePath, degree, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager)
 	if err != nil {
 		log.Fatalf("Failed to create new B-tree file: %v", err)
 	}
@@ -75,20 +74,20 @@ func main() {
 
 	// 3. Insert some data
 	fmt.Println("\n--- Inserting data ---")
-	dataToInsert := map[int64]string{
-		10: "Value_10",
-		20: "Value_20",
-		5:  "Value_5",
-		15: "Value_15",
-		30: "Value_30",
-		25: "Value_25",
-		1:  "Value_1",
-		7:  "Value_7",
-		22: "Value_22",
-		18: "Value_18",
+	dataToInsert := map[string]string{
+		"10": "Value_10",
+		"20": "Value_20",
+		"5":  "Value_5",
+		"15": "Value_15",
+		"30": "Value_30",
+		"25": "Value_25",
+		"1":  "Value_1",
+		"7":  "Value_7",
+		"22": "Value_22",
+		"18": "Value_18",
 	}
 
-	keys := make([]int64, 0, len(dataToInsert))
+	keys := make([]string, 0, len(dataToInsert))
 	for k := range dataToInsert {
 		keys = append(keys, k)
 	}
@@ -97,7 +96,7 @@ func main() {
 	for _, k := range keys {
 		v := dataToInsert[k]
 		fmt.Printf("Inserting (%d, %s)...\n", k, v)
-		if err := bt.Insert(k, v); err != nil {
+		if err := bt.Insert(k, v, 0); err != nil {
 			log.Fatalf("Failed to insert key %d: %v", k, err)
 		}
 	}
@@ -106,7 +105,7 @@ func main() {
 
 	// 4. Search for data
 	fmt.Println("\n--- Searching for data ---")
-	keysToSearch := []int64{5, 15, 22, 99} // 99 should not be found
+	keysToSearch := []string{"5", "15", "22", "99"} // 99 should not be found
 	for _, k := range keysToSearch {
 		val, found, err := bt.Search(k)
 		if err != nil {
@@ -121,10 +120,10 @@ func main() {
 
 	// 5. Delete some data
 	fmt.Println("\n--- Deleting data ---")
-	keysToDelete := []int64{15, 5, 30, 2} // 2 should not be found for deletion
+	keysToDelete := []string{"5", "15", "22", "99"} // 2 should not be found for deletion
 	for _, k := range keysToDelete {
 		fmt.Printf("Deleting key %d...\n", k)
-		err := bt.Delete(k)
+		err := bt.Delete(k, 0)
 		if err != nil {
 			if err == btree.ErrKeyNotFound {
 				fmt.Printf("Key %d not found for deletion.\n", k)
@@ -139,16 +138,16 @@ func main() {
 
 	// 6. Verify deletions
 	fmt.Println("\n--- Verifying deletions ---")
-	keysToVerify := []int64{5, 15, 30, 10, 20}
+	keysToVerify := []string{"5", "15", "22", "99"}
 	for _, k := range keysToVerify {
 		_, found, err := bt.Search(k)
 		if err != nil {
 			log.Fatalf("Error verifying key %d: %v", k, err)
 		}
 		if found {
-			fmt.Printf("Verification for %d: STILL FOUND (Expected to be deleted: %t)\n", k, (k == 5 || k == 15 || k == 30))
+			fmt.Printf("Verification for %d: STILL FOUND (Expected to be deleted: %t)\n", k, (k == "5" || k == "15" || k == "30"))
 		} else {
-			fmt.Printf("Verification for %d: NOT FOUND (Expected to be deleted: %t)\n", k, (k == 5 || k == 15 || k == 30))
+			fmt.Printf("Verification for %d: NOT FOUND (Expected to be deleted: %t)\n", k, (k == "5" || k == "15" || k == "30"))
 		}
 	}
 
@@ -160,7 +159,7 @@ func main() {
 
 	// 8. Re-open the database, triggering recovery via LogManager
 	fmt.Printf("\nAttempting to re-open B-tree at %s with recovery...\n", dbFilePath)
-	btRecovered, err := btree.OpenBTreeFile[int64, string](dbFilePath, btree.DefaultKeyOrder[int64], kvSerializers, poolSize, pageSize, logManager)
+	btRecovered, err := btree.OpenBTreeFile[string, string](dbFilePath, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager)
 	if err != nil {
 		log.Fatalf("Failed to open existing B-tree file for recovery: %v", err)
 	}
@@ -169,19 +168,19 @@ func main() {
 	// 9. Verify state after recovery
 	printBTreeContent(btRecovered, "After Recovery")
 	fmt.Println("\n--- Verifying data consistency after recovery ---")
-	keysAfterRecovery := []int64{1, 7, 10, 18, 20, 22, 25, 5, 15, 30} // Check original, deleted, and remaining
+	keysAfterRecovery := []string{"1", "7", "10", "18", "20", "22", "25", "5", "15", "30"} // Check "original", deleted, and remaining
 	for _, k := range keysAfterRecovery {
 		val, found, err := btRecovered.Search(k)
 		if err != nil {
-			log.Fatalf("Error searching for key %d after recovery: %v", k, err)
+			log.Fatalf("Error searching for key %s after recovery: %v", k, err)
 		}
-		expectedFound := !(k == 5 || k == 15 || k == 30) // These keys were deleted
+		expectedFound := !(k == "5" || k == "15" || k == "30") // These keys were deleted
 		if found != expectedFound {
-			fmt.Printf("Recovery check for %d: Mismatch! Found: %t, Expected Found: %t\n", k, found, expectedFound)
+			fmt.Printf("Recovery check for %s: Mismatch! Found: %t, Expected Found: %t\n", k, found, expectedFound)
 		} else if found {
-			fmt.Printf("Recovery check for %d: OK. Found: %s\n", k, val)
+			fmt.Printf("Recovery check for %s: OK. Found: %s\n", k, val)
 		} else {
-			fmt.Printf("Recovery check for %d: OK. Not Found.\n", k)
+			fmt.Printf("Recovery check for %s: OK. Not Found.\n", k)
 		}
 	}
 
