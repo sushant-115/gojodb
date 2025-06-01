@@ -29,6 +29,13 @@ type Node[K any, V any] struct {
 	tree         *BTree[K, V] // Reference to the parent BTree for BPM/DiskManager access
 }
 
+// func NewNode(pageID PageID, data []byte) *Node[any, any] {
+// 	return &Node[any, any]{
+// 		pageID: pageID,
+// 		isLeaf: false,
+// 	}
+// }
+
 func (n *Node[K, V]) GetPageID() PageID {
 	return n.pageID
 }
@@ -131,6 +138,18 @@ func (n *Node[K, V]) serialize(page *Page, keySerializer func(K) ([]byte, error)
 	page.SetDirty(true)
 	return nil
 }
+
+// func (n *Node[K, V]) Deserialize(page *Page, keyDeserializer func([]byte) (K, error), valueDeserializer func([]byte) (V, error)) error {
+// 	return n.deserialize(page, keyDeserializer, valueDeserializer)
+// }
+
+// func (n *Node[K, V]) Keys() []K {
+// 	return n.keys
+// }
+
+// func (n *Node[K, V]) Values() []V {
+// 	return n.values
+// }
 
 // deserialize reads node data from the provided Page's data buffer and reconstructs the Node.
 // It also verifies the checksum.

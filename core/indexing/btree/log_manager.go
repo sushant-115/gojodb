@@ -58,18 +58,19 @@ type LogRecord struct {
 // It is responsible for appending log records, managing log segments,
 // ensuring durability, and providing a basic archiving mechanism.
 type LogManager struct {
-	logDir           string         // Directory where active log segments reside
-	archiveDir       string         // Directory for archived log segments
-	logFile          *os.File       // Current active log segment file handle
-	currentSegmentID uint64         // ID of the current active log segment
-	currentLSN       LSN            // The next LSN to be assigned (global, monotonically increasing)
-	buffer           *bytes.Buffer  // In-memory buffer for log records before flushing
-	mu               sync.Mutex     // Protects access to LogManager state (currentLSN, buffer, logFile, segmentID)
-	flushCond        *sync.Cond     // For signaling when buffer needs flushing (e.g., buffer is full)
-	bufferSize       int            // Maximum size of the in-memory buffer
-	segmentSizeLimit int64          // Maximum size of a single log segment file before rotation
-	stopChan         chan struct{}  // Channel to signal stopping the flusher goroutine
-	wg               sync.WaitGroup // WaitGroup for flusher goroutine
+	logDir                   string         // Directory where active log segments reside
+	archiveDir               string         // Directory for archived log segments
+	logFile                  *os.File       // Current active log segment file handle
+	currentSegmentID         uint64         // ID of the current active log segment
+	currentLSN               LSN            // The next LSN to be assigned (global, monotonically increasing)
+	currentSegmentFileOffset int64          // Current byte offset within the active log segment file
+	buffer                   *bytes.Buffer  // In-memory buffer for log records before flushing
+	mu                       sync.Mutex     // Protects access to LogManager state (currentLSN, buffer, logFile, segmentID)
+	flushCond                *sync.Cond     // For signaling when buffer needs flushing (e.g., buffer is full)
+	bufferSize               int            // Maximum size of the in-memory buffer
+	segmentSizeLimit         int64          // Maximum size of a single log segment file before rotation
+	stopChan                 chan struct{}  // Channel to signal stopping the flusher goroutine
+	wg                       sync.WaitGroup // WaitGroup for flusher goroutine
 
 	// --- NEW: Recovery State (for Analysis Pass) ---
 	// This would typically be part of a dedicated RecoveryManager,
@@ -132,7 +133,7 @@ func NewLogManager(logDir string, archiveDir string, bufferSize int, segmentSize
 	lm.wg.Add(1)
 	go lm.flusher()
 
-	log.Printf("INFO: LogManager initialized. Log directory: %s, Archive directory: %s, Current Segment ID: %d, Initial LSN: %d",
+	log.Printf("INFO: LogManager initialized. Log directory: %s, Archive directory: %s, Current Segment ID: %d, Initial Global LSN: %d",
 		logDir, archiveDir, lm.currentSegmentID, lm.currentLSN)
 	return lm, nil
 }
@@ -141,67 +142,80 @@ func NewLogManager(logDir string, archiveDir string, bufferSize int, segmentSize
 // or creates the first one if none exist. It sets lm.logFile, lm.currentSegmentID, and lm.currentLSN.
 // This method MUST be called with lm.mu locked.
 func (lm *LogManager) findOrCreateLatestLogSegment() error {
-	files, err := os.ReadDir(lm.logDir)
-	if err != nil {
-		return fmt.Errorf("failed to read log directory: %w", err)
+	var segmentFiles []struct {
+		path string
+		id   uint64
+		size int64
 	}
 
-	var latestSegmentID uint64 = 0
-	var latestLogFilePath string
-
-	// Find the highest existing segment ID
-	for _, file := range files {
-		if file.IsDir() {
-			continue
+	// 1. Collect all log segments (archived and active)
+	dirs := []string{lm.logDir, lm.archiveDir}
+	for _, dir := range dirs {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			return fmt.Errorf("failed to read directory %s: %w", dir, err)
 		}
-		if strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
-			parts := strings.Split(strings.TrimSuffix(file.Name(), ".log"), "_")
-			if len(parts) == 2 {
-				id, parseErr := strconv.ParseUint(parts[1], 10, 64)
-				if parseErr == nil && id > latestSegmentID {
-					latestSegmentID = id
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			if strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
+				parts := strings.Split(strings.TrimSuffix(file.Name(), ".log"), "_")
+				if len(parts) == 2 {
+					id, parseErr := strconv.ParseUint(parts[1], 10, 64)
+					if parseErr == nil {
+						info, _ := file.Info() // Get file info to read size
+						segmentFiles = append(segmentFiles, struct {
+							path string
+							id   uint64
+							size int64
+						}{filepath.Join(dir, file.Name()), id, info.Size()})
+					}
 				}
 			}
 		}
 	}
 
-	if latestSegmentID == 0 {
-		// No existing log segments, start with segment 1
-		lm.currentSegmentID = 1
-	} else {
-		// Continue with the latest found segment
-		lm.currentSegmentID = latestSegmentID
+	// Sort segments by their ID
+	sort.Slice(segmentFiles, func(i, j int) bool {
+		return segmentFiles[i].id < segmentFiles[j].id
+	})
+
+	var currentGlobalLSN LSN = 0
+	var latestActiveSegmentID uint64 = 0
+	var latestActiveSegmentSize int64 = 0
+
+	// 2. Calculate global LSN by summing sizes of all segments.
+	// Identify the latest segment that's still in the active log directory.
+	for _, seg := range segmentFiles {
+		// Sum up all segment sizes to determine the true current LSN
+		currentGlobalLSN += LSN(seg.size)
+		if filepath.Dir(seg.path) == lm.logDir {
+			latestActiveSegmentID = seg.id
+			latestActiveSegmentSize = seg.size
+		}
 	}
 
-	latestLogFilePath = lm.getLogSegmentPath(lm.currentSegmentID)
+	if latestActiveSegmentID == 0 {
+		// No existing log segments in logDir, start with segment 1
+		lm.currentSegmentID = 1
+		lm.currentLSN = 0 // Global LSN starts at 0 for the very first log record
+		lm.currentSegmentFileOffset = 0
+	} else {
+		lm.currentSegmentID = latestActiveSegmentID
+		lm.currentLSN = currentGlobalLSN                      // Set current LSN to the end of all existing segments
+		lm.currentSegmentFileOffset = latestActiveSegmentSize // Set initial offset in current segment
+	}
 
-	// Open the latest log segment for appending.
-	// If it's a new segment (currentSegmentID was incremented), it will be created.
-	// If it's an existing segment, it will be opened in append mode.
+	latestLogFilePath := lm.getLogSegmentPath(lm.currentSegmentID)
 	logFile, err := os.OpenFile(latestLogFilePath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		return fmt.Errorf("failed to open/create log segment %s: %w", latestLogFilePath, err)
 	}
 	lm.logFile = logFile
 
-	// Set current LSN based on the current size of the active log file.
-	// In a real system, LSNs would be recovered from a checkpoint or by scanning the log.
-	fileInfo, err := lm.logFile.Stat()
-	if err != nil {
-		lm.logFile.Close()
-		return fmt.Errorf("failed to stat active log file: %w", err)
-	}
-	// For simplicity, LSN is global byte offset.
-	// A more robust LSN would be (segment_id, offset_in_segment) or a global counter
-	// persisted in a superblock/checkpoint. Here, we assume LSN is a global counter
-	// and its value is the total bytes written across all segments.
-	// This simple LSN scheme is problematic for recovery if segments are deleted.
-	// A better LSN is a monotonically increasing counter persisted in a metadata file.
-	// For now, we'll derive it from the size of the *current* log file,
-	// implying LSNs are relative to the start of the current segment.
-	// This needs careful consideration for recovery.
-	lm.currentLSN = LSN(fileInfo.Size())
-	log.Printf("DEBUG: Active log segment: %s, Initial LSN for segment: %d", latestLogFilePath, lm.currentLSN)
+	log.Printf("DEBUG: LogManager: Initialized currentSegmentID: %d, Initial Global LSN: %d, Initial Segment File Offset: %d",
+		lm.currentSegmentID, lm.currentLSN, lm.currentSegmentFileOffset)
 
 	return nil
 }
@@ -218,7 +232,7 @@ func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
 	defer lm.mu.Unlock()
 
 	// Assign LSN and update current LSN
-	record.LSN = lm.currentLSN // LSN is relative to the start of the current segment for now
+	record.LSN = lm.currentLSN
 
 	// Serialize the log record
 	serializedRecord, err := record.Serialize()
@@ -226,9 +240,11 @@ func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
 		return InvalidLSN, fmt.Errorf("failed to serialize log record: %w", err)
 	}
 
+	recordSize := int64(len(serializedRecord))
+
 	// Check if record fits in buffer, if not, flush first
-	if lm.buffer.Len()+len(serializedRecord) > lm.bufferSize {
-		log.Printf("DEBUG: Log buffer full (%d bytes). Flushing before appending LSN %d.", lm.buffer.Len(), record.LSN)
+	if lm.buffer.Len()+int(recordSize) > lm.bufferSize {
+		log.Printf("DEBUG: Log buffer full (%d bytes). Flushing before appending Global LSN %d.", lm.buffer.Len(), record.LSN)
 		if err := lm.flushInternal(); err != nil {
 			return InvalidLSN, fmt.Errorf("failed to flush log buffer before append: %w", err)
 		}
@@ -236,24 +252,13 @@ func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
 
 	// Check if appending this record would exceed the segment size limit
 	// This check should happen *after* flushInternal to ensure the buffer is as empty as possible.
-	currentLogFileSize := int64(lm.buffer.Len()) // Data currently in buffer
-	if lm.logFile != nil {
-		fileInfo, statErr := lm.logFile.Stat()
-		if statErr == nil {
-			currentLogFileSize += fileInfo.Size() // Data already written to file
-		} else {
-			log.Printf("WARNING: Failed to stat log file for size check: %v", statErr)
-		}
-	}
-
-	if currentLogFileSize+int64(len(serializedRecord)) > lm.segmentSizeLimit {
+	// lm.currentSegmentFileOffset reflects bytes written to the *file* plus bytes in the *buffer*.
+	if lm.currentSegmentFileOffset+recordSize > lm.segmentSizeLimit {
 		log.Printf("INFO: Log segment %d reaching limit (%d bytes). Rolling to new segment.", lm.currentSegmentID, lm.segmentSizeLimit)
 		if err := lm.rollLogSegment(); err != nil {
 			return InvalidLSN, fmt.Errorf("failed to roll log segment before append: %w", err)
 		}
-		// After rolling, currentLSN is reset to 0 for the new segment.
-		// Re-assign LSN based on the new segment's start.
-		record.LSN = lm.currentLSN
+		// After rolling, currentSegmentFileOffset is reset to 0 for the new segment.
 	}
 
 	// Append to buffer
@@ -261,25 +266,28 @@ func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
 		return InvalidLSN, fmt.Errorf("failed to write record to log buffer: %w", err)
 	}
 
-	// Update current LSN by record size after successful append to buffer
-	lm.currentLSN += LSN(len(serializedRecord))
+	// Update global LSN and current segment file offset after successful append to buffer
+	lm.currentLSN += LSN(recordSize)
+	lm.currentSegmentFileOffset += recordSize
 
 	// Signal the flusher goroutine if the buffer is now full or close to full
 	if lm.buffer.Len() >= lm.bufferSize/2 { // Signal at half full to trigger proactive flushing
 		lm.flushCond.Signal()
 	}
+	if err := lm.flushInternal(); err != nil {
+		return InvalidLSN, fmt.Errorf("failed to flush log buffer before append: %w", err)
+	}
 
-	// --- NEW: Signal log stream readers that new log is ready ---
+	// Signal log stream readers that new log is ready
 	select {
 	case lm.newLogReady <- struct{}{}:
 		// Signal sent
 	default:
 		// Channel is full, reader is not ready, skip signal
 	}
-	// --- END NEW ---
 
-	log.Printf("DEBUG: Appended log record LSN %d (Type: %v, PageID: %d, Size: %d) to segment %d",
-		record.LSN, record.Type, record.PageID, len(serializedRecord), lm.currentSegmentID)
+	log.Printf("DEBUG: Appended log record Global LSN %d (Type: %v, PageID: %d, Size: %d) to segment %d, new segment offset %d",
+		record.LSN, record.Type, record.PageID, recordSize, lm.currentSegmentID, lm.currentSegmentFileOffset)
 	return record.LSN, nil
 }
 
@@ -297,62 +305,46 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 	lm.recoveryTxnStates = make(map[uint64]TransactionState)
 
 	// Collect all log segments (archived and active) in order.
-	var segmentPaths []string
-
-	// Add archived segments
-	archiveFiles, err := os.ReadDir(lm.archiveDir)
+	lm.mu.Lock()
+	segmentInfos, err := lm.getOrderedLogSegments()
+	lm.mu.Unlock()
 	if err != nil {
-		return fmt.Errorf("failed to read archive directory: %w", err)
+		return fmt.Errorf("failed to get ordered log segments for recovery: %w", err)
 	}
-	for _, file := range archiveFiles {
-		if !file.IsDir() && strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
-			segmentPaths = append(segmentPaths, filepath.Join(lm.archiveDir, file.Name()))
-		}
-	}
-
-	// Add active segments (from logDir)
-	logFiles, err := os.ReadDir(lm.logDir)
-	if err != nil {
-		return fmt.Errorf("failed to read log directory: %w", err)
-	}
-	for _, file := range logFiles {
-		if !file.IsDir() && strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
-			segmentPaths = append(segmentPaths, filepath.Join(lm.logDir, file.Name()))
-		}
-	}
-
-	// Sort segments by their ID to ensure correct replay order
-	sort.Slice(segmentPaths, func(i, j int) bool {
-		id1, _ := strconv.ParseUint(strings.TrimSuffix(strings.Split(filepath.Base(segmentPaths[i]), "_")[1], ".log"), 10, 64)
-		id2, _ := strconv.ParseUint(strings.TrimSuffix(strings.Split(filepath.Base(segmentPaths[j]), "_")[1], ".log"), 10, 64)
-		return id1 < id2
-	})
 
 	// --- Redo Pass (V1: Reapply changes from log) ---
-	var currentGlobalLSN LSN = 0 // Track global LSN for recovery progress (relative to start of logs being scanned)
-	for _, segmentPath := range segmentPaths {
-		log.Printf("INFO: Analyzing and Replaying from log segment: %s", segmentPath)
-		segmentFile, err := os.Open(segmentPath)
+	for _, segInfo := range segmentInfos {
+		log.Printf("INFO: Analyzing and Replaying from log segment: %s (ID: %d, Global LSN Range: %d-%d)", segInfo.path, segInfo.id, segInfo.startGlobalLSN, segInfo.endGlobalLSN)
+		segmentFile, err := os.Open(segInfo.path)
 		if err != nil {
-			return fmt.Errorf("failed to open log segment %s for recovery: %w", segmentPath, err)
+			return fmt.Errorf("failed to open log segment %s for recovery: %w", segInfo.path, err)
 		}
-		defer segmentFile.Close() // Close each segment file after processing
+		// No defer segmentFile.Close() here, close explicitly at end of loop iteration.
+		// For robustness, seek to where this segment starts if the file was opened for global LSN.
+		// Since we open each segment file individually, we read from its beginning.
 
 		reader := bufio.NewReader(segmentFile) // Use bufio.NewReader for efficient byte-by-byte reading
+		currentLocalOffset := LSN(0)           // Offset within the current segment file
+
 		for {
 			var lr LogRecord
-			// recordStartOffset := currentGlobalLSN // LSN of this record
-
 			// Read and deserialize a single log record
 			err := lm.readLogRecord(reader, &lr)
 			if err == io.EOF {
 				break // End of segment file
 			}
 			if err != nil {
-				log.Printf("ERROR: Failed to read log record from %s at offset %d: %v. Stopping recovery for this segment.", segmentPath, currentGlobalLSN, err)
+				log.Printf("ERROR: Failed to read log record from %s at offset %d: %v. Stopping recovery for this segment.", segInfo.path, currentLocalOffset, err)
 				// In a real system, this might indicate a corrupted log or truncated record.
 				// We might try to skip to the next segment or require manual intervention.
 				break
+			}
+
+			// Ensure the LSN in the record matches what we expect from segment order.
+			// This check is mainly for debugging if LSNs are inconsistent.
+			expectedGlobalLSN := segInfo.startGlobalLSN + currentLocalOffset
+			if lr.LSN != expectedGlobalLSN {
+				log.Printf("WARNING: LSN mismatch during recovery! Record LSN: %d, Expected Global LSN: %d. Proceeding but investigate.", lr.LSN, expectedGlobalLSN)
 			}
 
 			// --- Analysis Pass Logic ---
@@ -401,7 +393,7 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 				if readErr != nil && lr.Type != LogRecordTypeNewPage {
 					log.Printf("WARNING: Failed to read page %d for recovery replay: %v. Skipping record LSN %d.", lr.PageID, readErr, lr.LSN)
 					// A real system might panic or require manual intervention here.
-					currentGlobalLSN += LSN(lr.Size()) // Advance LSN even on error
+					currentLocalOffset += LSN(lr.Size()) // Advance LSN even on error
 					continue
 				} else if readErr != nil && lr.Type == LogRecordTypeNewPage {
 					log.Printf("DEBUG: Page %d not found on disk, but it's a new page record. Will allocate if needed.", lr.PageID)
@@ -417,6 +409,8 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 						if writeErr := dm.WritePage(lr.PageID, emptyPage); writeErr != nil {
 							return fmt.Errorf("failed to re-allocate new page %d during recovery: %w", lr.PageID, writeErr)
 						}
+						// CRITICAL FIX: Invalidate the page in BufferPoolManager after writing it to disk
+						bpm.InvalidatePage(lr.PageID)
 						if lr.PageID >= PageID(dm.numPages) {
 							dm.numPages = uint64(lr.PageID) + 1
 						}
@@ -425,7 +419,10 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 						if writeErr := dm.WritePage(lr.PageID, lr.NewData); writeErr != nil {
 							return fmt.Errorf("failed to write new page data for %d during recovery: %w", lr.PageID, writeErr)
 						}
+						// CRITICAL FIX: Invalidate the page in BufferPoolManager after writing it to disk
+						bpm.InvalidatePage(lr.PageID)
 					}
+
 				case LogRecordTypeUpdate:
 					copy(pageData, lr.NewData) // Overwrite page data with new data
 					if writeErr := dm.WritePage(lr.PageID, pageData); writeErr != nil {
@@ -436,8 +433,9 @@ func (lm *LogManager) Recover(dm *DiskManager, bpm *BufferPoolManager, lastLSN L
 					// For now, LogRecordTypeUpdate is a generic page overwrite.
 				}
 			}
-			currentGlobalLSN += LSN(lr.Size()) // Advance global LSN
+			currentLocalOffset += LSN(lr.Size()) // Advance local offset
 		}
+		segmentFile.Close() // Explicitly close after processing
 	}
 
 	// --- Undo Pass (V1: Rollback uncommitted transactions) ---
@@ -567,132 +565,273 @@ func (lm *LogManager) Flush(targetLSN LSN) error {
 		}
 	}
 
-	log.Printf("DEBUG: LogManager flushed and synced all buffered data up to LSN %d (in segment %d).", lm.currentLSN, lm.currentSegmentID)
+	log.Printf("DEBUG: LogManager flushed and synced all buffered data up to Global LSN %d (in segment %d).", lm.currentLSN, lm.currentSegmentID)
 	return nil
+}
+
+// getOrderedLogSegments returns a sorted list of all log segments (active and archived)
+// along with their global LSN ranges.
+// This function should be called with lm.mu locked, or consider its own locking.
+func (lm *LogManager) getOrderedLogSegments() ([]struct {
+	path           string
+	id             uint64
+	size           int64
+	startGlobalLSN LSN
+	endGlobalLSN   LSN
+}, error) {
+	var segmentFiles []struct {
+		path string
+		id   uint64
+		size int64
+	}
+
+	dirs := []string{lm.logDir, lm.archiveDir}
+	for _, dir := range dirs {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
+		}
+		for _, file := range files {
+			if !file.IsDir() && strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
+				parts := strings.Split(strings.TrimSuffix(file.Name(), ".log"), "_")
+				if len(parts) == 2 {
+					id, parseErr := strconv.ParseUint(parts[1], 10, 64)
+					if parseErr == nil {
+						info, _ := file.Info()
+						segmentFiles = append(segmentFiles, struct {
+							path string
+							id   uint64
+							size int64
+						}{filepath.Join(dir, file.Name()), id, info.Size()})
+					}
+				}
+			}
+		}
+	}
+
+	sort.Slice(segmentFiles, func(i, j int) bool {
+		return segmentFiles[i].id < segmentFiles[j].id
+	})
+
+	var orderedSegments []struct {
+		path           string
+		id             uint64
+		size           int64
+		startGlobalLSN LSN
+		endGlobalLSN   LSN
+	}
+	currentGlobalLSN := LSN(0)
+	for _, seg := range segmentFiles {
+		orderedSegments = append(orderedSegments, struct {
+			path           string
+			id             uint64
+			size           int64
+			startGlobalLSN LSN
+			endGlobalLSN   LSN
+		}{
+			path:           seg.path,
+			id:             seg.id,
+			size:           seg.size,
+			startGlobalLSN: currentGlobalLSN,
+			endGlobalLSN:   currentGlobalLSN + LSN(seg.size),
+		})
+		currentGlobalLSN += LSN(seg.size)
+	}
+	return orderedSegments, nil
 }
 
 // StartLogStream provides a channel to stream log records from a given LSN.
 // This is used by replication followers to catch up and stay in sync.
 func (lm *LogManager) StartLogStream(fromLSN LSN) (<-chan LogRecord, error) {
 	logStream := make(chan LogRecord)
-	currentGlobalLSN := LSN(0)
+
 	go func() {
-		defer close(logStream) // Ensure channel is closed when goroutine exits
+		defer close(logStream)
 
-		lm.mu.Lock()
-		// Determine the starting segment and offset
-		// This simplified LSN (offset within current file) means we need to re-scan from start
-		// for any LSN that might be in an older segment. A global LSN would be better.
-		// For now, we'll assume `fromLSN` is an offset within the current active log segment
-		// or the start of the first archived segment if it's very old.
-		// A robust system would use a log index to find the correct segment.
-
-		// For simplicity, we'll open the current active log file and seek.
-		// If fromLSN is very old, it might be in an archived segment.
-		// This V1 will only stream from the current active segment for simplicity.
-		// A full implementation would iterate through archived segments first.
-
-		// Open the current active log file for reading
-		logFileForRead, err := os.Open(lm.getLogSegmentPath(lm.currentSegmentID))
-		if err != nil {
-			log.Printf("ERROR: Failed to open active log segment for streaming: %v", err)
-			lm.mu.Unlock()
-			return
+		currentReaderGlobalLSN := fromLSN
+		var currentSegmentFile *os.File
+		var currentSegmentReader *bufio.Reader
+		var currentSegmentInfo struct { // Tracks the segment currently being read
+			path           string
+			id             uint64
+			size           int64
+			startGlobalLSN LSN
+			endGlobalLSN   LSN
 		}
-		defer logFileForRead.Close()
+		segmentIndex := -1 // Index into the orderedSegments slice
 
-		// Seek to the starting LSN
-		_, err = logFileForRead.Seek(int64(fromLSN), io.SeekStart)
-		if err != nil {
-			log.Printf("ERROR: Failed to seek log file to LSN %d for streaming: %v", fromLSN, err)
+		// Helper to open/re-open and seek the correct log segment
+		openAndSeekCorrectSegment := func() error {
+			if currentSegmentFile != nil {
+				currentSegmentFile.Close()
+				currentSegmentFile = nil
+			}
+
+			lm.mu.Lock()
+			orderedSegments, err := lm.getOrderedLogSegments() // This re-scans. For production, consider caching.
 			lm.mu.Unlock()
-			return
-		}
-		lm.mu.Unlock() // Release mutex while reading from file
+			if err != nil {
+				log.Printf("ERROR: Failed to get ordered log segments for streaming: %v", err)
+				return err
+			}
 
-		reader := bufio.NewReader(logFileForRead)
-
-		for {
-			var lr LogRecord
-			err := lm.readLogRecord(reader, &lr)
-			if err == io.EOF {
-				// Reached end of current file. Now wait for new appends.
-				lm.mu.Lock()
-				// Check if new data is in buffer
-				if lm.buffer.Len() > 0 {
-					// If there's data in buffer, flush it and try reading again.
-					// This is complex. A simpler approach for V1:
-					// Just wait for new appends to be flushed to disk.
-					log.Printf("DEBUG: Log stream reached end of file. Waiting for new appends from LSN %d.", lm.currentLSN)
-					lm.mu.Unlock() // Release lock before waiting on channel
-					select {
-					case <-lm.newLogReady:
-						// New log records are ready, re-acquire lock and try reading again.
-						lm.mu.Lock()
-						// Re-open/re-seek file to ensure we get new data
-						logFileForRead.Close() // Close old handle
-						logFileForRead, err = os.Open(lm.getLogSegmentPath(lm.currentSegmentID))
-						if err != nil {
-							log.Printf("ERROR: Failed to re-open active log segment for streaming after signal: %v", err)
-							lm.mu.Unlock()
-							return
-						}
-						_, err = logFileForRead.Seek(int64(lr.LSN)+int64(lr.Size()), io.SeekStart) // Seek past last read record
-						if err != nil {
-							log.Printf("ERROR: Failed to re-seek log file after signal: %v", err)
-							lm.mu.Unlock()
-							return
-						}
-						reader = bufio.NewReader(logFileForRead)
-						lm.mu.Unlock() // Release lock to allow other operations
-						continue       // Try reading again
-					case <-lm.stopChan:
-						log.Println("INFO: Log stream goroutine stopping due to stop signal.")
-						return
-					}
-				} else {
-					lm.mu.Unlock()
-					log.Printf("DEBUG: Log stream reached end of file. No new data in buffer. Waiting for signal.")
-					select {
-					case <-lm.newLogReady:
-						// New log records are ready, re-acquire lock and try reading again.
-						lm.mu.Lock()
-						logFileForRead.Close() // Close old handle
-						logFileForRead, err = os.Open(lm.getLogSegmentPath(lm.currentSegmentID))
-						if err != nil {
-							log.Printf("ERROR: Failed to re-open active log segment for streaming after signal: %v", err)
-							lm.mu.Unlock()
-							return
-						}
-						// Seek to the LSN of the last record read, or the beginning if this is the first record.
-						// This is tricky. A robust solution needs global LSNs for seeking across segments.
-						// For now, assume current LSN of the manager is the end of what's written.
-						_, err = logFileForRead.Seek(int64(currentGlobalLSN), io.SeekStart)
-						if err != nil {
-							log.Printf("ERROR: Failed to re-seek log file after signal: %v", err)
-							lm.mu.Unlock()
-							return
-						}
-						reader = bufio.NewReader(logFileForRead)
-						lm.mu.Unlock()
-						continue
-					case <-lm.stopChan:
-						log.Println("INFO: Log stream goroutine stopping due to stop signal.")
-						return
-					}
+			// Find the segment that contains currentReaderGlobalLSN
+			found := false
+			for i, seg := range orderedSegments {
+				if currentReaderGlobalLSN >= seg.startGlobalLSN && currentReaderGlobalLSN < seg.endGlobalLSN {
+					currentSegmentInfo = seg
+					segmentIndex = i
+					found = true
+					break
+				}
+				// Handle case where fromLSN is exactly at the end of a segment.
+				// This means we should start at the beginning of the *next* segment.
+				if currentReaderGlobalLSN == seg.endGlobalLSN && i+1 < len(orderedSegments) {
+					currentSegmentInfo = orderedSegments[i+1]
+					segmentIndex = i + 1
+					currentReaderGlobalLSN = currentSegmentInfo.startGlobalLSN // Adjust LSN to start of next segment
+					found = true
+					break
 				}
 			}
-			if err != nil {
-				log.Printf("ERROR: Failed to read log record during streaming: %v", err)
-				return
+
+			if !found {
+				// This can happen if fromLSN is past the end of all existing logs.
+				// In this case, we start waiting for new logs.
+				log.Printf("INFO: FromLSN %d is beyond current known log segments. Will wait for new logs.", fromLSN)
+				currentSegmentInfo.id = 0 // Mark as 'no active segment'
+				return nil
 			}
 
+			file, err := os.Open(currentSegmentInfo.path)
+			if err != nil {
+				log.Printf("ERROR: Failed to open log segment %s for streaming: %v", currentSegmentInfo.path, err)
+				return err
+			}
+			currentSegmentFile = file
+
+			offsetInSegment := int64(currentReaderGlobalLSN - currentSegmentInfo.startGlobalLSN)
+			_, err = currentSegmentFile.Seek(offsetInSegment, io.SeekStart)
+			if err != nil {
+				log.Printf("ERROR: Failed to seek log file %s to offset %d (Global LSN %d): %v", currentSegmentInfo.path, offsetInSegment, currentReaderGlobalLSN, err)
+				currentSegmentFile.Close()
+				currentSegmentFile = nil
+				return err
+			}
+			currentSegmentReader = bufio.NewReader(currentSegmentFile)
+			log.Printf("DEBUG: Log stream opened segment %d (%s) and sought to offset %d (Global LSN %d).",
+				currentSegmentInfo.id, filepath.Base(currentSegmentInfo.path), offsetInSegment, currentReaderGlobalLSN)
+			return nil
+		}
+
+		// Initial open and seek
+		if err := openAndSeekCorrectSegment(); err != nil {
+			return // Exit goroutine on initial failure
+		}
+
+		for {
 			select {
-			case logStream <- lr:
-				currentGlobalLSN += LSN(lr.Size())
 			case <-lm.stopChan:
 				log.Println("INFO: Log stream goroutine stopping due to stop signal.")
 				return
+			default:
+				// If no active segment, or already past the end of the last known segment, just wait.
+				if currentSegmentInfo.id == 0 {
+					log.Printf("DEBUG: Log stream waiting for new logs (no active segment or past known logs).")
+					select {
+					case <-lm.newLogReady:
+						// Try to open and seek again, as new logs might have appeared or segments rolled.
+						if err := openAndSeekCorrectSegment(); err != nil {
+							return
+						}
+						continue // Try reading again
+					case <-lm.stopChan:
+						log.Println("INFO: Log stream goroutine stopping due to stop signal while waiting for new logs.")
+						return
+					}
+				}
+
+				var lr LogRecord
+				readErr := lm.readLogRecord(currentSegmentReader, &lr)
+
+				if readErr == io.EOF {
+					log.Printf("DEBUG: Reached EOF for segment %d (Global LSN %d).", currentSegmentInfo.id, currentReaderGlobalLSN)
+
+					lm.mu.Lock()
+					orderedSegments, err := lm.getOrderedLogSegments()
+					lm.mu.Unlock()
+					if err != nil {
+						log.Printf("ERROR: Failed to get ordered log segments during EOF handling: %v", err)
+						return
+					}
+
+					// Check if there's a next segment to transition to
+					if segmentIndex+1 < len(orderedSegments) {
+						// Move to the next segment
+						currentSegmentInfo = orderedSegments[segmentIndex+1]
+						segmentIndex++
+						currentReaderGlobalLSN = currentSegmentInfo.startGlobalLSN // Reset LSN to start of new segment
+						log.Printf("INFO: Transitioning to next log segment %d (Global LSN from %d).", currentSegmentInfo.id, currentReaderGlobalLSN)
+						if err := openAndSeekCorrectSegment(); err != nil {
+							return
+						}
+						continue // Try reading from the new segment
+					} else {
+						// This was the last segment. Now wait for new appends to *this* segment or for a segment roll.
+						// Check if any new data has been written since last read in this segment.
+						lm.mu.Lock()
+						fileInfo, statErr := currentSegmentFile.Stat() // Stat the current segment file
+						lm.mu.Unlock()
+
+						if statErr == nil && LSN(fileInfo.Size()) > (currentReaderGlobalLSN-currentSegmentInfo.startGlobalLSN) {
+							// New data physically written to the *current* segment. Re-open/re-seek.
+							log.Printf("DEBUG: New data detected in current segment %d. Re-opening and re-seeking.", currentSegmentInfo.id)
+							if err := openAndSeekCorrectSegment(); err != nil {
+								return
+							}
+							continue // Try reading again immediately
+						} else if LSN(fileInfo.Size()) < (currentReaderGlobalLSN - currentSegmentInfo.startGlobalLSN) {
+							// This indicates a potential truncation or rollback, or the LSN is somehow invalid.
+							log.Printf("WARNING: Current reader LSN %d is past actual file size %d in segment %d. Re-seeking to end of file.",
+								currentReaderGlobalLSN, fileInfo.Size(), currentSegmentInfo.id)
+							// Reset currentReaderGlobalLSN to end of file and try to read from there.
+							currentReaderGlobalLSN = currentSegmentInfo.startGlobalLSN + LSN(fileInfo.Size())
+							if err := openAndSeekCorrectSegment(); err != nil {
+								return
+							}
+							continue
+						}
+
+						// No new data in current file, wait for signal.
+						log.Printf("DEBUG: Log stream reached end of last segment %d. Waiting for new appends.", currentSegmentInfo.id)
+						select {
+						case <-lm.newLogReady:
+							// New log records are ready, attempt to re-open and re-seek.
+							// It's possible a segment roll happened, so re-evaluate segments.
+							if err := openAndSeekCorrectSegment(); err != nil {
+								return
+							}
+							continue // Try reading again
+						case <-lm.stopChan:
+							log.Println("INFO: Log stream goroutine stopping due to stop signal while waiting for new logs at end of stream.")
+							return
+						}
+					}
+				}
+
+				if readErr != nil {
+					log.Printf("ERROR: Failed to read log record during streaming: %v", readErr)
+					return // Exit goroutine on unrecoverable error
+				}
+
+				// Successfully read a record, send it to the channel and update currentReaderGlobalLSN
+				select {
+				case logStream <- lr:
+					currentReaderGlobalLSN = lr.LSN + LSN(lr.Size())
+				case <-lm.stopChan:
+					log.Println("INFO: Log stream goroutine stopping because logStream send was blocked or stop signal received.")
+					return
+				}
 			}
 		}
 	}()
@@ -750,12 +889,8 @@ func (lm *LogManager) rollLogSegment() error {
 
 	// 4. Archive the just-closed log segment
 	oldSegmentPath := lm.getLogSegmentPath(lm.currentSegmentID)
-	archivePath := filepath.Join(lm.archiveDir, filepath.Base(oldSegmentPath)) // Copy to archive dir
+	archivePath := filepath.Join(lm.archiveDir, filepath.Base(oldSegmentPath))
 
-	// In a real system, this would be a robust copy operation to a separate,
-	// potentially remote, durable storage. For simplicity, we'll use os.Rename
-	// to simulate moving it, implying it's "archived" and no longer in the active log directory.
-	// Note: os.Rename will fail across different filesystems. A real archiver would copy then delete.
 	if err := os.Rename(oldSegmentPath, archivePath); err != nil {
 		return fmt.Errorf("failed to archive log segment %s to %s: %w", oldSegmentPath, archivePath, err)
 	}
@@ -769,7 +904,7 @@ func (lm *LogManager) rollLogSegment() error {
 		return fmt.Errorf("failed to open new log segment %s: %w", newSegmentPath, err)
 	}
 	lm.logFile = newLogFile
-	lm.currentLSN = 0 // Reset LSN for the new segment (LSN is now offset within segment)
+	lm.currentSegmentFileOffset = 0 // Reset offset for the new segment
 
 	log.Printf("INFO: Rolled to new log segment %d: %s", lm.currentSegmentID, newSegmentPath)
 	return nil
@@ -827,12 +962,22 @@ func (lm *LogManager) Close() error {
 
 	// Perform a final log segment roll to ensure all data is archived.
 	// This also handles the final flush and sync of the current segment.
-	if err := lm.rollLogSegment(); err != nil {
-		log.Printf("ERROR: Failed to perform final log segment roll on close: %v", err)
-		// Don't return here, try to close the file handle anyway.
+	// Only roll if there's data in the buffer or the current segment file is not empty.
+	if lm.buffer.Len() > 0 || (lm.logFile != nil && lm.currentSegmentFileOffset > 0) {
+		if err := lm.rollLogSegment(); err != nil {
+			log.Printf("ERROR: Failed to perform final log segment roll on close: %v", err)
+			// Don't return here, try to close the file handle anyway.
+		}
+	} else if lm.logFile != nil {
+		// If no data was written to the current segment, just close it if it's open.
+		// Avoid archiving an empty segment unless explicitly desired.
+		if err := lm.logFile.Close(); err != nil {
+			log.Printf("ERROR: Failed to close potentially empty log file on close: %v", err)
+		}
+		lm.logFile = nil
 	}
 
-	// The logFile should be nil after rollLogSegment.
+	// The logFile should be nil after rollLogSegment or direct close.
 	// If it's not nil (e.g., if rollLogSegment failed to close it), try to close it.
 	if lm.logFile != nil {
 		log.Printf("WARNING: Log file %s was not closed by rollLogSegment on close. Attempting to close now.", lm.getLogSegmentPath(lm.currentSegmentID))

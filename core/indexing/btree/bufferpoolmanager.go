@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"bytes"
 	"container/list" // For LRU
 	"fmt"
 	"log"
@@ -373,6 +374,13 @@ func (bpm *BufferPoolManager) FlushPage(pageID PageID) error {
 				log.Printf("ERROR: Failed to flush page %d: %v", pageID, err)
 				return err
 			}
+			dd := make([]byte, len(page.GetData()))
+			err := bpm.diskManager.ReadPage(page.GetPageID(), dd)
+			if err != nil {
+				log.Println("Error during read page: ", err)
+			}
+			log.Println("Page data and data read from disk is same? : ", bytes.Equal(page.GetData(), dd))
+
 			page.SetDirty(false) // Mark clean after successful flush
 		} else {
 			log.Printf("DEBUG: Page %d (frame %d) is clean, no flush needed.", pageID, frameIdx)
@@ -436,4 +444,42 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 	}
 	log.Println("DEBUG: Finished FlushAllPages.")
 	return firstErr
+}
+
+// InvalidatePage removes a page from the buffer pool's hash table,
+// forcing a fresh read from DiskManager on the next FetchPage.
+// It also ensures the page is unpinned and its frame is available for eviction.
+func (bpm *BufferPoolManager) InvalidatePage(pageID PageID) {
+	bpm.mu.Lock()
+	defer bpm.mu.Unlock()
+
+	if frameID, ok := bpm.pageTable[pageID]; ok {
+		// Ensure the page is unpinned so it can be evicted.
+		// For recovery, pages are typically not pinned during direct writes.
+		// If it's pinned by something else, this might indicate a logical error
+		// or a case where the page shouldn't be invalidated yet.
+		// For robustness, we forcefully unpin it here.
+		for bpm.pages[frameID].pinCount > 0 {
+			bpm.UnpinPage(pageID, false) // Unpin without marking dirty, as it's being invalidated
+		}
+
+		// Remove from page table
+		delete(bpm.pageTable, pageID)
+
+		// Reset page state in the frame to make it truly "invalid" and reusable.
+		// This also ensures the replacer can manage this frame.
+		bpm.pages[pageID].id = InvalidPageID
+		bpm.pages[pageID].isDirty = false
+		bpm.pages[pageID].pinCount = 0
+		bpm.pages[pageID].lsn = InvalidLSN
+
+		// Inform the replacer that this frame is now unpinned and available for eviction
+		// if it was previously pinned. Or if it was already unpinned, this is idempotent.
+		// This is important because the replacer holds state about pinned/unpinned frames.
+		bpm.UnpinPage(pageID, true)
+
+		log.Printf("DEBUG: Invalidated page %d (frame %d) from buffer pool.", pageID, frameID)
+	} else {
+		log.Printf("DEBUG: Attempted to invalidate page %d not found in buffer pool. No action taken.", pageID)
+	}
 }

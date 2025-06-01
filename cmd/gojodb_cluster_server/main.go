@@ -68,6 +68,7 @@ type Request struct {
 	TxnID    uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
 	StartKey string // For range query
 	EndKey   string // For range query
+
 }
 
 // Response represents a server's reply to a client request.
@@ -114,7 +115,7 @@ func NewReplicationManager(nodeID string, lm *btree_core.LogManager, db *btree_c
 		lastSentLSN:           make(map[string]btree_core.LSN),
 		stopChan:              make(chan struct{}),
 		storageNodeAddresses:  make(map[string]string),
-		replicationListenPort: "9115",
+		replicationListenPort: os.Getenv("REPLICATION_LISTEN_PORT"),
 	}
 }
 
@@ -193,7 +194,7 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
 		default:
 			// Read and deserialize log record
 			var lr btree_core.LogRecord
-			err := rm.logManager.ReadLogRecord(reader, &lr) // Assuming LogManager has a ReadLogRecord helper
+			err := rm.logManager.ReadLogRecord(reader, &lr)
 			if err == io.EOF {
 				log.Printf("INFO: ReplicationManager: Primary %s closed replication stream.", conn.RemoteAddr().String())
 				return
@@ -205,66 +206,118 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
 
 			log.Printf("DEBUG: ReplicationManager: Received log record LSN %d (Type: %v, Txn: %d, Page: %d) from Primary.",
 				lr.LSN, lr.Type, lr.TxnID, lr.PageID)
+			// var od any
+			// err = json.Unmarshal(lr.OldData, &od)
+			// if err != nil {
+			// 	log.Println("Unamrshal failed")
+			// }
+			// var nd any
+			// err = json.Unmarshal(lr.OldData, &nd)
+			// if err != nil {
+			// 	log.Println("Unamrshal failed")
+			// }
 
-			// --- Apply Log Record Locally (Redo Logic) ---
-			// This is similar to recovery's Redo Pass, but continuous.
-			// It should be idempotent.
-			rm.dbLock.Lock()                                      // Acquire DB write lock for applying replicated changes
-			pageData := make([]byte, rm.dbInstance.GetPageSize()) // Assuming GetPageSize is available on BTree
-
-			// Read page from disk (or get from BPM if already cached)
-			// For simplicity, we'll use DiskManager directly for now, bypassing BPM for direct application.
-			// In a real system, BPM would be used, but with specific flags to avoid pinning/LRU updates.
-			readErr := rm.dbInstance.ReadPage(lr.PageID, pageData)
-			if readErr != nil && lr.Type != btree_core.LogRecordTypeNewPage {
-				log.Printf("WARNING: ReplicationManager: Failed to read page %d for replay: %v. Skipping record LSN %d.", lr.PageID, readErr, lr.LSN)
-				rm.dbLock.Unlock()
-				continue
-			} else if readErr != nil && lr.Type == btree_core.LogRecordTypeNewPage {
-				log.Printf("DEBUG: ReplicationManager: Page %d not found on disk, but it's a new page record. Will allocate if needed.", lr.PageID)
-			}
+			// log.Println("Debug LogRecord: ", od, nd)
+			// Acquire global DB write lock for overall consistency, though page latches are more fine-grained.
+			// This lock will prevent concurrent client requests from interfering with replication application.
+			rm.dbLock.Lock()
 
 			switch lr.Type {
 			case btree_core.LogRecordTypeNewPage:
-				// Ensure the page exists on disk. If it was truncated, re-allocate.
-				if lr.PageID.GetID() >= rm.dbInstance.GetNumPages() { // Assuming numPages is public
-					log.Printf("INFO: ReplicationManager: Re-allocating page %d during replay.", lr.PageID)
+				log.Println("DEBUG Applying new page for: ", lr.PageID)
+				// Ensure the underlying disk space is allocated for this PageID if it's beyond current numPages.
+				// This is similar to LogManager.Recover's handling for NewPage.
+				if lr.PageID.GetID() >= rm.dbInstance.GetNumPages() {
+					log.Printf("INFO: ReplicationManager: Extending disk file for new page %d during replay.", lr.PageID)
 					emptyPage := make([]byte, rm.dbInstance.GetPageSize())
 					if writeErr := rm.dbInstance.WritePage(lr.PageID, emptyPage); writeErr != nil {
-						log.Printf("ERROR: ReplicationManager: Failed to re-allocate new page %d during replay: %v", lr.PageID, writeErr)
+						log.Printf("ERROR: ReplicationManager: Failed to allocate/write empty page %d on disk: %v", lr.PageID, writeErr)
 						rm.dbLock.Unlock()
 						continue
 					}
-					// Update DiskManager's numPages if this extended the file
+					// Update DiskManager's numPages
 					if lr.PageID >= btree_core.PageID(rm.dbInstance.GetNumPages()) {
 						rm.dbInstance.SetNumPages(uint64(lr.PageID) + 1)
 					}
 				}
-				if len(lr.NewData) > 0 { // Apply initial data if logged
-					if writeErr := rm.dbInstance.WritePage(lr.PageID, lr.NewData); writeErr != nil {
-						log.Printf("ERROR: ReplicationManager: Failed to write new page data for %d during replay: %v", lr.PageID, writeErr)
-						rm.dbLock.Unlock()
-						continue
-					}
-				}
-			case btree_core.LogRecordTypeUpdate:
-				copy(pageData, lr.NewData) // Overwrite page data with new data
-				if writeErr := rm.dbInstance.WritePage(lr.PageID, pageData); writeErr != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to write updated page %d during replay: %v", lr.PageID, writeErr)
+
+				// Now fetch the page into the buffer pool. It should exist on disk or be newly allocated.
+				page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
+				if fetchErr != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to fetch page %d from BPM for NEW_PAGE record after disk ensuring: %v", lr.PageID, fetchErr)
 					rm.dbLock.Unlock()
 					continue
 				}
+
+				if errUnpin := rm.dbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
+					log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
+				}
+
+				if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
+				}
+
+			case btree_core.LogRecordTypeUpdate:
+				log.Println("DEBUG Applying update page for: ", lr.PageID)
+				page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
+				if fetchErr != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to fetch page %d from BPM for UPDATE record: %v", lr.PageID, fetchErr)
+					rm.dbLock.Unlock()
+					continue
+				}
+
+				page.Lock()              // Acquire X-latch for writing
+				page.SetData(lr.NewData) // Overwrite page data with new data
+				page.SetDirty(true)
+				page.Unlock() // Release X-latch
+				// lsn, err := rm.logManager.Append(&lr)
+				// if err != nil {
+				// 	log.Println("ERROR: Update ReplicationManager: failed to append logrecord New Page.", err)
+				// }
+				// log.Println("Update Appened log record using LM. ", lsn)
+				if errUnpin := rm.dbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
+					log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
+				}
+
+				// if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
+				// 	log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
+				// }
+
 			case btree_core.LogRecordTypePrepare:
+				log.Println("DEBUG Applying prepare page for: ", lr.PageID)
 				// Replica receives PREPARE. It should record this txn as PREPARED.
-				// It doesn't need to acquire locks or re-run operations, just track state for recovery.
-				// This is complex. For V1, we'll just log it.
-				log.Printf("DEBUG: ReplicationManager: Replica received PREPARE for Txn %d. (V1: no active processing)", lr.TxnID)
+				// This implies the replica should also have a transaction table.
+				// For V1, the original code just logs this. If the primary sends
+				// data modifications and then PREPARE, the replica needs to
+				// apply the data first, then update transaction state.
+				// Current implementation applies data first, then handles 2PC records.
+				log.Printf("DEBUG: ReplicationManager: Replica received PREPARE for Txn %d. (V1: no active processing beyond data apply)", lr.TxnID)
 			case btree_core.LogRecordTypeCommitTxn:
-				// Replica receives COMMIT. It should mark this txn as COMMITTED.
+				log.Println("DEBUG Applying commit page for: ", lr.PageID)
+				// Mark transaction as committed on replica if it has a transaction table.
 				log.Printf("DEBUG: ReplicationManager: Replica received COMMIT for Txn %d.", lr.TxnID)
 			case btree_core.LogRecordTypeAbortTxn:
-				// Replica receives ABORT. It should mark this txn as ABORTED.
+				log.Println("DEBUG Applying Abort for: ", lr.PageID)
+				// Mark transaction as aborted on replica. If undo is implemented, perform undo.
 				log.Printf("DEBUG: ReplicationManager: Replica received ABORT for Txn %d.", lr.TxnID)
+			case btree_core.LogRecordTypeInsertKey:
+				log.Println("DEBUG Applying Insert Key page for: ", lr.PageID)
+			case btree_core.LogRecordTypeDeleteKey:
+				log.Println("DEBUG Applying Delete key page for: ", lr.PageID)
+				// These are higher-level B-tree operations.
+				// In a full logical replication, we might replay these.
+				// But since we are getting page-level REDO logs (LogRecordTypeUpdate/NewPage),
+				// these high-level logs are mostly for debugging or logical undo/recovery.
+				// For physical REDO, we apply page-level changes directly.
+				log.Printf("WARNING: ReplicationManager: Received logical log record type %v (LSN %d). Applying physical page changes already handled by UPDATE/NEW_PAGE. Skipping.", lr.Type, lr.LSN)
+			case btree_core.LogRecordTypeNodeSplit:
+				log.Println("DEBUG Applying node split for: ", lr.PageID)
+			case btree_core.LogRecordTypeNodeMerge:
+				log.Println("DEBUG Node merge for: ", lr.PageID)
+				// These are structural changes.
+				// Physical REDO logs (UPDATE/NEW_PAGE) should cover the page content changes.
+				// If these logs are purely informational or for logical recovery, they might be skipped for physical replication.
+				log.Printf("WARNING: ReplicationManager: Received structural log record type %v (LSN %d). Applying physical page changes already handled by UPDATE/NEW_PAGE. Skipping.", lr.Type, lr.LSN)
 			default:
 				log.Printf("WARNING: ReplicationManager: Unhandled log record type %v during replay for LSN %d. Skipping.", lr.Type, lr.LSN)
 			}
@@ -648,7 +701,7 @@ func parseRequest(raw string) (Request, error) {
 		req.Key = parts[1]
 	case "SIZE":
 		// No additional arguments needed
-		// --- NEW: 2PC Commands ---
+
 	case "GET_RANGE":
 		log.Println("RANGE QUERY: ", raw, parts)
 		if len(parts) < 2 {
@@ -656,6 +709,7 @@ func parseRequest(raw string) (Request, error) {
 		}
 		req.StartKey = parts[0]
 		req.EndKey = parts[1]
+
 	case "PREPARE":
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
@@ -740,6 +794,9 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "NOT_FOUND", Message: fmt.Sprintf("Key '%s' not found.", req.Key)}
 		}
 	case "GET_RANGE":
+		if strings.TrimSpace(req.StartKey) == "" || strings.TrimSpace(req.EndKey) == "" {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Invalid startKey = '%s'and endKey = '%s'", req.StartKey, req.EndKey)}
+		}
 		dbLock.RLock() // Abort releases locks, not acquires DB lock
 		iterator, err := dbInstance.Iterator(req.StartKey, req.EndKey)
 		dbLock.RUnlock()
