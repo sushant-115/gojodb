@@ -36,12 +36,12 @@ const (
 	storageNodeListenPort = "9000"      // Default listen port for Storage Node
 
 	// Controller interaction configuration
-	controllerHeartbeatTargetPort = 8086                   // Default UDP port on Controller for heartbeats
-	controllerHTTPAddresses       = "localhost:8080"       // Comma-separated list of Controller HTTP addresses
-	heartbeatInterval             = 5 * time.Second        // How often to send heartbeats
-	shardMapFetchInterval         = 10 * time.Second       // How often to fetch shard map
-	replicationStreamInterval     = 100 * time.Millisecond // How often primary checks for new logs to send
-	storageNodeDialTimeout        = 2 * time.Second        // Timeout for connecting to a storage node
+	controllerHeartbeatTargetPort = 8086             // Default UDP port on Controller for heartbeats
+	controllerHTTPAddresses       = "localhost:8080" // Comma-separated list of Controller HTTP addresses
+	heartbeatInterval             = 5 * time.Second  // How often to send heartbeats
+	shardMapFetchInterval         = 10 * time.Second // How often to fetch shard map
+	replicationStreamInterval     = 10 * time.Second // How often primary checks for new logs to send
+	storageNodeDialTimeout        = 2 * time.Second  // Timeout for connecting to a storage node
 )
 
 // Global database instance and its lock for simple concurrency control
@@ -323,6 +323,40 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
 	}
 }
 
+func getReplicaPort(replicaAddr string) (string, error) {
+	log.Println("Connecting to: ", replicaAddr)
+	conn, err := net.DialTimeout("tcp", replicaAddr, storageNodeDialTimeout)
+	replicaPort := replicationManager.replicationListenPort
+	if err != nil {
+		log.Printf("ERROR: ReplicationManager: Failed to connect to replica to get the port at %s: %v", replicaAddr, err)
+		return replicaPort, err
+	}
+	log.Println("Sending command to ", replicaAddr)
+	_, err = fmt.Fprint(conn, "SHOW CONFIG REPLICA_PORT \n")
+	if err != nil {
+		log.Printf("ERROR: ReplicationManager: Failed to send command to replica to get the port at %s: %v", replicaAddr, err)
+		return replicaPort, err
+	}
+	log.Println("Sent command to ", replicaAddr)
+	reader := bufio.NewReader(conn)
+	defer conn.Close()
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("ERROR: ReplicationManager: Failed to send command %v", err)
+		return replicaPort, err
+	}
+	log.Println("Read command from ", replicaAddr)
+	log.Println("Replica port: ", line)
+	parts := strings.Split(line, " ")
+	if len(parts) < 2 {
+		return replicaPort, err
+	}
+	if strings.TrimSpace(parts[0]) == "OK" {
+		replicaPort = strings.TrimSpace(parts[1])
+	}
+	return replicaPort, nil
+}
+
 // manageOutboundReplication identifies primary roles and streams logs to replicas.
 func (rm *ReplicationManager) manageOutboundReplication() {
 	defer rm.wg.Done()
@@ -356,6 +390,7 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 			// 3. For each primary slot, stream logs to its replicas
 			for rangeID, slotInfo := range currentPrimarySlots {
 				for _, replicaID := range slotInfo.ReplicaNodeIDs {
+					log.Println("Slot info for: ", rangeID, slotInfo)
 					// Get replica's address from storageNodeAddresses (from main's cache)
 					rm.storageNodeAddressesMu.RLock()
 					log.Println("DEBUG: storage nodes: ", rm.storageNodeAddresses)
@@ -372,8 +407,16 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 					conn, connExists := rm.replicaClients[replicaAddr]
 					if !connExists {
 						var err error
-						log.Println("Sending logstreams to: ", replicaAddr)
-						conn, err = net.DialTimeout("tcp", "localhost:9116", storageNodeDialTimeout)
+						replicaPort, err := getReplicaPort(replicaAddr)
+						if err != nil {
+							log.Println("Failed to get the replication port using default replication port: ", replicaPort)
+						}
+						if rm.replicationListenPort == replicaPort {
+							log.Println("Couldn't get the replica port: ", replicaPort)
+							replicaPort = "9116"
+						}
+						log.Println("Sending logstreams to: ", "localhost:"+replicaPort)
+						conn, err = net.DialTimeout("tcp", "localhost:"+replicaPort, storageNodeDialTimeout)
 						if err != nil {
 							log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
 							rm.primaryMu.Unlock()
@@ -382,11 +425,10 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 						rm.replicaClients[replicaAddr] = conn
 						rm.lastSentLSN[replicaAddr] = 0 // Start from beginning of log for new connection
 						log.Printf("INFO: ReplicationManager: Established new replication client connection to replica %s at %s.", replicaID, replicaAddr)
+						// Stream logs to this replica
+						go rm.streamLogsToReplica(conn, replicaAddr, replicaID)
 					}
 					rm.primaryMu.Unlock()
-
-					// Stream logs to this replica
-					rm.streamLogsToReplica(conn, replicaAddr, replicaID)
 				}
 			}
 		}
@@ -696,13 +738,19 @@ func parseRequest(raw string) (Request, error) {
 			return Request{}, fmt.Errorf("%s requires a key", command)
 		}
 		req.Key = parts[1]
+	case "SHOW":
+		if len(parts) < 3 {
+			return Request{}, fmt.Errorf("%s requires a key and value", command)
+		}
+		req.Key = parts[1]
+		req.Value = parts[2]
 	case "SIZE":
 		// No additional arguments needed
 
 	case "GET_RANGE":
 		log.Println("RANGE QUERY: ", raw, parts)
 		if len(parts) < 2 {
-			return Request{}, fmt.Errorf("Invalid range query")
+			return Request{}, fmt.Errorf("invalid range query, %s", req.Command)
 		}
 		req.StartKey = parts[0]
 		req.EndKey = parts[1]
@@ -870,6 +918,20 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("ABORT failed for Txn %d: %v", req.TxnID, err)}
 		} else {
 			resp = Response{Status: "ABORTED", Message: fmt.Sprintf("Txn %d aborted.", req.TxnID)}
+		}
+
+	case "SHOW":
+		switch req.Key {
+		case "CONFIG":
+			switch req.Value {
+			case "REPLICA_PORT":
+				resp = Response{Status: "OK", Message: fmt.Sprint(os.Getenv("REPLICATION_LISTEN_PORT"))}
+				log.Println("SHOW CONFIG REPLICA_PORT: ", resp)
+			default:
+				resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Value)}
+			}
+		default:
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Key)}
 		}
 	// --- END NEW ---
 	default:
