@@ -487,7 +487,7 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 					if !connExists {
 						var err error
 
-						idxConn, err = net.DialTimeout("tcp", "localhost:"+bTreeReplicaPort, storageNodeDialTimeout)
+						idxConn, err = net.DialTimeout("tcp", "localhost:"+idxReplicaPort, storageNodeDialTimeout)
 						if err != nil {
 							log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
 							rm.primaryMu.Unlock()
