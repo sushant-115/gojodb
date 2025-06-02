@@ -116,15 +116,6 @@ go mod tidy
 ```
 This will install the gojodb_cli, gojodb_standalone_server, gojodb_controller, gojodb_cluster_server, and various API server binaries into your Go GOPATH/bin directory.
 
-### **Running Standalone Server**
-
-For a quick start, you can run a single standalone DB server:
-```
-cd cmd/gojodb_standalone_server
-go run main.go
-```
-By default, it will listen on localhost:9090.
-
 ### **Running a Cluster**
 
 To run a full GojoDB cluster, you'll typically start the controller, followed by multiple DB servers, and then the API servers.
@@ -172,6 +163,30 @@ go run api/basic/main.go
 ```
   *You can start other API services similarly.*
 
+* **Configure the shard slots :**
+* For now we will configure storage_node_1 as primary and storage_node_2 as replica and configure only one slot range 0-1023
+```
+gojodb> admin assign_slot_range 0 1023 storage_node_1 storage_node_2
+Admin Response (Status: 200 OK): Slot range 0-1023 assigned to storage_node_1 successfully.
+gojodb> status
+Cluster Status (Status: 200 OK):
+GojoDB Controller Cluster Status:
+  - Controller: node1 (Addr: localhost:8080)
+    State: Leader, Leader: 127.0.0.1:8081
+  - Controller: node2 (Addr: localhost:8083)
+    State: Follower, Leader: 127.0.0.1:8081
+  - Controller: node3 (Addr: localhost:8085)
+    State: Follower, Leader: 127.0.0.1:8081
+
+Registered Storage Nodes (4):
+  - ID: storage_node_1, Addr: localhost:9090, Health: HEALTHY
+  - ID: storage_node_2, Addr: localhost:9091, Health: HEALTHY
+
+Slot Assignments (1 ranges):
+  - RangeID: 0-1023 (0-1023), Assigned To: storage_node_1, Status: active, Primary: storage_node_1, Replicas: storage_node_2
+gojodb>
+```
+If you have more replica you can configure it by just providing a comma-separated value like storage_node_2,storage_node_3,storage_node_4
 ## **Usage**
 
 You can interact with GojoDB using the CLI or by making HTTP requests to the API servers.
