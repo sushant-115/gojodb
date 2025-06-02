@@ -78,6 +78,11 @@ type Response struct {
 	Message string // Details or value for GET, or target node for REDIRECT
 }
 
+type Entry struct {
+	Key   string
+	Value string
+}
+
 type TransactionOperations struct {
 	Operations []btree_core.TransactionOperation `json:"operations"`
 }
@@ -841,22 +846,29 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Invalid startKey = '%s'and endKey = '%s'", req.StartKey, req.EndKey)}
 		}
 		dbLock.RLock() // Abort releases locks, not acquires DB lock
-		iterator, err := dbInstance.Iterator(req.StartKey, req.EndKey)
+		var iterator btree_core.BTreeIterator[string, string]
+		var err error
+		if req.StartKey == "*" || req.EndKey == "*" {
+			iterator, err = dbInstance.FullScan()
+		} else {
+			iterator, err = dbInstance.Iterator(req.StartKey, req.EndKey)
+		}
 		dbLock.RUnlock()
 		if err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Failed to create iterator: %v", err)}
 		} else {
-			response := "Result: "
+			var result []Entry
 			for {
 				key, val, isNext, iterErr := iterator.Next()
 				if iterErr != nil || !isNext {
 					log.Println("ITERATOR NEXT: ", isNext, iterErr)
 					break
 				}
-				response += "Key: " + key + " Value: " + val + "	"
-				log.Println("RESPONSE: ", response)
+				result = append(result, Entry{Key: key, Value: val})
+				log.Println("RESPONSE: ", result)
 			}
-			resp = Response{Status: "OK", Message: response}
+			b, _ := json.Marshal(result)
+			resp = Response{Status: "OK", Message: string(b)}
 			iterator.Close()
 		}
 	case "DELETE":

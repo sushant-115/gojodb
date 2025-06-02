@@ -427,6 +427,8 @@ func (bt *BTree[K, V]) updatePersistedSize(delta int64) error {
 		} else if delta < 0 {
 			// Ensure TreeSize doesn't underflow
 			if h.TreeSize >= uint64(-delta) {
+				h.TreeSize -= uint64(-delta)
+			} else {
 				h.TreeSize = 0 // Should not happen if logic is correct
 			}
 		}
@@ -1450,8 +1452,8 @@ func (bt *BTree[K, V]) borrowFromRightSibling(
 	// If children are not leaves, move the leftmost child pointer from right sibling to rightmost of child
 	if !childNode.isLeaf {
 		childPointerFromSibling := rightSiblingNode.childPageIDs[0]
-		childNode.childPageIDs = slices.Insert(childNode.childPageIDs, 0, childPointerFromSibling)
-		rightSiblingNode.childPageIDs = slices.Delete(rightSiblingNode.childPageIDs, 0, 1) // Remove first child pointer
+		childNode.childPageIDs = slices.Insert(childNode.childPageIDs, len(childNode.childPageIDs), childPointerFromSibling) // Append to end
+		rightSiblingNode.childPageIDs = slices.Delete(rightSiblingNode.childPageIDs, 0, 1)                                   // Remove first child pointer
 	}
 
 	// Move key/value from right sibling up to replace the old key in parent
@@ -1917,6 +1919,13 @@ type BTreeIterator[K any, V any] interface {
 	Close() error              // Releases any resources held by the iterator
 }
 
+// pathEntry represents a node and the index of the child taken to reach the next level.
+type pathEntry[K any, V any] struct {
+	node *Node[K, V]
+	page *Page // Pinned and latched page for this node
+	idx  int   // Index of the child that was followed to get to the next level
+}
+
 // bTreeIterator is the concrete implementation of BTreeIterator.
 type bTreeIterator[K, V any] struct {
 	tree              *BTree[K, V]
@@ -1926,26 +1935,31 @@ type bTreeIterator[K, V any] struct {
 	startKey          K
 	endKey            K
 	isExhausted       bool
-	initialSearchDone bool // Flag to indicate if initial search to startKey is complete
+	initialSearchDone bool              // Flag to indicate if initial search to startKey is complete
+	pathStack         []pathEntry[K, V] // Stack to keep track of the path from root to current leaf
+	isFullScan        bool              // NEW: Flag to indicate if this is a full scan (unbounded)
 }
 
 // Iterator returns a new BTreeIterator for the specified key range [startKey, endKey).
 // It acquires an S-latch on the root page and pins it.
 func (bt *BTree[K, V]) Iterator(startKey K, endKey K) (BTreeIterator[K, V], error) {
-	//var zeroK K
+	// var zeroK K
 	if bt.rootPageID == InvalidPageID {
 		return nil, errors.New("cannot create iterator on an empty B-tree")
 	}
 
 	iter := &bTreeIterator[K, V]{
-		tree:     bt,
-		startKey: startKey,
-		endKey:   endKey,
+		tree:       bt,
+		startKey:   startKey,
+		endKey:     endKey,
+		pathStack:  make([]pathEntry[K, V], 0), // Initialize empty stack
+		isFullScan: false,                      // Not a full scan
 	}
 
-	// Find the first leaf page containing or preceding startKey
-	node, page, err := bt.findLeafForIterator(bt.rootPageID, startKey)
+	// Find the first leaf page containing or preceding startKey and populate the path stack
+	node, page, err := bt.findLeafForIterator(bt.rootPageID, startKey, iter.pathStack)
 	if err != nil {
+		iter.Close() // Ensure any pinned pages from failed search are unpinned
 		return nil, fmt.Errorf("failed to find starting leaf for iterator: %w", err)
 	}
 	log.Println("Iterator Node: ", node.keys, node.values)
@@ -1956,8 +1970,19 @@ func (bt *BTree[K, V]) Iterator(startKey K, endKey K) (BTreeIterator[K, V], erro
 	idx, _ := slices.BinarySearchFunc(node.keys, startKey, bt.keyOrder)
 	iter.currentKeyIdx = idx
 
-	// If startKey is greater than all keys in the leaf, move to the next leaf
-	if idx == len(node.keys) {
+	// If startKey is greater than all keys in the leaf, or if the initial key is outside the range
+	// (e.g., startKey is greater than the largest key in the tree), move to the next leaf.
+	// This ensures we start at the first valid key in the range.
+	if iter.currentKeyIdx == len(node.keys) || (len(node.keys) > 0 && bt.keyOrder(node.keys[iter.currentKeyIdx], startKey) < 0) {
+		// If the binary search result `idx` is `len(node.keys)`, it means `startKey` is greater than all keys in this leaf.
+		// Or, if `startKey` is smaller than the key at `idx` but we need to ensure we start from `startKey` or greater.
+		// The `slices.BinarySearchFunc` returns the index to insert `startKey` to maintain sorted order.
+		// If `startKey` is greater than all keys, `idx` will be `len(node.keys)`.
+		// If `startKey` is exactly equal to `node.keys[idx]`, then `idx` is correct.
+		// If `startKey` is between `node.keys[idx-1]` and `node.keys[idx]`, then `idx` is correct.
+		// We need to ensure `currentKeyIdx` points to the first key >= `startKey`.
+		// The `slices.BinarySearchFunc` does this.
+		// If `idx` is `len(node.keys)`, it means `startKey` is larger than all keys in this leaf. We need to go to the next leaf.
 		if err := iter.moveToNextLeaf(); err != nil {
 			iter.Close() // Clean up if moving to next leaf fails
 			return nil, fmt.Errorf("failed to move to next leaf after initial search: %w", err)
@@ -1968,13 +1993,45 @@ func (bt *BTree[K, V]) Iterator(startKey K, endKey K) (BTreeIterator[K, V], erro
 	return iter, nil
 }
 
+// FullScan returns a new BTreeIterator configured to scan the entire B-tree.
+func (bt *BTree[K, V]) FullScan() (BTreeIterator[K, V], error) {
+	if bt.rootPageID == InvalidPageID {
+		return nil, errors.New("cannot create full scan iterator on an empty B-tree")
+	}
+
+	iter := &bTreeIterator[K, V]{
+		tree:       bt,
+		pathStack:  make([]pathEntry[K, V], 0),
+		isFullScan: true, // Mark as full scan
+	}
+
+	// Find the absolute leftmost leaf to start the full scan
+	node, page, err := bt.findLeftmostLeaf(bt.rootPageID, iter.pathStack)
+	if err != nil {
+		iter.Close() // Ensure any pinned pages from failed search are unpinned
+		return nil, fmt.Errorf("failed to find leftmost leaf for full scan: %w", err)
+	}
+
+	iter.currentNode = node
+	iter.currentPage = page
+	iter.currentKeyIdx = 0        // Start from the very first key in the leftmost leaf
+	iter.initialSearchDone = true // Initial search is done, we are at the beginning
+
+	return iter, nil
+}
+
 // findLeafForIterator recursively finds the leaf node where the iteration should start.
-// It uses read crabbing (S-latches).
-func (bt *BTree[K, V]) findLeafForIterator(pageID PageID, key K) (*Node[K, V], *Page, error) {
+// It uses read crabbing (S-latches) and populates the pathStack.
+func (bt *BTree[K, V]) findLeafForIterator(pageID PageID, key K, pathStack []pathEntry[K, V]) (*Node[K, V], *Page, error) {
 	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Add current node and its page to the path stack
+	// The index `idx` for this level will be determined in the recursive call.
+	// For now, push with a placeholder index. It will be updated by the caller.
+	pathStack = append(pathStack, pathEntry[K, V]{node: currNode, page: currPage, idx: -1})
 
 	if currNode.isLeaf {
 		return currNode, currPage, nil // Found the leaf
@@ -1983,6 +2040,9 @@ func (bt *BTree[K, V]) findLeafForIterator(pageID PageID, key K) (*Node[K, V], *
 	// Find the child to descend into
 	idx, _ := slices.BinarySearchFunc(currNode.keys, key, bt.keyOrder)
 	childPageID := currNode.childPageIDs[idx]
+
+	// Update the index in the last path entry for the current node
+	pathStack[len(pathStack)-1].idx = idx
 
 	// Read crabbing: Acquire S-latch on child before releasing S-latch on parent
 	// The fetchNode for child will acquire S-latch on child.
@@ -1993,7 +2053,8 @@ func (bt *BTree[K, V]) findLeafForIterator(pageID PageID, key K) (*Node[K, V], *
 		// Proceed, but log the warning.
 	}
 
-	return bt.findLeafForIterator(childPageID, key) // Recursive call
+	// Pass the updated pathStack to the recursive call
+	return bt.findLeafForIterator(childPageID, key, pathStack) // Recursive call
 }
 
 // Next returns the next key-value pair in the iteration.
@@ -2005,22 +2066,52 @@ func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
 	if iter.isExhausted {
 		return zeroK, zeroV, false, ErrIteratorInvalid
 	}
-	//log.Println("NEXT ITERATOR: ", iter.currentNode.keys, iter.currentNode.values, iter.currentKeyIdx)
-	// Ensure current node is valid and within range
-	for iter.currentNode != nil {
-		// Check if current key index is valid within the node
-		if iter.currentKeyIdx < len(iter.currentNode.keys) {
+
+	for {
+		// Check if current node is valid and has more keys to process
+		if iter.currentNode == nil {
+			// This can happen if moveToNextLeaf failed or was called when no more leaves exist
+			iter.isExhausted = true
+			iter.Close()
+			return zeroK, zeroV, false, nil
+		}
+
+		// Process keys in the current leaf node
+		for iter.currentKeyIdx < len(iter.currentNode.keys) {
 			key := iter.currentNode.keys[iter.currentKeyIdx]
 			value := iter.currentNode.values[iter.currentKeyIdx]
-			// Check if the current key is within the desired endKey range
-			if iter.tree.keyOrder(iter.startKey, key) <= 0 && iter.tree.keyOrder(key, iter.endKey) < 0 { // key >= startKey and key < endKey
+
+			// If it's a full scan, just return the key/value
+			if iter.isFullScan {
 				iter.currentKeyIdx++ // Advance for next call
 				return key, value, true, nil
-			} else if iter.tree.keyOrder(key, iter.endKey) >= 0 { // Reached or exceeded endKey
-				iter.isExhausted = true // Reached or exceeded endKey
-				iter.Close()            // Release resources
+			}
+
+			// For bounded scans, check if the current key is within the desired endKey range
+			// The condition is `key >= startKey` and `key < endKey`.
+			// `iter.tree.keyOrder(key, iter.endKey) < 0` means `key < endKey`.
+			// `iter.tree.keyOrder(key, iter.startKey) >= 0` means `key >= startKey`.
+			if iter.tree.keyOrder(key, iter.endKey) < 0 { // key < endKey
+				// If initial search is done, we only need to check against endKey.
+				// Otherwise, we need to ensure key is >= startKey.
+				if iter.initialSearchDone && iter.tree.keyOrder(key, iter.startKey) >= 0 {
+					iter.currentKeyIdx++ // Advance for next call
+					return key, value, true, nil
+				} else if !iter.initialSearchDone { // This branch should ideally not be hit if initial search is done correctly
+					// This means we are still in the process of finding the first valid key.
+					// If key is within range, advance and return.
+					if iter.tree.keyOrder(key, iter.startKey) >= 0 {
+						iter.currentKeyIdx++
+						return key, value, true, nil
+					}
+				}
+			} else {
+				// Reached or exceeded endKey. Exhaust the iterator.
+				iter.isExhausted = true
+				iter.Close()
 				return zeroK, zeroV, false, nil
 			}
+			iter.currentKeyIdx++ // Move to the next key in the current node if the current one was skipped (e.g., < startKey)
 		}
 
 		// Current node exhausted, move to the next leaf node
@@ -2029,49 +2120,132 @@ func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
 			iter.Close()
 			return zeroK, zeroV, false, fmt.Errorf("failed to move to next leaf: %w", err)
 		}
-	}
 
-	// Iterator exhausted
-	iter.isExhausted = true
-	iter.Close()
-	return zeroK, zeroV, false, nil
+		// After moving to the next leaf, reset currentKeyIdx to 0 for the new leaf
+		iter.currentKeyIdx = 0
+	}
 }
 
 // moveToNextLeaf moves the iterator to the next leaf node in the B-tree.
+// It uses the path stack to traverse up and then down to the next leaf.
 // It handles releasing the latch on the current page and acquiring on the next.
 func (iter *bTreeIterator[K, V]) moveToNextLeaf() error {
-	// Release latch on current page before moving
+	// Unpin the current leaf page
 	if iter.currentPage != nil {
-		iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false) // Unpin current page
-		iter.currentPage = nil
-		iter.currentNode = nil
-	}
-
-	// In a B-tree, leaf nodes are often linked. If not, we need to traverse up and down.
-	// For simplicity, this implementation assumes a "next sibling" pointer or re-traverses.
-	// A proper B+Tree would have next/prev leaf pointers for efficient range scans.
-	// For a pure B-tree, moving to the "next leaf" means finding the smallest key
-	// in the rightmost child of the lowest common ancestor. This is complex.
-	// For now, let's simplify: this iterator only works for a single leaf node's range.
-	// To truly implement full range scans, you'd need to add `nextLeafPageID` to Node struct
-	// or implement a stack-based traversal (more complex for recovery/crash safety).
-	log.Printf("DEBUG: Iterator exhausted current leaf. No next leaf pointer for full range scan.")
-	iter.isExhausted = true
-	return nil
-}
-
-// Close releases any resources held by the iterator, specifically unpinning the current page.
-func (iter *bTreeIterator[K, V]) Close() error {
-	if iter.currentPage != nil {
-		err := iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false) // Unpin the page
-		if err != nil {
-			log.Printf("WARNING: Error closing iterator, failed to unpin page %d: %v", iter.currentPage.GetPageID(), err)
-			return fmt.Errorf("failed to close iterator cleanly: %w", err)
+		if err := iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false); err != nil {
+			log.Printf("WARNING: Error unpinning current page %d during moveToNextLeaf: %v", iter.currentPage.GetPageID(), err)
+			// Continue, but log the error
 		}
 		iter.currentPage = nil
 		iter.currentNode = nil
 	}
+
+	// Traverse up the path stack to find the next available child
+	for len(iter.pathStack) > 0 {
+		// Pop the current entry from the stack
+		lastEntryIdx := len(iter.pathStack) - 1
+		currentParentEntry := iter.pathStack[lastEntryIdx]
+		iter.pathStack = iter.pathStack[:lastEntryIdx] // Pop
+
+		// Get the parent node and its page (which should still be pinned from findLeafForIterator or previous moveToNextLeaf)
+		parentNode := currentParentEntry.node
+		parentPage := currentParentEntry.page
+		childIdx := currentParentEntry.idx
+
+		// Check if there's a next sibling child
+		if childIdx+1 < len(parentNode.childPageIDs) {
+			// Found a next sibling. Descend into it.
+			nextChildPageID := parentNode.childPageIDs[childIdx+1]
+
+			// Unpin the parent page (read crabbing) before fetching the next child
+			if err := iter.tree.bpm.UnpinPage(parentPage.GetPageID(), false); err != nil {
+				log.Printf("WARNING: Error unpinning parent page %d before descending to next child: %v", parentPage.GetPageID(), err)
+				// Continue, but log
+			}
+
+			// Find the leftmost leaf in the subtree rooted at nextChildPageID
+			newNode, newPage, err := iter.tree.findLeftmostLeaf(nextChildPageID, iter.pathStack)
+			if err != nil {
+				return fmt.Errorf("failed to find leftmost leaf from child %d: %w", nextChildPageID, err)
+			}
+			iter.currentNode = newNode
+			iter.currentPage = newPage
+			iter.currentKeyIdx = 0 // Start from the beginning of the new leaf
+			return nil             // Successfully moved to next leaf
+		} else {
+			// No more children at this level for the current parent.
+			// Unpin the parent page as we are done with it.
+			if err := iter.tree.bpm.UnpinPage(parentPage.GetPageID(), false); err != nil {
+				log.Printf("WARNING: Error unpinning parent page %d after exhausting children: %v", parentPage.GetPageID(), err)
+			}
+			// Continue loop to go up to the next parent
+		}
+	}
+
+	// Stack is empty, no more leaves to visit.
+	iter.isExhausted = true
+	return nil
+}
+
+// findLeftmostLeaf recursively finds the leftmost leaf node in the subtree rooted at pageID.
+// It populates the pathStack as it descends.
+func (bt *BTree[K, V]) findLeftmostLeaf(pageID PageID, pathStack []pathEntry[K, V]) (*Node[K, V], *Page, error) {
+	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Add current node and its page to the path stack. Index is always 0 for leftmost descent.
+	pathStack = append(pathStack, pathEntry[K, V]{node: currNode, page: currPage, idx: 0})
+
+	if currNode.isLeaf {
+		return currNode, currPage, nil // Found the leftmost leaf
+	}
+
+	childPageID := currNode.childPageIDs[0] // Always take the leftmost child
+
+	// Read crabbing: Acquire S-latch on child before releasing S-latch on parent
+	if err := bt.bpm.UnpinPage(currPage.GetPageID(), false); err != nil {
+		log.Printf("WARNING: Error unpinning page %d during findLeftmostLeaf: %v", currPage.GetPageID(), err)
+	}
+
+	// Recursive call
+	return bt.findLeftmostLeaf(childPageID, pathStack)
+}
+
+// Close releases any resources held by the iterator, specifically unpinning all pages in the path stack and the current page.
+func (iter *bTreeIterator[K, V]) Close() error {
+	var firstErr error
+
+	// Unpin the current page if it's still pinned
+	if iter.currentPage != nil {
+		if err := iter.tree.bpm.UnpinPage(iter.currentPage.GetPageID(), false); err != nil {
+			log.Printf("WARNING: Error closing iterator, failed to unpin current page %d: %v", iter.currentPage.GetPageID(), err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		iter.currentPage = nil
+		iter.currentNode = nil
+	}
+
+	// Unpin all pages in the path stack
+	for i := len(iter.pathStack) - 1; i >= 0; i-- {
+		entry := iter.pathStack[i]
+		if entry.page != nil {
+			if err := iter.tree.bpm.UnpinPage(entry.page.GetPageID(), false); err != nil {
+				log.Printf("WARNING: Error closing iterator, failed to unpin page %d from stack: %v", entry.page.GetPageID(), err)
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+			iter.pathStack[i].page = nil // Clear reference
+			iter.pathStack[i].node = nil // Clear reference
+		}
+	}
+	iter.pathStack = nil // Clear the stack
+
 	iter.isExhausted = true
 	log.Println("DEBUG: BTreeIterator closed.")
-	return nil
+	return firstErr
 }
