@@ -20,17 +20,17 @@ The primary goals for GojoDB are:
 * **Horizontal Scalability:** All components, including ingestors, queriers, control plane, and storage engine, are designed to scale out.  
 * **Granular Resource Management:**  
   * **Per-Query Control:** Implement mechanisms for managing resources consumed by individual queries, including query prioritization, throttling, and admission control to prevent system overload.  
-  * **User-Level Quotas:** Enforce resource quotas (e.g., storage, compute, request rates) for different users or tenants to ensure fair usage and prevent abuse.  
+  * **User-Level Quotas:** Enforce resource quotas (e.g., storage, compute, request rates) for different users or tenants to ensure fair usage and prevent abuse.  (Work in progress)
 * **High Availability:** Eliminate single points of failure and ensure continuous operation.  
 * **Sharding:** Automatic data distribution across multiple nodes for performance and capacity.  
 * **Persistence:** Durable storage of data.  
-* **Security:** Robust security mechanisms including encryption and access control.  
-* **Encryption:** Support for data encryption at rest and in transit.  
+* **Security:** Robust security mechanisms including encryption and access control.  (Work in progress)
+* **Encryption:** Support for data encryption at rest and in transit.  (Work in progress)
 * **GraphQL Support:** Native support for GraphQL queries.  
-* **Data Lifecycle Management:**  
+* **Data Lifecycle Management:**  (Work in progress)
   * **Archival:** Mechanisms for moving data to cold storage.  
   * **Restore:** Reliable data restoration capabilities.  
-* **External Storage Integration:** Support for reading data from object stores like S3.  
+* **External Storage Integration:** Support for reading data from object stores like S3.  (Work in progress)
 * **Fault Tolerance:** Resilience against network partitions and node failures, potentially leveraging mechanisms like 3-Phase Commit for critical operations.
 
 ## **High-Level Design**
@@ -74,20 +74,16 @@ The project is organized into several key directories:
 
 ```
 gojodb/  
-├── api/             # API microservices (GraphQL, reads, writes, bulk, aggregation)  
-├── cmd/             # Main application entry points (controller, server, CLI)  
+├── api/
+    |---basic
+    |--- graphql             # API microservices (GraphQL, reads, writes, bulk, aggregation)  
+├── cmd/
+    |--- cli
+    |---- controller
+    |----Storage service             # Main application entry points (controller, server, CLI)  
 ├── config/          # Configuration files  
-├── core/            # Core database engine components  
-│   ├── controller/  
-│   ├── resource_management/ # Logic for query throttling, user quotas, admission control  
-│   │   ├── admission_control/  
-│   │   ├── query_throttling/  
-│   │   └── user_quotas/  
-│   ├── storage_engine/  
-│   ├── query_engine/  
-│   ├── write_engine/  
+├── core/            # Core database engine components     
 │   ├── indexing/  
-│   └── sharding/  
 ├── data_management/ # Tools for archival, restore, migration, backup  
 ├── docs/            # Project documentation  
 ├── examples/        # Example client applications  
