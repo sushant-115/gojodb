@@ -1,6 +1,9 @@
 # **# **GojoDB - A Universal, Horizontally Scalable Database****
 
-GojoDB is a distributed key-value database designed for high availability, fault tolerance, and efficient data retrieval, particularly for text-based content. It features built-in log replication, tiered storage management, and an inverted indexing system for fast full-text search capabilities.
+GojoDB is an ambitious project to build a universal database designed for extreme extensibility, horizontal scalability, and robust resource management. It aims to provide high availability and fault tolerance for modern data-intensive applications. It is a distributed key-value database designed for high availability, fault tolerance, and efficient data retrieval, particularly for text-based content. It features built-in log replication, tiered storage management, and an inverted indexing system for fast full-text search capabilities.
+
+Milestone Plan: https://docs.google.com/document/d/1h7EVUI1Cq3jjjEcOZ7-OIjjvjgEIi4mn-BAsKBBYFE4/edit?usp=sharing
+High level and low level design: https://docs.google.com/document/d/1kh8X3yKDaBk03Aa7z_Pp-rm8j2Sb-1Z8Owm_eKGecxY/edit?usp=sharing
 
 ## **Table of Contents**
 
