@@ -247,8 +247,8 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 				return
 			}
 
-			log.Printf("DEBUG: ReplicationManager: Received log record LSN %d (Type: %v, Txn: %d, Page: %d) from Primary.",
-				lr.LSN, lr.Type, lr.TxnID, lr.PageID)
+			log.Printf("DEBUG: ReplicationManager: Received log record LSN %d (Type: %v, Txn: %d, Page: %d) from Primary (%s) ",
+				lr.LSN, lr.Type, lr.TxnID, lr.PageID, conn.RemoteAddr().String())
 
 			// Differentiate between B-tree and Inverted Index log records
 			if logType == LOG_INVERTED_INDEX {
@@ -379,21 +379,21 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 }
 
 func getReplicaPort(replicaAddr string) (string, string, error) {
-	log.Println("Connecting to: ", replicaAddr)
+	// log.Println("Connecting to: ", replicaAddr)
 	conn, err := net.DialTimeout("tcp", replicaAddr, storageNodeDialTimeout)
-	bTreeReplicaPort := replicationManager.replicationBTreeListenPort
-	idxReplicaPort := replicationManager.replicationInvertedIndexListenPort
+	bTreeReplicaPort := ""
+	idxReplicaPort := ""
 	if err != nil {
 		log.Printf("ERROR: ReplicationManager: Failed to connect to replica to get the port at %s: %v", replicaAddr, err)
 		return bTreeReplicaPort, idxReplicaPort, err
 	}
-	log.Println("Sending command to ", replicaAddr)
+	// log.Println("Sending command to ", replicaAddr)
 	_, err = fmt.Fprint(conn, "SHOW CONFIG REPLICA_PORT \n")
 	if err != nil {
 		log.Printf("ERROR: ReplicationManager: Failed to send command to replica to get the port at %s: %v", replicaAddr, err)
 		return bTreeReplicaPort, idxReplicaPort, err
 	}
-	log.Println("Sent command to ", replicaAddr)
+	// log.Println("Sent command to ", replicaAddr)
 	reader := bufio.NewReader(conn)
 	defer conn.Close()
 	line, err := reader.ReadString('\n')
@@ -401,8 +401,8 @@ func getReplicaPort(replicaAddr string) (string, string, error) {
 		log.Printf("ERROR: ReplicationManager: Failed to send command %v", err)
 		return bTreeReplicaPort, idxReplicaPort, err
 	}
-	log.Println("Read command from ", replicaAddr)
-	log.Println("Replica port: ", line)
+	// log.Println("Read command from ", replicaAddr)
+	// log.Println("Replica port: ", line)
 	parts := strings.Split(line, " ")
 	if len(parts) < 3 {
 		return bTreeReplicaPort, idxReplicaPort, err
@@ -465,7 +465,7 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 					if rm.replicationBTreeListenPort == bTreeReplicaPort || rm.replicationInvertedIndexListenPort == idxReplicaPort {
 						log.Println("Couldn't get the replica port: ", bTreeReplicaPort, idxReplicaPort)
 					}
-					log.Println("Sending logstreams to: ", "localhost:"+bTreeReplicaPort, " for Btree and to localhost:"+idxReplicaPort, " for InvertedIdx")
+					// log.Println("Sending logstreams to: ", "localhost:"+bTreeReplicaPort, " for Btree and to localhost:"+idxReplicaPort, " for InvertedIdx")
 					rm.primaryMu.Lock()
 					bTreeConn, connExists := rm.replicaClients[replicaAddr+"_btree_conn"]
 					if !connExists {
@@ -1164,7 +1164,7 @@ func handleRequest(req Request) Response {
 			switch req.Value {
 			case "REPLICA_PORT":
 				resp = Response{Status: "OK", Message: fmt.Sprint(os.Getenv("BTREE_REPLICATION_LISTEN_PORT") + " " + os.Getenv("INVERTED_IDX_REPLICATION_LISTEN_PORT"))}
-				log.Println("SHOW CONFIG REPLICA_PORT: ", resp)
+				// log.Println("SHOW CONFIG REPLICA_PORT: ", resp)
 			default:
 				resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Value)}
 			}
@@ -1180,7 +1180,7 @@ func handleRequest(req Request) Response {
 // handleConnection manages a single client connection.
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-	log.Printf("INFO: Client connected to Storage Node %s: %s", myStorageNodeID, conn.RemoteAddr().String())
+	// log.Printf("INFO: Client connected to Storage Node %s: %s", myStorageNodeID, conn.RemoteAddr().String())
 
 	reader := bufio.NewReader(conn)
 	for {
@@ -1188,7 +1188,7 @@ func handleConnection(conn net.Conn) {
 		netData, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				log.Printf("INFO: Client disconnected from Storage Node %s: %s", myStorageNodeID, conn.RemoteAddr().String())
+				// log.Printf("INFO: Client disconnected from Storage Node %s: %s", myStorageNodeID, conn.RemoteAddr().String())
 			} else {
 				log.Printf("ERROR: Error reading from client %s: %v", conn.RemoteAddr().String(), err)
 			}
@@ -1199,7 +1199,7 @@ func handleConnection(conn net.Conn) {
 		if rawCommand == "" {
 			continue // Ignore empty lines
 		}
-		log.Printf("DEBUG: Received command from %s: '%s'", conn.RemoteAddr().String(), rawCommand)
+		// log.Printf("DEBUG: Received command from %s: '%s'", conn.RemoteAddr().String(), rawCommand)
 
 		// Parse request
 		req, err := parseRequest(rawCommand)

@@ -326,6 +326,7 @@ func (s *APIService) getStorageNodeConn(nodeAddr string) (net.Conn, error) {
 					s.storageNodeHealthMu.Unlock()
 					return nil // Return nil if connection failed
 				}
+				//conn = setConnDeadline(conn)
 				return conn
 			},
 		}
@@ -340,7 +341,10 @@ func (s *APIService) getStorageNodeConn(nodeAddr string) (net.Conn, error) {
 		// For now, assume it's alive. Real system would do more robust health checks.
 		// If it's not alive, pool.Get() might return nil or a closed connection.
 		// We rely on the health monitor to mark nodes unhealthy.
-		return conn.(net.Conn), nil
+		if isConnWritable(conn.(net.Conn)) {
+			return conn.(net.Conn), nil
+		}
+
 	}
 
 	// If pool.Get() returned nil (meaning New failed), try creating a fresh connection
@@ -355,6 +359,18 @@ func (s *APIService) getStorageNodeConn(nodeAddr string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to get or create connection to %s: %w", nodeAddr, err)
 	}
 	return directConn, nil
+}
+
+func isConnWritable(conn net.Conn) bool {
+	err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+	if err != nil {
+		return false
+	}
+	_, err = conn.Write([]byte{})
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 // returnStorageNodeConn returns a connection to its pool.
@@ -553,6 +569,12 @@ func (s *APIService) handleClusterStatus(w http.ResponseWriter, r *http.Request)
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, responseBuilder.String())
+}
+
+func setConnDeadline(conn net.Conn) net.Conn {
+	conn.SetReadDeadline(time.Now().Add(CLIENT_TIMEOUT))
+	conn.SetWriteDeadline(time.Now().Add(CLIENT_TIMEOUT))
+	return conn
 }
 
 // getResponsibleNodesForSlot returns a list of healthy storage node addresses responsible for a given slot.
