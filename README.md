@@ -197,7 +197,7 @@ You can interact with GojoDB using the CLI or by making HTTP requests to the API
 
 **Using the CLI:**
 
-# Assuming gojodb_cli is in your PATH and connected to an API server (e.g., localhost:8080)  
+# Cli Tool  
 ```
 go run cmd/gojodb_cli/main.go
 
