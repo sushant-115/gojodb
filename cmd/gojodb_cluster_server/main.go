@@ -16,10 +16,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm"                    // FSM package for sharding info
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree"               // B-tree core package
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"                 // NEW: Inverted Index package
 	replication "github.com/sushant-115/gojodb/core/replication/log_replication" // B-tree core package
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"          // FSM package for sharding info
 )
 
 const (

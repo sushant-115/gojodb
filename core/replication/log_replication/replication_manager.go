@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm"
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 )
 
 const (
