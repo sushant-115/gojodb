@@ -135,35 +135,32 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 			}
 
 			headerPage.Lock() // Acquire X-latch
-			headerBytes, marshalErr := json.Marshal(idx.header)
-			if marshalErr != nil {
+
+			buf := new(bytes.Buffer)
+			if err := binary.Write(buf, binary.LittleEndian, &idx.header); err != nil {
 				headerPage.Unlock()
 				idx.bpm.UnpinPage(newPageID, false) // Unpin without marking dirty
 				idx.bpm.FlushAllPages()
 				idx.dm.Close()
 				idx.lm.Close()
-				return nil, fmt.Errorf("failed to serialize initial inverted index header: %w", marshalErr)
+				return nil, fmt.Errorf("failed to serialize initial inverted index header: %w", err)
 			}
-			// Ensure the header fits within the page
-			if len(headerBytes) > invertedIndexPageSize {
+			// Ensure the buffer length matches the header size
+			if buf.Len() != 128 { // Use the explicit header size
 				headerPage.Unlock()
 				idx.bpm.UnpinPage(newPageID, false)
 				idx.bpm.FlushAllPages()
 				idx.dm.Close()
 				idx.lm.Close()
-				return nil, fmt.Errorf("serialized initial header too large for a single page (%d bytes)", len(headerBytes))
+				return nil, fmt.Errorf("inverted index header serialization size mismatch! Expected %d bytes, got %d bytes", 128, buf.Len())
 			}
-			copy(headerPage.GetData(), headerBytes)
-			for i := len(headerBytes); i < invertedIndexPageSize; i++ { // Pad the rest of the page with zeros
-				headerPage.GetData()[i] = 0
-			}
+			copy(headerPage.GetData(), buf.Bytes())
 			headerPage.SetDirty(true)
 			headerPage.Unlock()
 			if err := idx.bpm.UnpinPage(newPageID, true); err != nil { // Unpin and mark dirty
 				log.Printf("WARNING: Failed to unpin header page %d after initial write: %v", newPageID, err)
 			}
 			log.Printf("INFO: Initial inverted index header written to new file %s.", filePath)
-
 		} else {
 			// Some other error occurred trying to open the existing file
 			idx.bpm.FlushAllPages() // Clean up BPM
@@ -234,12 +231,13 @@ func (idx *InvertedIndex) readHeader() error {
 	page.RLock() // Acquire S-latch on the page
 	defer page.RUnlock()
 
-	// The header is stored as JSON within the page
-	if err := json.Unmarshal(page.GetData()[:128], &idx.header); err != nil { // Assuming header is first 128 bytes
+	// Deserialize header using binary.Read
+	buf := bytes.NewReader(page.GetData()[:128]) // Read exactly 128 bytes
+	if err := binary.Read(buf, binary.LittleEndian, &idx.header); err != nil {
 		return fmt.Errorf("failed to deserialize inverted index header: %w", err)
 	}
 	log.Printf("DEBUG: Inverted index header read. Magic: 0x%x, Version: %d, LastLSN: %d",
-		idx.header.Magic, idx.header.Version, idx.header.LastLSN)
+		idx.header.Magic, idx.header.Version, idx.header.LastLSN) // Corrected log line
 	return nil
 }
 
@@ -254,21 +252,19 @@ func (idx *InvertedIndex) writeHeader() error {
 	page.Lock() // Acquire X-latch on the page
 	defer page.Unlock()
 
-	// Serialize header to JSON
-	headerBytes, err := json.Marshal(idx.header)
-	if err != nil {
+	// Serialize header using binary.Write
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, &idx.header); err != nil {
 		return fmt.Errorf("failed to serialize inverted index header: %w", err)
 	}
-	if len(headerBytes) > 128 {
-		return fmt.Errorf("serialized header too large (%d bytes) for 128-byte header space", len(headerBytes))
+
+	// Ensure the buffer length matches the header size
+	if buf.Len() != 128 {
+		return fmt.Errorf("inverted index header serialization size mismatch! Expected %d bytes, got %d bytes.", 128, buf.Len())
 	}
 
-	// Copy to page data and pad with zeros
-	copy(page.GetData(), headerBytes)
-	for i := len(headerBytes); i < 128; i++ {
-		page.GetData()[i] = 0 // Pad with zeros
-	}
-	page.SetDirty(true) // Mark the page dirty
+	copy(page.GetData(), buf.Bytes()) // Copy serialized bytes to page data
+	page.SetDirty(true)               // Mark the page dirty
 
 	log.Printf("DEBUG: Inverted index header written. Magic: 0x%x, Version: %d, LastLSN: %d",
 		idx.header.Magic, idx.header.Version, idx.header.LastLSN)
