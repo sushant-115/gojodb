@@ -18,6 +18,7 @@ import (
 
 	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm"      // FSM package for sharding info
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree" // B-tree core package
+	"github.com/sushant-115/gojodb/core/indexing/inverted_index"   // NEW: Inverted Index package
 )
 
 const (
@@ -42,13 +43,18 @@ const (
 	shardMapFetchInterval         = 10 * time.Second // How often to fetch shard map
 	replicationStreamInterval     = 10 * time.Second // How often primary checks for new logs to send
 	storageNodeDialTimeout        = 2 * time.Second  // Timeout for connecting to a storage node
+
+	// GOJODB.TEXT() wrapper prefix
+	gojoDBTextPrefix = "GOJODB.TEXT("
+	gojoDBTextSuffix = ")"
 )
 
 // Global database instance and its lock for simple concurrency control
 var (
-	dbInstance *btree_core.BTree[string, string] // Using string keys now
-	dbLock     sync.RWMutex                      // Global lock for the entire B-Tree operations
-	logManager *btree_core.LogManager
+	dbInstance            *btree_core.BTree[string, string] // Using string keys now
+	dbLock                sync.RWMutex                      // Global lock for the entire B-Tree operations
+	logManager            *btree_core.LogManager
+	invertedIndexInstance *inverted_index.InvertedIndex // NEW: Global inverted index instance
 
 	// Storage Node identity
 	myStorageNodeID   string
@@ -69,7 +75,7 @@ type Request struct {
 	TxnID    uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
 	StartKey string // For range query
 	EndKey   string // For range query
-
+	Query    string // NEW: For text search queries
 }
 
 // Response represents a server's reply to a client request.
@@ -502,9 +508,12 @@ func initStorageNode() error {
 	}
 
 	// Adjust dbFilePath to be unique per storage node
-	uniqueDbFilePath := fmt.Sprintf("data/%s_gojodb_shard.db", myStorageNodeID)
-	uniqueLogDir := fmt.Sprintf("data/%s_logs", myStorageNodeID)
-	uniqueArchiveDir := fmt.Sprintf("data/%s_archives", myStorageNodeID)
+	uniqueDbFilePath := fmt.Sprintf("data/%s/%s_gojodb_shard.db", myStorageNodeID, myStorageNodeID)
+	uniqueLogDir := fmt.Sprintf("data/%s/%s_logs", myStorageNodeID, myStorageNodeID)
+	uniqueArchiveDir := fmt.Sprintf("data/%s/%s_archives", myStorageNodeID, myStorageNodeID)
+	uniqueInvertedIndexFilePath := fmt.Sprintf("data/%s/%s_inverted_index.json", myStorageNodeID, myStorageNodeID) // NEW: Inverted index file path
+	uniqueInvertedLogDir := fmt.Sprintf("data/%s/%s_inverted_logs", myStorageNodeID, myStorageNodeID)
+	uniqueInvertedArchiveDir := fmt.Sprintf("data/%s/%s_inverted_archives", myStorageNodeID, myStorageNodeID)
 
 	// 2. Initialize LogManager for this Storage Node
 	logManager, err = btree_core.NewLogManager(uniqueLogDir, uniqueArchiveDir, logBufferSize, logSegmentSize)
@@ -555,7 +564,14 @@ func initStorageNode() error {
 	}
 	log.Printf("INFO: Storage Node %s database initialized successfully. Root PageID: %d", myStorageNodeID, dbInstance.GetRootPageID())
 
-	// 4. Initialize local shard map cache
+	// NEW: 4. Initialize Inverted Index for this Storage Node
+	invertedIndexInstance, err = inverted_index.NewInvertedIndex(uniqueInvertedIndexFilePath, uniqueInvertedLogDir, uniqueInvertedArchiveDir)
+	if err != nil {
+		return fmt.Errorf("failed to create InvertedIndex for storage node %s: %w", myStorageNodeID, err)
+	}
+	log.Printf("INFO: Storage Node %s inverted index initialized successfully.", myStorageNodeID)
+
+	// 5. Initialize local shard map cache
 	myAssignedSlots = make(map[string]fsm.SlotRangeInfo)
 
 	// --- NEW: Initialize Replication Manager ---
@@ -563,14 +579,14 @@ func initStorageNode() error {
 	replicationManager.Start() // Start replication background tasks
 	// --- END NEW ---
 
-	// 5. Start background tasks
+	// 6. Start background tasks
 	go sendHeartbeatsToController()
 	go fetchShardMapFromController(replicationManager)
 
 	return nil
 }
 
-// closeStorageNode closes the B-tree and LogManager cleanly.
+// closeStorageNode closes the B-tree, LogManager, and InvertedIndex cleanly.
 func closeStorageNode() {
 	log.Println("INFO: Shutting down Storage Node database...")
 	if dbInstance != nil {
@@ -581,6 +597,12 @@ func closeStorageNode() {
 	if logManager != nil {
 		if err := logManager.Close(); err != nil {
 			log.Printf("ERROR: Failed to close LogManager for Storage Node %s: %v", myStorageNodeID, err)
+		}
+	}
+	// NEW: Close Inverted Index
+	if invertedIndexInstance != nil {
+		if err := invertedIndexInstance.Close(); err != nil {
+			log.Printf("ERROR: Failed to close InvertedIndex for Storage Node %s: %v", myStorageNodeID, err)
 		}
 	}
 	log.Println("INFO: Storage Node shutdown complete.")
@@ -719,7 +741,7 @@ func fetchShardMapFromController(rm *ReplicationManager) {
 }
 
 // parseRequest parses a raw string command into a Request struct.
-// It's updated to handle 2PC commands.
+// It's updated to handle 2PC commands and TEXT_SEARCH.
 func parseRequest(raw string) (Request, error) {
 	parts := strings.Fields(raw)
 	if len(parts) == 0 {
@@ -730,9 +752,9 @@ func parseRequest(raw string) (Request, error) {
 	req := Request{Command: command, TxnID: 0} // Default TxnID to 0 for auto-commit
 
 	switch command {
-	case "PUT":
+	case "PUT", "PUT_TEXT": // NEW: Handle PUT_TEXT
 		if len(parts) < 3 {
-			return Request{}, fmt.Errorf("PUT requires key and value")
+			return Request{}, fmt.Errorf("%s requires key and value", command)
 		}
 		req.Key = parts[1]
 		req.Value = strings.Join(parts[2:], " ")
@@ -758,6 +780,11 @@ func parseRequest(raw string) (Request, error) {
 		req.StartKey = parts[0]
 		req.EndKey = parts[1]
 
+	case "TEXT_SEARCH": // NEW: Handle TEXT_SEARCH
+		if len(parts) < 2 {
+			return Request{}, fmt.Errorf("TEXT_SEARCH requires a query string")
+		}
+		req.Query = strings.Join(parts[1:], " ") // The rest is the query
 	case "PREPARE":
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
@@ -777,7 +804,6 @@ func parseRequest(raw string) (Request, error) {
 			return Request{}, fmt.Errorf("invalid TxnID format: %w", err)
 		}
 		req.TxnID = txnID
-	// --- END NEW ---
 	default:
 		return Request{}, fmt.Errorf("unknown command: %s", command)
 	}
@@ -786,6 +812,7 @@ func parseRequest(raw string) (Request, error) {
 
 // handleRequest processes a parsed Request and returns a Response.
 // It now includes 2PC command handling and passes TxnID to B-tree operations.
+// It also handles new PUT_TEXT and TEXT_SEARCH commands for the inverted index.
 func handleRequest(req Request) Response {
 	var resp Response
 	var err error
@@ -793,7 +820,8 @@ func handleRequest(req Request) Response {
 	// --- Sharding Awareness: Check if key belongs to this node (for data ops) ---
 	// 2PC commands (PREPARE, COMMIT, ABORT) are sent directly to the participant,
 	// so they don't need shard routing check here.
-	isDataOperation := req.Command == "PUT" || req.Command == "GET" || req.Command == "DELETE"
+	// TEXT_SEARCH is handled by any node (for V1), so it doesn't need shard routing check.
+	isDataOperation := req.Command == "PUT" || req.Command == "PUT_TEXT" || req.Command == "GET" || req.Command == "DELETE"
 	if isDataOperation {
 		targetSlot := fsm.GetSlotForHashKey(req.Key)
 
@@ -829,6 +857,29 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT failed: %v", err)}
 		} else {
 			resp = Response{Status: "OK", Message: "Key-value pair inserted/updated."}
+		}
+	case "PUT_TEXT": // NEW: Handle PUT_TEXT command
+		// Extract raw text from GOJODB.TEXT() wrapper
+		pureText := ""
+		if strings.HasPrefix(req.Value, gojoDBTextPrefix) && strings.HasSuffix(req.Value, gojoDBTextSuffix) {
+			pureText = req.Value[len(gojoDBTextPrefix) : len(req.Value)-len(gojoDBTextSuffix)]
+		} else {
+			resp = Response{Status: "ERROR", Message: "PUT_TEXT command requires value wrapped in GOJODB.TEXT()."}
+			return resp
+		}
+
+		// Insert into Inverted Index (non-transactional for V1)
+		invertedIndexInstance.Insert(pureText, req.Key)
+		log.Printf("INFO: Inverted Index: Indexed key '%s' with text '%s'", req.Key, pureText)
+
+		// Then, insert the original value (including wrapper) into the B-tree
+		dbLock.Lock()
+		err = dbInstance.Insert(req.Key, req.Value, req.TxnID)
+		dbLock.Unlock()
+		if err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_TEXT (B-tree part) failed: %v", err)}
+		} else {
+			resp = Response{Status: "OK", Message: "Key-value pair and text indexed."}
 		}
 	case "GET":
 		dbLock.RLock() // Acquire read lock for GET
@@ -870,6 +921,36 @@ func handleRequest(req Request) Response {
 			b, _ := json.Marshal(result)
 			resp = Response{Status: "OK", Message: string(b)}
 			iterator.Close()
+		}
+	case "TEXT_SEARCH": // NEW: Handle TEXT_SEARCH command
+		// Perform search on the inverted index
+		resultKeys, err := invertedIndexInstance.Search(req.Query)
+		if err != nil {
+			log.Println("Encountered error while inverted index search: ", err)
+		}
+		log.Printf("INFO: Inverted Index: Search for '%s' returned %d keys.", req.Query, len(resultKeys))
+
+		var foundEntries []Entry
+		// For each key found in the inverted index, retrieve the full entry from the B-tree
+		for _, key := range resultKeys {
+			dbLock.RLock() // Acquire read lock for B-tree GET
+			val, found, searchErr := dbInstance.Search(key)
+			dbLock.RUnlock() // Release read lock
+			if searchErr != nil {
+				log.Printf("ERROR: TEXT_SEARCH: Failed to retrieve key '%s' from B-tree: %v", key, searchErr)
+				continue // Continue to next key
+			}
+			if found {
+				foundEntries = append(foundEntries, Entry{Key: key, Value: val})
+			}
+		}
+
+		// Marshal the list of found entries into JSON
+		entriesJSON, marshalErr := json.Marshal(foundEntries)
+		if marshalErr != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Failed to marshal search results: %v", marshalErr)}
+		} else {
+			resp = Response{Status: "OK", Message: string(entriesJSON)}
 		}
 	case "DELETE":
 		dbLock.Lock()                               // Acquire write lock for DELETE
@@ -943,7 +1024,6 @@ func handleRequest(req Request) Response {
 		default:
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Key)}
 		}
-	// --- END NEW ---
 	default:
 		resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Command)}
 	}
@@ -1039,7 +1119,7 @@ func main() {
 	defer listener.Close()
 
 	log.Printf("INFO: GojoDB Storage Node %s listening for client traffic on %s", myStorageNodeID, myStorageNodeAddr)
-	log.Println("INFO: Commands: PUT <key> <value>, GET <key>, DELETE <key>, SIZE")
+	log.Println("INFO: Commands: PUT <key> <value>, PUT_TEXT <key> GOJODB.TEXT(<value>), GET <key>, DELETE <key>, SIZE, TEXT_SEARCH <query>") // NEW: Commands
 	log.Println("INFO: 2PC Commands (from Coordinator only): PREPARE <TxnID> <ops_json>, COMMIT <TxnID>, ABORT <TxnID>")
 
 	for {

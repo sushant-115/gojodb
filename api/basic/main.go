@@ -31,15 +31,20 @@ const (
 	// 2PC Coordinator configuration
 	prepareTimeout      = 5 * time.Second // Timeout for participants to respond to PREPARE
 	healthCheckInterval = 5 * time.Second // How often to health check storage nodes
+
+	// GOJODB.TEXT() wrapper prefix
+	gojoDBTextPrefix = "GOJODB.TEXT("
+	gojoDBTextSuffix = ")"
 )
 
 // APIRequest represents a client request received by the API service.
 type APIRequest struct {
 	Command  string `json:"command"`
 	Key      string `json:"key"`
-	Value    string `json:"value,omitempty"`     // Optional for GET/DELETE
+	Value    string `json:"value,omitempty"`     // Optional for GET/DELETE/PUT
 	StartKey string `json:"start_key,omitempty"` // For range ops
 	EndKey   string `json:"end_key,omitempty"`   // For range ops
+	Query    string `json:"query,omitempty"`     // NEW: For text search queries
 }
 
 // APIResponse represents a response sent by the API service to the client.
@@ -389,7 +394,7 @@ func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
 	s.leaderMu.RUnlock()
 
 	// Operations that depend on leader or shard map:
-	isCriticalPath := strings.HasPrefix(path, "/admin/") || path == "/api/data" || path == "/api/transaction" || path == "/api/query"
+	isCriticalPath := strings.HasPrefix(path, "/admin/") || path == "/api/data" || path == "/api/transaction" || path == "/api/query" || path == "/api/text_search" // NEW: Add text_search
 	if isCriticalPath && leaderAddr == "" {
 		http.Error(w, "ERROR: No Controller leader available. Cannot process request.", http.StatusServiceUnavailable)
 		log.Printf("ERROR: Request for %s failed: No Controller leader available.", path)
@@ -409,8 +414,11 @@ func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
 	} else if path == "/api/transaction" { // New endpoint for distributed transactions
 		s.handleTransactionRequest(w, r)
 		return
-	} else if path == "/api/query" { // NEW: Endpoint for range queries and aggregations
+	} else if path == "/api/query" { // Endpoint for range queries and aggregations
 		s.handleQueryRequest(w, r)
+		return
+	} else if path == "/api/text_search" { // NEW: Endpoint for text-based search
+		s.handleTextSearchRequest(w, r)
 		return
 	} else {
 		http.Error(w, "Not Found", http.StatusNotFound)
@@ -687,7 +695,18 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 	defer s.returnStorageNodeConn(targetNodeAddr, conn) // Return connection to pool
 
 	// 5. Send request to Storage Node
-	storageReq := fmt.Sprintf("%s %s %s\n", apiReq.Command, apiReq.Key, apiReq.Value) // Format matches Storage Node's expected input
+	// Check for GOJODB.TEXT() wrapper for PUT operations
+	commandToSend := apiReq.Command
+	valueToSend := apiReq.Value
+	if apiReq.Command == "PUT" && strings.HasPrefix(apiReq.Value, gojoDBTextPrefix) && strings.HasSuffix(apiReq.Value, gojoDBTextSuffix) {
+		// If it's a text value, modify the command to instruct the Storage Node
+		// to also index it in the inverted index.
+		// The Storage Node will then parse the actual text and store it.
+		commandToSend = "PUT_TEXT" // New command for Storage Node
+		log.Printf("DEBUG: API Service: Detected GOJODB.TEXT() wrapper for key '%s'. Sending as PUT_TEXT.", apiReq.Key)
+	}
+
+	storageReq := fmt.Sprintf("%s %s %s\n", commandToSend, apiReq.Key, valueToSend) // Format matches Storage Node's expected input
 	_, err = conn.Write([]byte(storageReq))
 	if err != nil {
 		log.Printf("ERROR: API Service: Failed to send request to Storage Node %s: %v", targetNodeAddr, err)
@@ -925,7 +944,6 @@ func deserializeOperations(s string) ([]TransactionOperation, error) {
 	return ops, nil
 }
 
-// --- NEW: handleQueryRequest for range queries and aggregations ---
 // handleQueryRequest processes client range query and aggregation requests.
 func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -991,7 +1009,82 @@ func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) 
 	log.Printf("INFO: API Service: Range query '%s' completed with status: %s", apiReq.Command, apiResp.Status)
 }
 
-// --- END NEW ---
+// handleTextSearchRequest processes client text-based search requests.
+func (s *APIService) handleTextSearchRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var apiReq APIRequest
+	if err := json.NewDecoder(r.Body).Decode(&apiReq); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request format: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if apiReq.Query == "" {
+		http.Error(w, "Query parameter is required for text search.", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("INFO: API Service: Received text search query: '%s'", apiReq.Query)
+
+	// For text search, we don't shard by key. We need to query ALL storage nodes
+	// that might contain relevant inverted index data.
+	// For simplicity in V1, we'll pick a random node and assume it can forward/coordinate
+	// or that the inverted index is replicated across all nodes and any can serve.
+	// A more robust solution would involve a dedicated text search service or
+	// broadcasting the query to all relevant nodes and aggregating results.
+
+	s.storageNodeAddressesMu.RLock()
+	addresses := make([]string, 0, len(s.storageNodeAddresses))
+	for _, addr := range s.storageNodeAddresses {
+		// Only consider healthy nodes for the query
+		s.storageNodeHealthMu.RLock()
+		if s.storageNodeHealth[addr] {
+			addresses = append(addresses, addr)
+		}
+		s.storageNodeHealthMu.RUnlock()
+	}
+	s.storageNodeAddressesMu.RUnlock()
+
+	if len(addresses) == 0 {
+		resp := APIResponse{Status: "ERROR", Message: "No healthy storage nodes available for text search."}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Select a random healthy node to send the text search query to.
+	// In a real system, this might be a dedicated text search node or a broadcast.
+	targetNodeAddr := addresses[rand.Intn(len(addresses))]
+	log.Printf("DEBUG: API Service: Routing text search '%s' to Storage Node %s", apiReq.Query, targetNodeAddr)
+
+	// Send TEXT_SEARCH command to the selected Storage Node
+	storageSearchCmd := fmt.Sprintf("TEXT_SEARCH %s\n", apiReq.Query)
+	respFromSN, err := s.sendStorageNodeCommand(targetNodeAddr, storageSearchCmd)
+	if err != nil {
+		log.Printf("ERROR: API Service: Failed to get response from Storage Node %s for text search: %v", targetNodeAddr, err)
+		resp := APIResponse{Status: "ERROR", Message: fmt.Sprintf("Failed to perform text search on Storage Node %s: %v", targetNodeAddr, err)}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Parse and return response from Storage Node
+	apiResp := APIResponse{Status: respFromSN.Status}
+	if respFromSN.Status == "OK" {
+		// The Storage Node should return a JSON array of Entry objects (key-value pairs)
+		if json.Valid([]byte(respFromSN.Message)) {
+			apiResp.Data = json.RawMessage(respFromSN.Message)
+		} else {
+			apiResp.Message = respFromSN.Message // Fallback to plain message if not JSON
+		}
+	} else {
+		apiResp.Message = respFromSN.Message
+	}
+
+	json.NewEncoder(w).Encode(apiResp)
+	log.Printf("INFO: API Service: Text search '%s' completed with status: %s", apiReq.Query, apiResp.Status)
+}
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
@@ -1005,8 +1098,10 @@ func main() {
 	log.Printf("INFO: GojoDB API Service listening on %s:%s", apiServiceHost, apiServicePort)
 	log.Println("INFO: API Endpoints:")
 	log.Println("  - /api/data (POST): { \"command\": \"PUT/GET/DELETE\", \"key\": \"...\", \"value\": \"...\" }")
+	log.Println("    (Use GOJODB.TEXT(your text) for text indexing in PUT value)")
 	log.Println("  - /api/transaction (POST): { \"operations\": [ {\"command\":\"PUT/DELETE\", \"key\":\"...\", \"value\":\"...\"}, ... ] }")
 	log.Println("  - /api/query (POST): { \"command\": \"GET_RANGE/COUNT_RANGE/SUM_RANGE/MIN_RANGE/MAX_RANGE\", \"start_key\": \"...\", \"end_key\": \"...\" }")
+	log.Println("  - /api/text_search (POST): { \"query\": \"your search terms\" }") // NEW: Text search endpoint
 	log.Println("  - /admin/assign_slot_range (POST, authenticated): Proxy to Controller Leader")
 	log.Println("  - /admin/get_node_for_key (GET, authenticated): Proxy to Controller Leader")
 	log.Println("  - /admin/set_metadata (POST, authenticated): Proxy to Controller Leader")
