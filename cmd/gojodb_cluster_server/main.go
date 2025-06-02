@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"           // Added for bytes.SplitN
 	"encoding/binary" // Added for PageID serialization/deserialization
 	"encoding/json"   // Needed for (de)serializing TransactionOperations
 	"fmt"
@@ -96,15 +97,16 @@ type TransactionOperations struct {
 // ReplicationManager manages sending and receiving log streams for replication.
 type ReplicationManager struct {
 	nodeID                string
-	logManager            *btree_core.LogManager
+	logManager            *btree_core.LogManager // B-tree's log manager
 	dbInstance            *btree_core.BTree[string, string]
 	dbLock                *sync.RWMutex
+	invertedIndex         *inverted_index.InvertedIndex // NEW: Inverted index instance
 	replicationListenPort string
 
 	// State for Primary role (sending logs)
 	primaryForSlots        map[string]fsm.SlotRangeInfo // SlotRangeID -> SlotRangeInfo (where this node is primary)
 	replicaClients         map[string]net.Conn          // ReplicaNodeAddr -> TCP connection to replica
-	lastSentLSN            map[string]btree_core.LSN    // ReplicaNodeAddr -> Last LSN sent to this replica
+	lastSentLSN            map[string]btree_core.LSN    // ReplicaNodeAddr + "_btree" or "_inverted_index" -> Last LSN sent to this replica
 	primaryMu              sync.Mutex                   // Protects primary role state
 	storageNodeAddressesMu sync.RWMutex
 	storageNodeAddresses   map[string]string
@@ -116,12 +118,13 @@ type ReplicationManager struct {
 }
 
 // NewReplicationManager creates and initializes a ReplicationManager.
-func NewReplicationManager(nodeID string, lm *btree_core.LogManager, db *btree_core.BTree[string, string], lock *sync.RWMutex) *ReplicationManager {
+func NewReplicationManager(nodeID string, lm *btree_core.LogManager, db *btree_core.BTree[string, string], lock *sync.RWMutex, ii *inverted_index.InvertedIndex) *ReplicationManager {
 	return &ReplicationManager{
 		nodeID:                nodeID,
 		logManager:            lm,
 		dbInstance:            db,
 		dbLock:                lock,
+		invertedIndex:         ii, // Store the inverted index instance
 		primaryForSlots:       make(map[string]fsm.SlotRangeInfo),
 		replicaClients:        make(map[string]net.Conn),
 		lastSentLSN:           make(map[string]btree_core.LSN),
@@ -152,6 +155,8 @@ func (rm *ReplicationManager) Stop() {
 	for addr, conn := range rm.replicaClients {
 		conn.Close()
 		delete(rm.replicaClients, addr)
+		delete(rm.lastSentLSN, addr+"_btree") // Clean up both LSNs
+		delete(rm.lastSentLSN, addr+"_inverted_index")
 	}
 	rm.primaryMu.Unlock()
 
@@ -206,6 +211,8 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
 		default:
 			// Read and deserialize log record
 			var lr btree_core.LogRecord
+			// Use the B-tree's log manager's ReadLogRecord as a generic reader for the stream
+			// Assuming all log records (B-tree and Inverted Index) are serialized in the same format.
 			err := rm.logManager.ReadLogRecord(reader, &lr)
 			if err == io.EOF {
 				log.Printf("INFO: ReplicationManager: Primary %s closed replication stream.", conn.RemoteAddr().String())
@@ -218,118 +225,131 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn) {
 
 			log.Printf("DEBUG: ReplicationManager: Received log record LSN %d (Type: %v, Txn: %d, Page: %d) from Primary.",
 				lr.LSN, lr.Type, lr.TxnID, lr.PageID)
-			// var od any
-			// err = json.Unmarshal(lr.OldData, &od)
-			// if err != nil {
-			// 	log.Println("Unamrshal failed")
-			// }
-			// var nd any
-			// err = json.Unmarshal(lr.OldData, &nd)
-			// if err != nil {
-			// 	log.Println("Unamrshal failed")
-			// }
 
-			// log.Println("Debug LogRecord: ", od, nd)
-			// Acquire global DB write lock for overall consistency, though page latches are more fine-grained.
-			// This lock will prevent concurrent client requests from interfering with replication application.
-			rm.dbLock.Lock()
+			// Differentiate between B-tree and Inverted Index log records
+			if lr.PageID == btree_core.InvalidPageID && lr.Type == btree_core.LogRecordTypeUpdate {
+				// This is likely an Inverted Index term dictionary update
+				// The NewData contains: term (null-terminated) + metadata JSON
+				parts := bytes.SplitN(lr.NewData, []byte{0}, 2)
+				if len(parts) != 2 {
+					log.Printf("ERROR: ReplicationManager: Invalid Inverted Index log record format for LSN %d. Skipping.", lr.LSN)
+					continue
+				}
+				term := string(parts[0])
+				metadataBytes := parts[1]
 
-			switch lr.Type {
-			case btree_core.LogRecordTypeNewPage:
-				log.Println("DEBUG Applying new page for: ", lr.PageID)
-				// Ensure the underlying disk space is allocated for this PageID if it's beyond current numPages.
-				// This is similar to LogManager.Recover's handling for NewPage.
-				if lr.PageID.GetID() >= rm.dbInstance.GetNumPages() {
-					log.Printf("INFO: ReplicationManager: Extending disk file for new page %d during replay.", lr.PageID)
-					emptyPage := make([]byte, rm.dbInstance.GetPageSize())
-					if writeErr := rm.dbInstance.WritePage(lr.PageID, emptyPage); writeErr != nil {
-						log.Printf("ERROR: ReplicationManager: Failed to allocate/write empty page %d on disk: %v", lr.PageID, writeErr)
+				var newMetadata inverted_index.PostingsListMetadata
+				if err := json.Unmarshal(metadataBytes, &newMetadata); err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to unmarshal Inverted Index metadata for LSN %d: %v. Skipping.", lr.LSN, err)
+					continue
+				}
+
+				// Apply to inverted index's term dictionary
+				rm.invertedIndex.UpdateTermDicktionary(term, newMetadata)
+
+				log.Printf("INFO: ReplicationManager: Replica applied Inverted Index update for term '%s' (LSN %d).", term, lr.LSN)
+
+				// Also update the Inverted Index's LastLSN in its header
+				// This is critical for its own recovery.
+				if err := rm.invertedIndex.UpdateHeaderLSN(lr.LSN); err != nil { // This will use invertedIndex's BPM
+					log.Printf("ERROR: ReplicationManager: Failed to update Inverted Index header LSN after applying log record %d: %v", lr.LSN, err)
+				}
+
+			} else {
+				// This is a B-tree log record, apply as before
+				rm.dbLock.Lock() // Acquire global DB write lock for B-tree operations
+				switch lr.Type {
+				case btree_core.LogRecordTypeNewPage:
+					log.Println("DEBUG Applying new page for: ", lr.PageID)
+					// Ensure the underlying disk space is allocated for this PageID if it's beyond current numPages.
+					// This is similar to LogManager.Recover's handling for NewPage.
+					if lr.PageID.GetID() >= rm.dbInstance.GetNumPages() {
+						log.Printf("INFO: ReplicationManager: Extending disk file for new page %d during replay.", lr.PageID)
+						emptyPage := make([]byte, rm.dbInstance.GetPageSize())
+						if writeErr := rm.dbInstance.WritePage(lr.PageID, emptyPage); writeErr != nil {
+							log.Printf("ERROR: ReplicationManager: Failed to allocate/write empty page %d on disk: %v", lr.PageID, writeErr)
+							rm.dbLock.Unlock()
+							continue
+						}
+						// Update DiskManager's numPages
+						if lr.PageID >= btree_core.PageID(rm.dbInstance.GetNumPages()) {
+							rm.dbInstance.SetNumPages(uint64(lr.PageID) + 1)
+						}
+					}
+
+					// Now fetch the page into the buffer pool. It should exist on disk or be newly allocated.
+					page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
+					if fetchErr != nil {
+						log.Printf("ERROR: ReplicationManager: Failed to fetch page %d from BPM for NEW_PAGE record after disk ensuring: %v", lr.PageID, fetchErr)
 						rm.dbLock.Unlock()
 						continue
 					}
-					// Update DiskManager's numPages
-					if lr.PageID >= btree_core.PageID(rm.dbInstance.GetNumPages()) {
-						rm.dbInstance.SetNumPages(uint64(lr.PageID) + 1)
+
+					// The 'page' is already pinned by FetchPage.
+					// Apply the new data.
+					page.Lock()              // Acquire X-latch for writing to the page
+					page.SetData(lr.NewData) // Overwrite page data with new data
+					page.SetDirty(true)      // Mark page as dirty
+					page.Unlock()            // Release X-latch
+
+					if errUnpin := rm.dbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
+						log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after NEW_PAGE application: %v", page.GetPageID(), errUnpin)
 					}
+
+					// Ensure the page is flushed to disk immediately.
+					if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
+						log.Printf("ERROR: ReplicationManager: Failed to flush page %d after NEW_PAGE application: %v", page.GetPageID(), errFlush)
+					}
+
+				case btree_core.LogRecordTypeUpdate:
+					log.Println("DEBUG Applying update page for: ", lr.PageID)
+					page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
+					if fetchErr != nil {
+						log.Printf("ERROR: ReplicationManager: Failed to fetch page %d from BPM for UPDATE record: %v", lr.PageID, fetchErr)
+						rm.dbLock.Unlock()
+						continue
+					}
+
+					page.Lock()              // Acquire X-latch for writing
+					page.SetData(lr.NewData) // Overwrite page data with new data
+					page.SetDirty(true)
+					page.Unlock() // Release X-latch
+					if errUnpin := rm.dbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
+						log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
+					}
+
+					// Ensure the page is flushed to disk immediately.
+					if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
+						log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
+					}
+
+				case btree_core.LogRecordTypeRootChange: // Handle root page ID changes
+					newRootPageID := btree_core.PageID(binary.LittleEndian.Uint64(lr.NewData))
+					log.Printf("INFO: ReplicationManager: Replica applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
+
+					// Update the B-tree's in-memory rootPageID
+					rm.dbInstance.SetRootPageID(newRootPageID, lr.TxnID) // Pass TxnID
+
+					// Update the disk header for persistence
+					if err := rm.dbInstance.GetDiskManager().UpdateHeaderField(func(h *btree_core.DBFileHeader) {
+						h.RootPageID = newRootPageID
+					}); err != nil {
+						log.Printf("ERROR: ReplicationManager: Failed to update disk header with new root page ID %d: %v", newRootPageID, err)
+					}
+
+				case btree_core.LogRecordTypePrepare:
+					log.Printf("DEBUG: ReplicationManager: Replica received PREPARE for Txn %d. (V1: no active processing beyond data apply)", lr.TxnID)
+				case btree_core.LogRecordTypeCommitTxn:
+					log.Printf("DEBUG: ReplicationManager: Replica received COMMIT for Txn %d.", lr.TxnID)
+				case btree_core.LogRecordTypeAbortTxn:
+					log.Printf("DEBUG: ReplicationManager: Replica received ABORT for Txn %d.", lr.TxnID)
+				case btree_core.LogRecordTypeInsertKey, btree_core.LogRecordTypeDeleteKey, btree_core.LogRecordTypeNodeSplit, btree_core.LogRecordTypeNodeMerge:
+					log.Printf("WARNING: ReplicationManager: Received structural/logical log record type %v (LSN %d). Physical page changes should already be covered by UPDATE/NEW_PAGE. Skipping.", lr.Type, lr.LSN)
+				default:
+					log.Printf("WARNING: ReplicationManager: Unhandled log record type %v during replay for LSN %d. Skipping.", lr.Type, lr.LSN)
 				}
-
-				// Now fetch the page into the buffer pool. It should exist on disk or be newly allocated.
-				page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
-				if fetchErr != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to fetch page %d from BPM for NEW_PAGE record after disk ensuring: %v", lr.PageID, fetchErr)
-					rm.dbLock.Unlock()
-					continue
-				}
-
-				// The 'page' is already pinned by FetchPage.
-				// Apply the new data.
-				page.Lock()              // Acquire X-latch for writing to the page
-				page.SetData(lr.NewData) // Overwrite page data with new data
-				page.SetDirty(true)      // Mark page as dirty
-				page.Unlock()            // Release X-latch
-
-				if errUnpin := rm.dbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
-					log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after NEW_PAGE application: %v", page.GetPageID(), errUnpin)
-				}
-
-				// UNCOMMENT THIS LINE: Ensure the page is flushed to disk immediately.
-				if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to flush page %d after NEW_PAGE application: %v", page.GetPageID(), errFlush)
-				}
-
-			case btree_core.LogRecordTypeUpdate:
-				log.Println("DEBUG Applying update page for: ", lr.PageID)
-				page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
-				if fetchErr != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to fetch page %d from BPM for UPDATE record: %v", lr.PageID, fetchErr)
-					rm.dbLock.Unlock()
-					continue
-				}
-
-				page.Lock()              // Acquire X-latch for writing
-				page.SetData(lr.NewData) // Overwrite page data with new data
-				page.SetDirty(true)
-				page.Unlock() // Release X-latch
-				// lsn, err := rm.logManager.Append(&lr)
-				// if err != nil {
-				// 	log.Println("ERROR: Update ReplicationManager: failed to append logrecord New Page.", err)
-				// }
-				// log.Println("Update Appened log record using LM. ", lsn)
-				if errUnpin := rm.dbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
-					log.Printf("WARNING: ReplicationManager: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
-				}
-
-				// UNCOMMENT THIS LINE: Ensure the page is flushed to disk immediately.
-				if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
-				}
-
-			case btree_core.LogRecordTypeRootChange: // NEW: Handle root page ID changes
-				newRootPageID := btree_core.PageID(binary.LittleEndian.Uint64(lr.NewData))
-				log.Printf("INFO: ReplicationManager: Replica applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
-
-				// Update the B-tree's in-memory rootPageID
-				rm.dbInstance.SetRootPageID(newRootPageID, lr.TxnID) // Pass TxnID
-
-				// Update the disk header for persistence
-				if err := rm.dbInstance.GetDiskManager().UpdateHeaderField(func(h *btree_core.DBFileHeader) {
-					h.RootPageID = newRootPageID
-				}); err != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to update disk header with new root page ID %d: %v", newRootPageID, err)
-				}
-
-			case btree_core.LogRecordTypePrepare:
-				log.Printf("DEBUG: ReplicationManager: Replica received PREPARE for Txn %d. (V1: no active processing beyond data apply)", lr.TxnID)
-			case btree_core.LogRecordTypeCommitTxn:
-				log.Printf("DEBUG: ReplicationManager: Replica received COMMIT for Txn %d.", lr.TxnID)
-			case btree_core.LogRecordTypeAbortTxn:
-				log.Printf("DEBUG: ReplicationManager: Replica received ABORT for Txn %d.", lr.TxnID)
-			case btree_core.LogRecordTypeInsertKey, btree_core.LogRecordTypeDeleteKey, btree_core.LogRecordTypeNodeSplit, btree_core.LogRecordTypeNodeMerge:
-				log.Printf("WARNING: ReplicationManager: Received structural/logical log record type %v (LSN %d). Physical page changes should already be covered by UPDATE/NEW_PAGE. Skipping.", lr.Type, lr.LSN)
-			default:
-				log.Printf("WARNING: ReplicationManager: Unhandled log record type %v during replay for LSN %d. Skipping.", lr.Type, lr.LSN)
+				rm.dbLock.Unlock() // Release DB write lock
 			}
-			rm.dbLock.Unlock() // Release DB write lock
 		}
 	}
 }
@@ -432,7 +452,8 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 							continue
 						}
 						rm.replicaClients[replicaAddr] = conn
-						rm.lastSentLSN[replicaAddr] = 0 // Start from beginning of log for new connection
+						rm.lastSentLSN[replicaAddr+"_btree"] = 0          // Initialize B-tree LSN
+						rm.lastSentLSN[replicaAddr+"_inverted_index"] = 0 // Initialize Inverted Index LSN
 						log.Printf("INFO: ReplicationManager: Established new replication client connection to replica %s at %s.", replicaID, replicaAddr)
 						// Stream logs to this replica
 						go rm.streamLogsToReplica(conn, replicaAddr, replicaID)
@@ -445,43 +466,107 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 }
 
 // streamLogsToReplica sends new log records to a specific replica.
+// It concurrently streams logs from both the B-tree's log manager and the inverted index's log manager.
 func (rm *ReplicationManager) streamLogsToReplica(conn net.Conn, replicaAddr, replicaID string) {
-	rm.primaryMu.Lock()
-	lastLSN := rm.lastSentLSN[replicaAddr]
-	rm.primaryMu.Unlock()
+	var wg sync.WaitGroup
+	stopStreaming := make(chan struct{}) // Channel to signal goroutines to stop
 
-	log.Printf("DEBUG: ReplicationManager: Streaming logs to replica %s from LSN %d.", replicaID, lastLSN)
-
-	// Get a log stream from LogManager
-	logStream, err := rm.logManager.StartLogStream(lastLSN)
-	if err != nil {
-		log.Printf("ERROR: ReplicationManager: Failed to start log stream for replica %s: %v", replicaID, err)
-		rm.closeReplicaConnection(replicaAddr)
-		return
-	}
-
-	for lr := range logStream {
-		serializedRecord, err := lr.Serialize()
-		if err != nil {
-			log.Printf("ERROR: ReplicationManager: Failed to serialize log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
-			rm.closeReplicaConnection(replicaAddr)
-			return
-		}
-
-		// Send serialized log record over TCP
-		_, err = conn.Write(serializedRecord)
-		if err != nil {
-			log.Printf("ERROR: ReplicationManager: Failed to send log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
-			rm.closeReplicaConnection(replicaAddr)
-			return
-		}
-
+	// Stream B-tree logs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		rm.primaryMu.Lock()
-		rm.lastSentLSN[replicaAddr] = lr.LSN // Update last sent LSN
+		lastBTreeLSN := rm.lastSentLSN[replicaAddr+"_btree"]
 		rm.primaryMu.Unlock()
-		log.Printf("DEBUG: ReplicationManager: Sent log record LSN %d to replica %s %s.", lr.LSN, replicaID, replicaAddr)
-	}
-	log.Printf("INFO: ReplicationManager: Log stream to replica %s ended.", replicaID)
+
+		log.Printf("DEBUG: ReplicationManager: Streaming B-tree logs to replica %s from LSN %d.", replicaID, lastBTreeLSN)
+		bTreeLogStream, err := rm.logManager.StartLogStream(lastBTreeLSN)
+		if err != nil {
+			log.Printf("ERROR: ReplicationManager: Failed to start B-tree log stream for replica %s: %v", replicaID, err)
+			rm.closeReplicaConnection(replicaAddr)
+			return
+		}
+
+		for {
+			select {
+			case lr, ok := <-bTreeLogStream:
+				if !ok {
+					log.Printf("INFO: ReplicationManager: B-tree log stream for replica %s closed.", replicaID)
+					return
+				}
+				serializedRecord, err := lr.Serialize()
+				if err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to serialize B-tree log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
+					rm.closeReplicaConnection(replicaAddr)
+					return
+				}
+				_, err = conn.Write(serializedRecord)
+				if err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to send B-tree log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
+					rm.closeReplicaConnection(replicaAddr)
+					return
+				}
+				rm.primaryMu.Lock()
+				rm.lastSentLSN[replicaAddr+"_btree"] = lr.LSN
+				rm.primaryMu.Unlock()
+				log.Printf("DEBUG: ReplicationManager: Sent B-tree log record LSN %d to replica %s.", lr.LSN, replicaID)
+			case <-stopStreaming:
+				log.Printf("INFO: B-tree log streaming goroutine for replica %s stopping.", replicaID)
+				return
+			}
+		}
+	}()
+
+	// Stream Inverted Index logs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rm.primaryMu.Lock()
+		lastInvertedIndexLSN := rm.lastSentLSN[replicaAddr+"_inverted_index"]
+		rm.primaryMu.Unlock()
+
+		log.Printf("DEBUG: ReplicationManager: Streaming Inverted Index logs to replica %s from LSN %d.", replicaID, lastInvertedIndexLSN)
+		invertedIndexLogStream, err := rm.invertedIndex.GetLogManager().StartLogStream(lastInvertedIndexLSN) // Access inverted index's log manager
+		if err != nil {
+			log.Printf("ERROR: ReplicationManager: Failed to start Inverted Index log stream for replica %s: %v", replicaID, err)
+			rm.closeReplicaConnection(replicaAddr)
+			return
+		}
+
+		for {
+			select {
+			case lr, ok := <-invertedIndexLogStream:
+				if !ok {
+					log.Printf("INFO: ReplicationManager: Inverted Index log stream for replica %s closed.", replicaID)
+					return
+				}
+				serializedRecord, err := lr.Serialize()
+				if err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to serialize Inverted Index log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
+					rm.closeReplicaConnection(replicaAddr)
+					return
+				}
+				_, err = conn.Write(serializedRecord)
+				if err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to send Inverted Index log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
+					rm.closeReplicaConnection(replicaAddr)
+					return
+				}
+				rm.primaryMu.Lock()
+				rm.lastSentLSN[replicaAddr+"_inverted_index"] = lr.LSN
+				rm.primaryMu.Unlock()
+				log.Printf("DEBUG: ReplicationManager: Sent Inverted Index log record LSN %d to replica %s.", lr.LSN, replicaID)
+			case <-stopStreaming:
+				log.Printf("INFO: Inverted Index log streaming goroutine for replica %s stopping.", replicaID)
+				return
+			}
+		}
+	}()
+
+	// Wait for both streaming goroutines to finish or for a stop signal
+	wg.Wait()
+	close(stopStreaming) // Signal goroutines to stop if they haven't already
+	log.Printf("INFO: All log streams to replica %s ended.", replicaID)
 }
 
 // closeReplicaConnection closes an outbound connection to a replica.
@@ -491,7 +576,8 @@ func (rm *ReplicationManager) closeReplicaConnection(addr string) {
 	if conn, ok := rm.replicaClients[addr]; ok {
 		conn.Close()
 		delete(rm.replicaClients, addr)
-		delete(rm.lastSentLSN, addr)
+		delete(rm.lastSentLSN, addr+"_btree") // Clean up both LSNs
+		delete(rm.lastSentLSN, addr+"_inverted_index")
 		log.Printf("INFO: ReplicationManager: Closed outbound connection to replica %s.", addr)
 	}
 }
@@ -507,13 +593,20 @@ func initStorageNode() error {
 		return fmt.Errorf("STORAGE_NODE_ID and STORAGE_NODE_ADDR environment variables must be set")
 	}
 
+	// Ensure the base data directory exists
+	baseDataDir := "data" // Assuming all data files/logs go here
+	if err := os.MkdirAll(baseDataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create base data directory %s: %w", baseDataDir, err)
+	}
+
 	// Adjust dbFilePath to be unique per storage node
-	uniqueDbFilePath := fmt.Sprintf("data/%s/%s_gojodb_shard.db", myStorageNodeID, myStorageNodeID)
-	uniqueLogDir := fmt.Sprintf("data/%s/%s_logs", myStorageNodeID, myStorageNodeID)
-	uniqueArchiveDir := fmt.Sprintf("data/%s/%s_archives", myStorageNodeID, myStorageNodeID)
-	uniqueInvertedIndexFilePath := fmt.Sprintf("data/%s/%s_inverted_index.json", myStorageNodeID, myStorageNodeID) // NEW: Inverted index file path
-	uniqueInvertedLogDir := fmt.Sprintf("data/%s/%s_inverted_logs", myStorageNodeID, myStorageNodeID)
-	uniqueInvertedArchiveDir := fmt.Sprintf("data/%s/%s_inverted_archives", myStorageNodeID, myStorageNodeID)
+	uniqueDbFilePath := fmt.Sprintf("data/%s_gojodb_shard.db", myStorageNodeID)
+	uniqueLogDir := fmt.Sprintf("data/%s_logs", myStorageNodeID)
+	uniqueArchiveDir := fmt.Sprintf("data/%s_archives", myStorageNodeID)
+	// Use a unique file path for the inverted index data file (changed from .json to .db)
+	uniqueInvertedIndexFilePath := fmt.Sprintf("data/%s_inverted_index.db", myStorageNodeID)
+	uniqueInvertedIndexLogDir := fmt.Sprintf("data/%s_inverted_index_logs", myStorageNodeID)
+	uniqueInvertedIndexArchiveDir := fmt.Sprintf("data/%s_inverted_index_archives", myStorageNodeID)
 
 	// 2. Initialize LogManager for this Storage Node
 	logManager, err = btree_core.NewLogManager(uniqueLogDir, uniqueArchiveDir, logBufferSize, logSegmentSize)
@@ -565,7 +658,8 @@ func initStorageNode() error {
 	log.Printf("INFO: Storage Node %s database initialized successfully. Root PageID: %d", myStorageNodeID, dbInstance.GetRootPageID())
 
 	// NEW: 4. Initialize Inverted Index for this Storage Node
-	invertedIndexInstance, err = inverted_index.NewInvertedIndex(uniqueInvertedIndexFilePath, uniqueInvertedLogDir, uniqueInvertedArchiveDir)
+	// Pass unique log and archive directories for the inverted index
+	invertedIndexInstance, err = inverted_index.NewInvertedIndex(uniqueInvertedIndexFilePath, uniqueInvertedIndexLogDir, uniqueInvertedIndexArchiveDir)
 	if err != nil {
 		return fmt.Errorf("failed to create InvertedIndex for storage node %s: %w", myStorageNodeID, err)
 	}
@@ -575,7 +669,8 @@ func initStorageNode() error {
 	myAssignedSlots = make(map[string]fsm.SlotRangeInfo)
 
 	// --- NEW: Initialize Replication Manager ---
-	replicationManager = NewReplicationManager(myStorageNodeID, logManager, dbInstance, &dbLock)
+	// Pass the invertedIndexInstance to the ReplicationManager
+	replicationManager = NewReplicationManager(myStorageNodeID, logManager, dbInstance, &dbLock, invertedIndexInstance)
 	replicationManager.Start() // Start replication background tasks
 	// --- END NEW ---
 
@@ -604,6 +699,10 @@ func closeStorageNode() {
 		if err := invertedIndexInstance.Close(); err != nil {
 			log.Printf("ERROR: Failed to close InvertedIndex for Storage Node %s: %v", myStorageNodeID, err)
 		}
+	}
+	// Stop Replication Manager
+	if replicationManager != nil {
+		replicationManager.Stop()
 	}
 	log.Println("INFO: Storage Node shutdown complete.")
 }
@@ -869,7 +968,11 @@ func handleRequest(req Request) Response {
 		}
 
 		// Insert into Inverted Index (non-transactional for V1)
-		invertedIndexInstance.Insert(pureText, req.Key)
+		// invertedIndexInstance.Insert returns an error now
+		if err := invertedIndexInstance.Insert(pureText, req.Key); err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_TEXT (inverted index part) failed: %v", err)}
+			return resp
+		}
 		log.Printf("INFO: Inverted Index: Indexed key '%s' with text '%s'", req.Key, pureText)
 
 		// Then, insert the original value (including wrapper) into the B-tree
@@ -924,9 +1027,10 @@ func handleRequest(req Request) Response {
 		}
 	case "TEXT_SEARCH": // NEW: Handle TEXT_SEARCH command
 		// Perform search on the inverted index
-		resultKeys, err := invertedIndexInstance.Search(req.Query)
-		if err != nil {
-			log.Println("Encountered error while inverted index search: ", err)
+		resultKeys, searchErr := invertedIndexInstance.Search(req.Query) // Capture error from InvertedIndex.Search
+		if searchErr != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Text search failed: %v", searchErr)}
+			return resp
 		}
 		log.Printf("INFO: Inverted Index: Search for '%s' returned %d keys.", req.Query, len(resultKeys))
 

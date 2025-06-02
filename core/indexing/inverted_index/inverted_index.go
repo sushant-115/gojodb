@@ -207,6 +207,22 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 	return idx, nil
 }
 
+func (idx *InvertedIndex) GetLogManager() *btree.LogManager {
+	return idx.lm
+}
+
+func (idx *InvertedIndex) UpdateTermDicktionary(term string, metadata PostingsListMetadata) {
+	// Apply to inverted index's term dictionary
+	idx.dictMu.Lock() // Acquire lock for inverted index dictionary
+	idx.termDictionary[term] = metadata
+	idx.dictMu.Unlock() // Release lock
+}
+
+func (idx *InvertedIndex) UpdateHeaderLSN(lsn btree.LSN) error {
+	idx.header.LastLSN = lsn
+	return idx.writeHeader()
+}
+
 // readHeader reads the InvertedIndexHeader from the beginning of the file (PageID 0).
 func (idx *InvertedIndex) readHeader() error {
 	page, err := idx.bpm.FetchPage(invertedIndexHeaderPageID)
