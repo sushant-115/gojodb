@@ -1,4 +1,4 @@
-# **GojoDB: A Distributed Key-Value Store with Inverted Indexing and Replication**
+# **# **GojoDB - A Universal, Horizontally Scalable Database****
 
 GojoDB is a distributed key-value database designed for high availability, fault tolerance, and efficient data retrieval, particularly for text-based content. It features built-in log replication, tiered storage management, and an inverted indexing system for fast full-text search capabilities.
 
@@ -113,7 +113,6 @@ Clone the repository and build the executables:
 git clone https://github.com/sushant-115/gojodb.git
 cd gojodb 
 go mod tidy  
-go install ./...
 ```
 This will install the gojodb_cli, gojodb_standalone_server, gojodb_controller, gojodb_cluster_server, and various API server binaries into your Go GOPATH/bin directory.
 
@@ -121,7 +120,8 @@ This will install the gojodb_cli, gojodb_standalone_server, gojodb_controller, g
 
 For a quick start, you can run a single standalone DB server:
 ```
-gojodb_standalone_server
+cd cmd/gojodb_standalone_server
+go run main.go
 ```
 By default, it will listen on localhost:9090.
 
@@ -130,30 +130,45 @@ By default, it will listen on localhost:9090.
 To run a full GojoDB cluster, you'll typically start the controller, followed by multiple DB servers, and then the API servers.
 
 **1. Start the Controller (e.g., on port 8000):**
+Note : Run each command in separate terminal and make sure to start the controller 1 first so that other controllers can join the leader
 ```
-gojodb_controller --port 8000
+cd cmd/gojodb_controller
+```
+Controller 1
+```
+NODE_ID=node1 RAFT_BIND_ADDR=localhost:8081 HTTP_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8086 go run main.go
+```
+Controller 2
+```
+NODE_ID=node2 RAFT_BIND_ADDR=localhost:8082 HTTP_ADDR=localhost:8083 HEARTBEAT_LISTEN_PORT=8087 JOIN_ADDR=localhost:8080 go run main.go
+```
+Controller 3
+```
+NODE_ID=node3 RAFT_BIND_ADDR=localhost:8084 HTTP_ADDR=localhost:8085 JOIN_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8088 go run main.go
 ```
 **2. Start DB Servers (e.g., two instances, one primary, one replica):**
 
-* **Primary DB Server (e.g., on port 9090, connecting to controller on 8000):**  
+* **Primary DB Server (e.g., on port 9090, connecting to controller on 8000):**
+cd ../gojodb_cluster_server
 ```
-  gojodb_cluster_server --port 9090 --controller-addr localhost:8000 --is-primary true
+  STORAGE_NODE_ID=storage_node_1 STORAGE_NODE_ADDR=localhost:9090 BTREE_REPLICATION_LISTEN_PORT=9117 INVERTED_IDX_REPLICATION_LISTEN_PORT=9120 go run main.go
 ```
 * **Replica DB Server (e.g., on port 9091, connecting to controller on 8000):**  
 ```
-  gojodb_cluster_server --port 9091 --controller-addr localhost:8000 --is-primary false --primary-addr localhost:9090
+  STORAGE_NODE_ID=storage_node_2 STORAGE_NODE_ADDR=localhost:9091 BTREE_REPLICATION_LISTEN_PORT=9116 INVERTED_IDX_REPLICATION_LISTEN_PORT=9121 go run main.go
 ```
   *Note: In a real distributed setup, localhost would be replaced with actual IP addresses or hostnames.*
 
+You can launch as many DB server you want
 **3. Start API Servers:**
 
 * **Basic API Server (e.g., on port 8080, connecting to DB server on 9090):**  
 ```
-  gojodb_basic_api --port 8080 --db-server-addr localhost:9090
+go run api/basic/main.go
 ```
 * **GraphQL API Server (e.g., on port 8081, connecting to DB server on 9090):**  
 ```
-  gojodb_graphql_service --port 8081 --db-server-addr localhost:9090
+  go run api/graphql_service/server.go
 ```
   *You can start other API services similarly.*
 
@@ -165,25 +180,60 @@ You can interact with GojoDB using the CLI or by making HTTP requests to the API
 
 # Assuming gojodb_cli is in your PATH and connected to an API server (e.g., localhost:8080)  
 ```
-gojodb_cli put mykey "Hello GojoDB"  
-gojodb_cli get mykey  
-gojodb_cli search "GojoDB"
+go run cmd/gojodb_cli/main.go
+
+sushant@Sushants-MacBook-Pro gojodb_cli % go run main.go
+
+  ██████╗  ███████╗  ██████╗ ███████╗           ██████╗  ██████╗
+  ██╔════╝ ██    ██╔════╝ ██╔██║═╝ ██         ╔════╝ ██╔════╝
+  ██║  ███╗██║   ██╗██║   ██╗██║   ██╗           ███╗██║  ███╗
+  ██║   ██║██║   ██║██║   ██║██║   ██║          ██║   ██║██║   ██║
+  ╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝
+   ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝
+    GojoDB CLI - Your data, unbound.
+
+    Type 'help' for commands, 'exit' or 'quit' to leave.
+	
+gojodb> 
+```
+Type help to get more details
+
+```gojodb> help
+GojoDB CLI Commands:
+  Data Operations:
+    put <key> <value>            - Inserts or updates a key-value pair.
+    get <key>                    - Retrieves the value for a key.
+    delete <key>                 - Deletes a key-value pair.
+    get_range <start_key> <end_key> - Retrieves key-value pairs within a range.
+  Transaction Operations (2PC):
+    txn put <key> <value>        - Performs a transactional PUT.
+    txn delete <key>             - Performs a transactional DELETE.
+  Admin Operations:
+    admin assign_slot_range <startSlot> <endSlot> <assignedNodeID> [replicaNodeIDs] - Assigns a slot range to a primary node with optional replicas.
+    admin get_node_for_key <key> - Finds the storage node responsible for a key.
+    admin set_metadata <key> <value> - Sets cluster-wide metadata.
+    admin set_primary_replica <rangeID> <primaryNodeID> <replicaNodeIDs> - Sets primary/replicas for a slot range.
+  Cluster Status:
+    status                       - Displays the current cluster status.
+  CLI Utilities:
+    history                      - Shows recent command history.
+    !<index>                     - Re-executes a command from history (e.g., !1).
+    help                         - Displays this help message.
+    exit / quit                  - Exits the CLI.
 ```
 **Example HTTP Request (Basic API):**
 
-# PUT request  
 ```
-curl -X PUT -H "Content-Type: application/json" -d '{"key": "mykey", "value": "Hello World"}'  
-```
-# GET request  
-```
-curl http://localhost:8080/get?key=mykey
-```
-**GraphQL Example:**
-
-The GraphQL API typically runs on http://localhost:8081/query (or /graphql depending on configuration). You can use a GraphQL client or curl to send queries.
-```
-curl -X POST  -H "Content-Type: application/json"  -d '{ "query": "{ getValue(key: "mykey") }" }'  http://localhost:8081/query
+INFO: API Endpoints:
+  - /api/data (POST): { "command": "PUT/GET/DELETE", "key": "...", "value": "..." }
+    (Use GOJODB.TEXT(your text) for text indexing in PUT value)
+  - /api/transaction (POST): { "operations": [ {"command":"PUT/DELETE", "key":"...", "value":"..."}, ... ] }
+  - /api/query (POST): { "command": "GET_RANGE/COUNT_RANGE/SUM_RANGE/MIN_RANGE/MAX_RANGE", "start_key": "...", "end_key": "..." }
+  - /api/text_search (POST): { "query": "your search terms" } // NEW: Text search endpoint
+  - /admin/assign_slot_range (POST, authenticated): Proxy to Controller Leader
+  - /admin/get_node_for_key (GET, authenticated): Proxy to Controller Leader
+  - /admin/set_metadata (POST, authenticated): Proxy to Controller Leader
+  - /status (GET): Get aggregated status of Controller cluster and Storage Nodes
 ```
 ## **Contributing**
 
