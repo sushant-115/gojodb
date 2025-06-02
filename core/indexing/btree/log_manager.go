@@ -139,6 +139,13 @@ func NewLogManager(logDir string, archiveDir string, bufferSize int, segmentSize
 	return lm, nil
 }
 
+// GetCurrentLSN returns the current global LSN of the log manager.
+func (lm *LogManager) GetCurrentLSN() LSN {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.currentLSN
+}
+
 // findOrCreateLatestLogSegment scans the log directory to find the latest segment,
 // or creates the first one if none exist. It sets lm.logFile, lm.currentSegmentID, and lm.currentLSN.
 // This method MUST be called with lm.mu locked.
