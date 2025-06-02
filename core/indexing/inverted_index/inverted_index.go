@@ -154,7 +154,9 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 				idx.lm.Close()
 				return nil, fmt.Errorf("inverted index header serialization size mismatch! Expected %d bytes, got %d bytes", 128, buf.Len())
 			}
-			copy(headerPage.GetData(), buf.Bytes())
+			h := []byte{}
+			copy(h, buf.Bytes())
+			headerPage.SetData(h)
 			headerPage.SetDirty(true)
 			headerPage.Unlock()
 			if err := idx.bpm.UnpinPage(newPageID, true); err != nil { // Unpin and mark dirty
@@ -262,9 +264,10 @@ func (idx *InvertedIndex) writeHeader() error {
 	if buf.Len() != 128 {
 		return fmt.Errorf("inverted index header serialization size mismatch! Expected %d bytes, got %d bytes.", 128, buf.Len())
 	}
-
-	copy(page.GetData(), buf.Bytes()) // Copy serialized bytes to page data
-	page.SetDirty(true)               // Mark the page dirty
+	h := []byte{}
+	copy(h, buf.Bytes()) // Copy serialized bytes to page data
+	page.SetData(h)
+	page.SetDirty(true) // Mark the page dirty
 
 	log.Printf("DEBUG: Inverted index header written. Magic: 0x%x, Version: %d, LastLSN: %d",
 		idx.header.Magic, idx.header.Version, idx.header.LastLSN)
@@ -318,6 +321,7 @@ func (idx *InvertedIndex) saveTermDictionary() error {
 // Insert processes a text and associates it with a document key in the inverted index.
 // It tokenizes, normalizes, and adds terms to the disk-backed postings lists.
 func (idx *InvertedIndex) Insert(text string, docKey string) error {
+	log.Println("Recieved insert request", text, docKey)
 	if text == "" || docKey == "" {
 		return nil // Nothing to index
 	}
@@ -380,8 +384,8 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 		// Log the update operation for recovery (conceptual for now)
 		// This is a simplified logging. A real system would log the term, old metadata, and new metadata.
 		// For now, we'll log the term and the new metadata.
-		metadataBytes, _ := json.Marshal(newMetadata) // Ignore error, should be fine
-		termBytes := []byte(term)
+		metadataBytes := []byte(text) // Ignore error, should be fine
+		termBytes := []byte(docKey)
 
 		// Combine term and metadata for logging: Term (null-terminated) + Metadata JSON
 		logData := new(bytes.Buffer)

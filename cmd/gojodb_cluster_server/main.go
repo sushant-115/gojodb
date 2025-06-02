@@ -260,23 +260,12 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 					continue
 				}
 				term := string(parts[0])
-				metadataBytes := parts[1]
-
-				var newMetadata inverted_index.PostingsListMetadata
-				if err := json.Unmarshal(metadataBytes, &newMetadata); err != nil {
-					log.Printf("ERROR: ReplicationManager: Failed to unmarshal Inverted Index metadata for LSN %d: %v. Skipping.", lr.LSN, err)
-					continue
-				}
-
-				// Apply to inverted index's term dictionary
-				rm.invertedIndex.UpdateTermDicktionary(term, newMetadata)
+				metadataBytes := string(parts[1])
 
 				log.Printf("INFO: ReplicationManager: Replica applied Inverted Index update for term '%s' (LSN %d).", term, lr.LSN)
 
-				// Also update the Inverted Index's LastLSN in its header
-				// This is critical for its own recovery.
-				if err := rm.invertedIndex.UpdateHeaderLSN(lr.LSN); err != nil { // This will use invertedIndex's BPM
-					log.Printf("ERROR: ReplicationManager: Failed to update Inverted Index header LSN after applying log record %d: %v", lr.LSN, err)
+				if err := rm.invertedIndex.Insert(metadataBytes, term); err != nil {
+					log.Println("failed to write the log entry: ", term, metadataBytes)
 				}
 
 			} else {
