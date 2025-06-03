@@ -15,13 +15,14 @@ import (
 	"sync"
 	"time" // Added for time.Ticker
 
+	"github.com/sushant-115/gojodb/core/transaction"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 )
 
 // --- Write-Ahead Logging (WAL) Constants and Types ---
 
-type LSN uint64 // Log Sequence Number
+type LSN pagemanager.LSN // Log Sequence Number
 const InvalidLSN LSN = 0
 
 // LogRecordType defines the type of operation logged.
@@ -80,7 +81,7 @@ type LogManager struct {
 	// This would typically be part of a dedicated RecoveryManager,
 	// but for V1, we'll keep it here for simplicity.
 	// Maps to track transaction states during recovery
-	recoveryTxnStates map[uint64]TransactionState // TxnID -> state (e.g., PREPARED, COMMITTED, ABORTED)
+	recoveryTxnStates map[uint64]transaction.TransactionState // TxnID -> state (e.g., PREPARED, COMMITTED, ABORTED)
 	// --- END NEW ---
 	// --- NEW: For Log Streaming (Replication) ---
 	// Channel to signal new log records are available (for streaming readers)
@@ -120,7 +121,7 @@ func NewLogManager(logDir string, archiveDir string, bufferSize int, segmentSize
 		segmentSizeLimit: segmentSizeLimit,
 		stopChan:         make(chan struct{}),
 		// --- NEW: Initialize Recovery State ---
-		recoveryTxnStates: make(map[uint64]TransactionState),
+		recoveryTxnStates: make(map[uint64]transaction.TransactionState),
 		// --- END NEW ---
 		// --- NEW: Initialize newLogReady channel ---
 		newLogReady: make(chan struct{}, 1), // Buffered channel to avoid blocking appends
@@ -308,12 +309,12 @@ func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
 // dm: The DiskManager to interact with data pages.
 // bpm: The BufferPoolManager to fetch/flush pages (not used for recovery reads/writes directly, but for context).
 // lastLSN: The last LSN recorded in the DBFileHeader, indicating the state of the data file.
-func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManager, lastLSN LSN) error {
+func (lm *LogManager) Recover(dm *flushmanager.DiskManager, lastLSN LSN) error {
 	log.Println("INFO: Starting LogManager recovery process (Redo Pass + basic Analysis/Undo)...")
 
 	// --- Analysis Pass (V1: Identify committed/aborted transactions) ---
 	// Clear previous recovery state
-	lm.recoveryTxnStates = make(map[uint64]TransactionState)
+	lm.recoveryTxnStates = make(map[uint64]transaction.TransactionState)
 
 	// Collect all log segments (archived and active) in order.
 	lm.mu.Lock()
@@ -362,13 +363,13 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManag
 			// Update transaction states based on log records
 			switch lr.Type {
 			case LogRecordTypePrepare:
-				lm.recoveryTxnStates[lr.TxnID] = TxnStatePrepared
+				lm.recoveryTxnStates[lr.TxnID] = transaction.TxnStatePrepared
 				log.Printf("DEBUG: Recovery Analysis: Txn %d is PREPARED (LSN %d)", lr.TxnID, lr.LSN)
 			case LogRecordTypeCommitTxn:
-				lm.recoveryTxnStates[lr.TxnID] = TxnStateCommitted
+				lm.recoveryTxnStates[lr.TxnID] = transaction.TxnStateCommitted
 				log.Printf("DEBUG: Recovery Analysis: Txn %d is COMMITTED (LSN %d)", lr.TxnID, lr.LSN)
 			case LogRecordTypeAbortTxn:
-				lm.recoveryTxnStates[lr.TxnID] = TxnStateAborted
+				lm.recoveryTxnStates[lr.TxnID] = transaction.TxnStateAborted
 				log.Printf("DEBUG: Recovery Analysis: Txn %d is ABORTED (LSN %d)", lr.TxnID, lr.LSN)
 			}
 			// For data modification records, track dirty pages if needed for Redo/Undo
@@ -387,7 +388,7 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManag
 			if lr.TxnID == 0 { // Non-transactional operation (auto-commit)
 				applyRecord = true
 			} else { // Transactional operation
-				if state, ok := lm.recoveryTxnStates[lr.TxnID]; ok && state == TxnStateCommitted {
+				if state, ok := lm.recoveryTxnStates[lr.TxnID]; ok && state == transaction.TxnStateCommitted {
 					applyRecord = true
 				} else {
 					log.Printf("DEBUG: Skipping Redo for Txn %d (LSN %d, Type %v): Not committed or state unknown.", lr.TxnID, lr.LSN, lr.Type)
@@ -397,7 +398,7 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManag
 			if applyRecord && lr.LSN >= lastLSN { // Only apply if LSN is newer than last checkpoint
 				log.Printf("DEBUG: Replaying log record LSN %d (Type: %v, PageID: %d) to disk.", lr.LSN, lr.Type, lr.PageID)
 
-				pageData := make([]byte, dm.pageSize)
+				pageData := make([]byte, dm.GetPageSize())
 
 				// Read page from disk (it might not exist if it's a new page log record)
 				readErr := dm.ReadPage(lr.PageID, pageData)
@@ -414,24 +415,24 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManag
 				switch lr.Type {
 				case LogRecordTypeNewPage:
 					// Ensure the page exists on disk. If it was truncated, re-allocate.
-					if lr.PageID.GetID() >= dm.numPages {
+					if lr.PageID.GetID() >= dm.GetNumPages() {
 						log.Printf("INFO: Re-allocating page %d during recovery (was truncated or never allocated).", lr.PageID)
-						emptyPage := make([]byte, dm.pageSize)
+						emptyPage := make([]byte, dm.GetPageSize())
 						if writeErr := dm.WritePage(lr.PageID, emptyPage); writeErr != nil {
 							return fmt.Errorf("failed to re-allocate new page %d during recovery: %w", lr.PageID, writeErr)
 						}
-						// CRITICAL FIX: Invalidate the page in BufferPoolManager after writing it to disk
-						bpm.InvalidatePage(lr.PageID)
-						if lr.PageID >= PageID(dm.numPages) {
-							dm.numPages = uint64(lr.PageID) + 1
-						}
+						// // CRITICAL FIX: Invalidate the page in BufferPoolManager after writing it to disk
+						// bpm.InvalidatePage(lr.PageID)
+						// if lr.PageID >= PageID(dm.numPages) {
+						// 	dm.numPages = uint64(lr.PageID) + 1
+						// }
 					}
 					if len(lr.NewData) > 0 { // Apply initial data if logged
 						if writeErr := dm.WritePage(lr.PageID, lr.NewData); writeErr != nil {
 							return fmt.Errorf("failed to write new page data for %d during recovery: %w", lr.PageID, writeErr)
 						}
 						// CRITICAL FIX: Invalidate the page in BufferPoolManager after writing it to disk
-						bpm.InvalidatePage(lr.PageID)
+						// bpm.InvalidatePage(lr.PageID)
 					}
 
 				case LogRecordTypeUpdate:
@@ -444,9 +445,9 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManag
 					// For now, LogRecordTypeUpdate is a generic page overwrite.
 
 				case LogRecordTypeRootChange: // NEW: Handle root page ID changes during recovery
-					newRootPageID := PageID(binary.LittleEndian.Uint64(lr.NewData))
+					newRootPageID := pagemanager.PageID(binary.LittleEndian.Uint64(lr.NewData))
 					log.Printf("INFO: Recovery: Applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
-					if err := dm.UpdateHeaderField(func(h *DBFileHeader) {
+					if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
 						h.RootPageID = newRootPageID
 					}); err != nil {
 						return fmt.Errorf("failed to update root page ID in header during recovery: %w", err)
@@ -466,7 +467,7 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManag
 	// --- Undo Pass (V1: Rollback uncommitted transactions) ---
 	log.Println("INFO: Starting LogManager recovery Undo Pass (V1: aborting prepared/unknown transactions)...")
 	for txnID, state := range lm.recoveryTxnStates {
-		if state == TxnStatePrepared { // Or any other state that is not Committed/Aborted
+		if state == transaction.TxnStatePrepared { // Or any other state that is not Committed/Aborted
 			log.Printf("WARNING: Txn %d was PREPARED but not COMMITTED/ABORTED. Forcing ABORT.", txnID)
 			// In a real system, you would scan the log backwards from the end
 			// to find all operations for this transaction and undo them using OldData.
@@ -484,8 +485,8 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, bpm *BufferPoolManag
 	finalLSN := lm.currentLSN
 	lm.mu.Unlock()
 
-	if err := dm.UpdateHeaderField(func(h *DBFileHeader) {
-		h.LastLSN = finalLSN
+	if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
+		h.LastLSN = pagemanager.LSN(finalLSN)
 	}); err != nil {
 		return fmt.Errorf("failed to update DBFileHeader LastLSN after recovery: %w", err)
 	}

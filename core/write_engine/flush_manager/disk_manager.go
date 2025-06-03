@@ -86,6 +86,14 @@ func NewDiskManager(filePath string, pageSize int) (*DiskManager, error) {
 	}, nil
 }
 
+func (dm *DiskManager) GetPageSize() int {
+	return dm.pageSize
+}
+
+func (dm *DiskManager) GetNumPages() uint64 {
+	return dm.numPages
+}
+
 // OpenOrCreateFile attempts to open an existing database file or create a new one.
 // The 'create' flag determines behavior if the file doesn't exist or already exists.
 func (dm *DiskManager) OpenOrCreateFile(create bool, degree int, initialTreeSize uint64) (*DBFileHeader, error) {

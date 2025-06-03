@@ -56,12 +56,12 @@ func (p *Page) Reset() {
 		p.data[i] = 0
 	}
 }
-
-func (p *Page) GetData() []byte             { return p.data }
-func (p *Page) SetData(newData []byte) bool { copy(p.data, newData); return true }
-func (p *Page) GetPageID() PageID           { return p.id }
-func (p *Page) IsDirty() bool               { return p.isDirty }
-func (p *Page) Pin()                        { p.pinCount++ }
+func (p *Page) GetLruElement() *list.Element { return p.lruElement }
+func (p *Page) GetData() []byte              { return p.data }
+func (p *Page) SetData(newData []byte) bool  { copy(p.data, newData); return true }
+func (p *Page) GetPageID() PageID            { return p.id }
+func (p *Page) IsDirty() bool                { return p.isDirty }
+func (p *Page) Pin()                         { p.pinCount++ }
 func (p *Page) Unpin() {
 	if p.pinCount > 0 {
 		p.pinCount--
