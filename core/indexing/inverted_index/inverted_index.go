@@ -13,6 +13,10 @@ import (
 	"sync"
 
 	"github.com/sushant-115/gojodb/core/indexing/btree" // Reusing btree's page, disk, buffer managers
+	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
+	"github.com/sushant-115/gojodb/core/write_engine/memtable"
+	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
+	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
 const (
@@ -23,7 +27,7 @@ const (
 	invertedIndexLogSegmentSize = 16 * 1024
 
 	// Special PageID for the header of the inverted index file
-	invertedIndexHeaderPageID btree.PageID = 0
+	invertedIndexHeaderPageID pagemanager.PageID = 0
 
 	// Size of the header within each postings list data page
 	// DataLength (uint32) + NextPageID (uint64)
@@ -35,23 +39,23 @@ const (
 type InvertedIndexHeader struct {
 	Magic   uint32                  // A magic number to identify the file
 	Version uint32                  // Version of the file format
-	LastLSN btree.LSN               // Last LSN applied to this index for recovery
+	LastLSN pagemanager.LSN         // Last LSN applied to this index for recovery
 	_       [128 - (4 + 4 + 8)]byte // Padding to ensure fixed size (128 bytes)
 }
 
 // PostingsListPageHeader is a small header at the beginning of each page
 // that stores a segment of a postings list.
 type PostingsListPageHeader struct {
-	DataLength uint32       // Number of bytes of actual postings list data in this page
-	NextPageID btree.PageID // PageID of the next page in the chain, or btree.InvalidPageID if this is the last
+	DataLength uint32             // Number of bytes of actual postings list data in this page
+	NextPageID pagemanager.PageID // PageID of the next page in the chain, or btree.InvalidPageID if this is the last
 }
 
 // PostingsListMetadata stores metadata about a postings list, allowing it to be stored on disk.
 // This is what the termDictionary maps to.
 type PostingsListMetadata struct {
-	StartPageID btree.PageID `json:"start_page_id"` // The PageID where this postings list starts
-	TotalLength uint32       `json:"total_length"`  // Total length of the serialized postings list in bytes across all pages
-	NumKeys     uint32       `json:"num_keys"`      // Number of document keys in the postings list
+	StartPageID pagemanager.PageID `json:"start_page_id"` // The PageID where this postings list starts
+	TotalLength uint32             `json:"total_length"`  // Total length of the serialized postings list in bytes across all pages
+	NumKeys     uint32             `json:"num_keys"`      // Number of document keys in the postings list
 }
 
 // InvertedIndex manages the inverted index for text-based search.
@@ -63,9 +67,9 @@ type InvertedIndex struct {
 	dictMu         sync.RWMutex // Protects access to the termDictionary map
 
 	// Disk and Buffer Pool Managers for the postings list data file
-	dm  *btree.DiskManager
-	bpm *btree.BufferPoolManager
-	lm  *btree.LogManager // LogManager for inverted index operations
+	dm  *flushmanager.DiskManager
+	bpm *memtable.BufferPoolManager
+	lm  *wal.LogManager // LogManager for inverted index operations
 
 	filePath   string // Path to the main data file for postings lists
 	logDir     string // Directory for inverted index logs
@@ -86,13 +90,13 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 
 	// 1. Initialize LogManager for the inverted index
 	var err error
-	idx.lm, err = btree.NewLogManager(logDir, archiveDir, invertedIndexLogBufferSize, invertedIndexLogSegmentSize)
+	idx.lm, err = wal.NewLogManager(logDir, archiveDir, invertedIndexLogBufferSize, invertedIndexLogSegmentSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for inverted index: %w", err)
 	}
 
 	// 2. Initialize DiskManager for the inverted index data file
-	idx.dm, err = btree.NewDiskManager(filePath, invertedIndexPageSize)
+	idx.dm, err = flushmanager.NewDiskManager(filePath, invertedIndexPageSize)
 	if err != nil {
 		idx.lm.Close() // Clean up log manager
 		return nil, fmt.Errorf("failed to create DiskManager for inverted index: %w", err)
@@ -100,7 +104,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 
 	// 3. Initialize BufferPoolManager for the inverted index data file
 	// THIS MUST BE DONE BEFORE ANY OPERATIONS THAT USE BPM (like readHeader)
-	idx.bpm = btree.NewBufferPoolManager(invertedIndexBufferPoolSize, idx.dm, idx.lm)
+	idx.bpm = memtable.NewBufferPoolManager(invertedIndexBufferPoolSize, idx.dm, idx.lm)
 
 	// 4. Open or create the inverted index data file and read/write header
 	// Attempt to open the file first. If it doesn't exist, create it.
@@ -120,7 +124,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 			idx.header = InvertedIndexHeader{
 				Magic:   btree.DBMagic,
 				Version: 1,
-				LastLSN: btree.InvalidLSN,
+				LastLSN: pagemanager.InvalidLSN,
 			}
 			// Write the new header to a newly allocated page 0
 			headerPage, newPageID, writeErr := idx.bpm.NewPage() // This should allocate page 0
@@ -188,7 +192,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 
 	// 5. Perform recovery for the inverted index (reapply logs)
 	// This will replay any changes to postings lists that were not flushed to disk.
-	if err := idx.lm.Recover(idx.dm, idx.bpm, idx.header.LastLSN); err != nil {
+	if err := idx.lm.Recover(idx.dm, wal.LSN(idx.header.LastLSN)); err != nil {
 		idx.bpm.FlushAllPages() // This will flush pages, but recovery failed, so state might be inconsistent
 		idx.dm.Close()
 		idx.lm.Close()
@@ -206,7 +210,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 	return idx, nil
 }
 
-func (idx *InvertedIndex) GetLogManager() *btree.LogManager {
+func (idx *InvertedIndex) GetLogManager() *wal.LogManager {
 	return idx.lm
 }
 
@@ -217,7 +221,7 @@ func (idx *InvertedIndex) UpdateTermDicktionary(term string, metadata PostingsLi
 	idx.dictMu.Unlock() // Release lock
 }
 
-func (idx *InvertedIndex) UpdateHeaderLSN(lsn btree.LSN) error {
+func (idx *InvertedIndex) UpdateHeaderLSN(lsn pagemanager.LSN) error {
 	idx.header.LastLSN = lsn
 	return idx.writeHeader()
 }
@@ -393,10 +397,10 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 		logData.WriteByte(0) // Null terminator as separator
 		logData.Write(metadataBytes)
 
-		lr := &btree.LogRecord{
+		lr := &wal.LogRecord{
 			TxnID:   0,                         // Not part of a 2PC transaction for now
-			Type:    btree.LogRecordTypeUpdate, // Using generic update type
-			PageID:  btree.InvalidPageID,       // Not a specific page, but a logical update to the term dictionary
+			Type:    wal.LogRecordTypeUpdate,   // Using generic update type
+			PageID:  pagemanager.InvalidPageID, // Not a specific page, but a logical update to the term dictionary
 			NewData: logData.Bytes(),
 		}
 		if _, err := idx.lm.Append(lr); err != nil {
@@ -456,10 +460,10 @@ func (idx *InvertedIndex) writePostingsList(serializedList []byte) (PostingsList
 
 	effectivePageSize := uint32(invertedIndexPageSize - postingsListPageHeaderSize)
 
-	var firstPageID btree.PageID
-	//var currentPageID btree.PageID = btree.InvalidPageID
-	var prevPage *btree.Page // To update NextPageID of the previous page
-	var prevPageID btree.PageID
+	var firstPageID pagemanager.PageID
+	//var currentPageID pagemanager.PageID = btree.InvalidPageID
+	var prevPage *pagemanager.Page // To update NextPageID of the previous page
+	var prevPageID pagemanager.PageID
 
 	bytesWritten := uint32(0)
 
@@ -612,7 +616,7 @@ func (idx *InvertedIndex) Close() error {
 	}
 
 	// Update header with latest LSN (after all flushes)
-	idx.header.LastLSN = idx.lm.GetCurrentLSN()
+	idx.header.LastLSN = pagemanager.LSN(idx.lm.GetCurrentLSN())
 	if err := idx.writeHeader(); err != nil {
 		log.Printf("ERROR: Failed to write final inverted index header: %v", err)
 		if firstErr == nil {
@@ -713,7 +717,7 @@ func deserializePostingsListPageHeader(pageData []byte) (PostingsListPageHeader,
 	}
 	header := PostingsListPageHeader{
 		DataLength: binary.LittleEndian.Uint32(pageData[0:4]),
-		NextPageID: btree.PageID(binary.LittleEndian.Uint64(pageData[4:12])),
+		NextPageID: pagemanager.PageID(binary.LittleEndian.Uint64(pageData[4:12])),
 	}
 	return header, nil
 }

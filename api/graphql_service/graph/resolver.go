@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/sushant-115/gojodb/api/graphql_service/graph/model"
-	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm" // Import FSM for SlotRangeInfo
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus" // Import FSM for SlotRangeInfo
 )
 
 // API_SERVICE_URL is the endpoint of your GojoDB API Service.

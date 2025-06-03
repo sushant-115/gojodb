@@ -2,23 +2,28 @@ package btree
 
 import (
 	"cmp"
-	"encoding/binary" // For serializing PageID to bytes
+	"encoding/binary" // For serializing pagemanager.PageID to bytes
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"slices"
 	"sync" // For sync.RWMutex and sync.Map
+
+	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
+	"github.com/sushant-115/gojodb/core/write_engine/memtable"
+	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
+	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
 // --- Configuration & Constants ---
 
 const (
-	DefaultPageSize          = 4096       // Bytes
-	FileHeaderPageID  PageID = 0          // Page ID for the database file header
-	InvalidPageID     PageID = 0          // Also used for header, but generally indicates invalid/unallocated
-	MaxFilenameLength        = 255        // Example limit
-	DBMagic           uint32 = 0x6010DB00 // GoJoDB00
+	DefaultPageSize                      = 4096       // Bytes
+	FileHeaderPageID  pagemanager.PageID = 0          // Page ID for the database file header
+	InvalidPageID     pagemanager.PageID = 0          // Also used for header, but generally indicates invalid/unallocated
+	MaxFilenameLength                    = 255        // Example limit
+	DBMagic           uint32             = 0x6010DB00 // GoJoDB00
 
 	// dbFileHeaderSize must be a fixed size that matches how it's written/read.
 	// We'll ensure DBFileHeader struct matches this.
@@ -106,13 +111,13 @@ type KeyValueSerializer[K any, V any] struct {
 }
 
 type BTree[K any, V any] struct {
-	rootPageID   PageID
+	rootPageID   pagemanager.PageID
 	degree       int
 	keyOrder     Order[K]
 	kvSerializer KeyValueSerializer[K, V]
-	bpm          *BufferPoolManager
-	diskManager  *DiskManager
-	logManager   *LogManager // Placeholder for *LogManager
+	bpm          *memtable.BufferPoolManager
+	diskManager  *flushmanager.DiskManager
+	logManager   *wal.LogManager // Placeholder for *LogManager
 
 	// --- NEW: 2PC Participant State ---
 	transactionTable       map[uint64]*Transaction // TxnID -> Transaction (in-memory state of active txns)
@@ -123,7 +128,7 @@ type BTree[K any, V any] struct {
 }
 
 // NewBTreeFile creates a new database file and initializes a new B-tree within it.
-func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, logManager *LogManager) (*BTree[K, V], error) {
+func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, logManager *wal.LogManager) (*BTree[K, V], error) {
 	if degree < 2 {
 		return nil, fmt.Errorf("%w: got %d", ErrInvalidDegree, degree)
 	}
@@ -134,7 +139,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		return nil, errors.New("all key/value serializers must be provided")
 	}
 
-	dm, err := NewDiskManager(filePath, pageSize)
+	dm, err := flushmanager.NewDiskManager(filePath, pageSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create disk manager: %w", err)
 	}
@@ -150,7 +155,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		return nil, fmt.Errorf("failed to open/create database file: %w", err)
 	}
 
-	bpm := NewBufferPoolManager(poolSize, dm, logManager)
+	bpm := memtable.NewBufferPoolManager(poolSize, dm, logManager)
 
 	bt := &BTree[K, V]{
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
@@ -177,7 +182,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		tree:         bt,
 		keys:         make([]K, 0),
 		values:       make([]V, 0),
-		childPageIDs: make([]PageID, 0),
+		childPageIDs: make([]pagemanager.PageID, 0),
 	}
 
 	// Serialize the new empty root node to its page
@@ -196,7 +201,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 	}
 
 	// Update the file header with the new root page ID and other metadata
-	if err := dm.UpdateHeaderField(func(h *DBFileHeader) {
+	if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
 		h.RootPageID = rootPageIDForNew
 		h.TreeSize = 0 // Initially empty tree
 		h.Degree = uint32(degree)
@@ -206,12 +211,12 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		return nil, fmt.Errorf("failed to update header with root page ID: %w", err)
 	}
 
-	log.Printf("INFO: New B-tree database created at %s with root PageID %d, Degree %d", filePath, rootPageIDForNew, degree)
+	log.Printf("INFO: New B-tree database created at %s with root pagemanager.PageID %d, Degree %d", filePath, rootPageIDForNew, degree)
 	return bt, nil
 }
 
 // OpenBTreeFile opens an existing database file and initializes the B-tree from its header.
-func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, logManager *LogManager) (*BTree[K, V], error) {
+func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, logManager *wal.LogManager) (*BTree[K, V], error) {
 	if keyOrder == nil {
 		return nil, ErrNilKeyOrder
 	}
@@ -219,7 +224,7 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 		return nil, errors.New("all key/value serializers must be provided")
 	}
 
-	dm, err := NewDiskManager(filePath, defaultPageSize)
+	dm, err := flushmanager.NewDiskManager(filePath, defaultPageSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create disk manager: %w", err)
 	}
@@ -232,12 +237,12 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 	}
 
 	// Ensure the DiskManager's page size matches the file's page size
-	if dm.pageSize != int(header.PageSize) {
-		log.Printf("WARNING: DiskManager initialized with page size %d, but file header specifies %d. Adjusting DiskManager's pageSize.", dm.pageSize, header.PageSize)
-		dm.pageSize = int(header.PageSize) // Adjust DM's page size to match the file's
+	if dm.GetPageSize() != int(header.PageSize) {
+		log.Printf("WARNING: DiskManager initialized with page size %d, but file header specifies %d. Adjusting DiskManager's pageSize.", dm.GetPageSize(), header.PageSize)
+		dm.SetPageSize(int(header.PageSize)) // Adjust DM's page size to match the file's
 	}
 
-	bpm := NewBufferPoolManager(poolSize, dm, logManager)
+	bpm := memtable.NewBufferPoolManager(poolSize, dm, logManager)
 
 	bt := &BTree[K, V]{
 		rootPageID:   header.RootPageID,
@@ -261,7 +266,7 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 	if logManager != nil {
 		log.Println("INFO: Starting database recovery process...")
 		// Pass the BTree instance to recovery so it can interact with its locking and transaction table
-		if err := logManager.Recover(dm, bpm, header.LastLSN); err != nil {
+		if err := logManager.Recover(dm, wal.LSN(header.LastLSN)); err != nil {
 			dm.Close()
 			return nil, fmt.Errorf("database recovery failed: %w", err)
 		}
@@ -271,7 +276,7 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 		// For now, we assume recovery just applies changes and doesn't write new logs to header.
 		// A more robust recovery would read the latest LSN after recovery and update header.
 		// For simplicity, we re-read header after recovery.
-		if err := dm.readHeader(header); err != nil { // Re-read header after potential recovery changes
+		if err := dm.ReadHeader(header); err != nil { // Re-read header after potential recovery changes
 			dm.Close()
 			return nil, fmt.Errorf("failed to re-read header after recovery: %w", err)
 		}
@@ -282,28 +287,28 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 	}
 	// --- END CRITICAL FIX ---
 
-	log.Printf("INFO: Existing B-tree database opened from %s. Root PageID: %d, Degree: %d, TreeSize: %d",
+	log.Printf("INFO: Existing B-tree database opened from %s. Root pagemanager.PageID: %d, Degree: %d, TreeSize: %d",
 		filePath, bt.rootPageID, bt.degree, header.TreeSize)
 	return bt, nil
 }
 
-func (bt *BTree[K, V]) GetRootPageID() PageID {
+func (bt *BTree[K, V]) GetRootPageID() pagemanager.PageID {
 	return bt.rootPageID
 }
 
 // SetRootPageID updates the B-tree's in-memory rootPageID and logs the change.
 // It also updates the disk header immediately to ensure durability of root changes.
-func (bt *BTree[K, V]) SetRootPageID(newRootPageID PageID, txnID uint64) error {
+func (bt *BTree[K, V]) SetRootPageID(newRootPageID pagemanager.PageID, txnID uint64) error {
 	oldRootPageID := bt.rootPageID
 	bt.rootPageID = newRootPageID
 
 	// Log the root page ID change
-	newRootPageIDBytes := make([]byte, 8) // PageID is uint64
+	newRootPageIDBytes := make([]byte, 8) // pagemanager.PageID is uint64
 	binary.LittleEndian.PutUint64(newRootPageIDBytes, uint64(newRootPageID))
 
-	logRecord := &LogRecord{
+	logRecord := &wal.LogRecord{
 		TxnID:   txnID,
-		Type:    LogRecordTypeRootChange,
+		Type:    wal.LogRecordTypeRootChange,
 		PageID:  newRootPageID,   // New root page ID
 		OldData: make([]byte, 8), // Store old root for undo, if needed
 		NewData: newRootPageIDBytes,
@@ -328,7 +333,7 @@ func (bt *BTree[K, V]) SetRootPageID(newRootPageID PageID, txnID uint64) error {
 	}
 
 	// Update the file header with the new root page ID
-	if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader) {
+	if err := bt.diskManager.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
 		h.RootPageID = newRootPageID
 	}); err != nil {
 		log.Printf("ERROR: Failed to update disk header with new root page ID %d: %v", newRootPageID, err)
@@ -342,24 +347,24 @@ func (bt *BTree[K, V]) SetRootPageID(newRootPageID PageID, txnID uint64) error {
 	return nil
 }
 
-func (bt *BTree[K, V]) GetDiskManager() *DiskManager {
+func (bt *BTree[K, V]) GetDiskManager() *flushmanager.DiskManager {
 	return bt.diskManager
 }
 
-func (bt *BTree[K, V]) FetchPage(pageID PageID) (*Page, error) {
+func (bt *BTree[K, V]) FetchPage(pageID pagemanager.PageID) (*pagemanager.Page, error) {
 	return bt.bpm.FetchPage(pageID)
 }
 
-func (bt *BTree[K, V]) FlushPage(pageID PageID) error {
+func (bt *BTree[K, V]) FlushPage(pageID pagemanager.PageID) error {
 	return bt.bpm.FlushPage(pageID)
 }
 
-func (bt *BTree[K, V]) UnpinPage(pageID PageID, isDirty bool) error {
+func (bt *BTree[K, V]) UnpinPage(pageID pagemanager.PageID, isDirty bool) error {
 	return bt.bpm.UnpinPage(pageID, isDirty)
 }
 
 // fetchNode retrieves a node from the buffer pool or disk.
-func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
+func (bt *BTree[K, V]) fetchNode(pageID pagemanager.PageID) (*Node[K, V], *pagemanager.Page, error) {
 	if pageID == InvalidPageID {
 		return nil, nil, errors.New("attempted to fetch node with InvalidPageID")
 	}
@@ -380,38 +385,38 @@ func (bt *BTree[K, V]) fetchNode(pageID PageID) (*Node[K, V], *Page, error) {
 	return node, page, nil
 }
 
-func (bt *BTree[K, V]) DeallocatePage(pageID PageID) error {
+func (bt *BTree[K, V]) DeallocatePage(pageID pagemanager.PageID) error {
 	return bt.diskManager.DeallocatePage(pageID)
 }
 func (bt *BTree[K, V]) GetPageSize() int {
 	return DefaultPageSize
 }
 
-func (bt *BTree[K, V]) ReadPage(pageID PageID, pageData []byte) error {
+func (bt *BTree[K, V]) ReadPage(pageID pagemanager.PageID, pageData []byte) error {
 	return bt.diskManager.ReadPage(pageID, pageData)
 }
 
 func (bt *BTree[K, V]) GetNumPages() uint64 {
-	return bt.diskManager.numPages
+	return bt.diskManager.GetNumPages()
 }
 
-func (bt *BTree[K, V]) InvalidatePage(pageID PageID) {
+func (bt *BTree[K, V]) InvalidatePage(pageID pagemanager.PageID) {
 	bt.bpm.InvalidatePage(pageID)
 }
 
 func (bt *BTree[K, V]) SetNumPages(totalPages uint64) {
-	bt.diskManager.numPages = totalPages
+	bt.diskManager.SetNumPages(totalPages)
 }
 
-func (bt *BTree[K, V]) WritePage(pageID PageID, pageData []byte) error {
+func (bt *BTree[K, V]) WritePage(pageID pagemanager.PageID, pageData []byte) error {
 	return bt.diskManager.WritePage(pageID, pageData)
 }
 
 // GetSize reads the persisted tree size from the file header.
 func (bt *BTree[K, V]) GetSize() (uint64, error) {
-	var header DBFileHeader
+	var header flushmanager.DBFileHeader
 	// Read header directly, ensures latest size from disk
-	if err := bt.diskManager.readHeader(&header); err != nil {
+	if err := bt.diskManager.ReadHeader(&header); err != nil {
 		return 0, fmt.Errorf("failed to read tree size from header: %w", err)
 	}
 	return header.TreeSize, nil
@@ -421,7 +426,7 @@ func (bt *BTree[K, V]) GetSize() (uint64, error) {
 // NOTE: This is inefficient for frequent updates. In a real DB, size is often
 // updated in memory and flushed periodically or at shutdown/checkpoint.
 func (bt *BTree[K, V]) updatePersistedSize(delta int64) error {
-	return bt.diskManager.UpdateHeaderField(func(h *DBFileHeader) {
+	return bt.diskManager.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
 		if delta > 0 {
 			h.TreeSize += uint64(delta)
 		} else if delta < 0 {
@@ -460,7 +465,7 @@ func (bt *BTree[K, V]) Search(key K) (V, bool, error) {
 
 // searchRecursive performs a recursive search for a key.
 // It takes ownership of currNode and currPage, unpinning currPage before returning.
-func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *Page, key K) (V, bool, error) {
+func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *pagemanager.Page, key K) (V, bool, error) {
 	var zeroV V
 
 	// Find the index where the key *could* be or where it should be if not found
@@ -544,7 +549,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 			_ = bt.diskManager.DeallocatePage(rootPgID) // Try to free the orphaned page
 			return fmt.Errorf("failed to set initial root page ID: %w", err)
 		}
-		rootNode := &Node[K, V]{pageID: rootPgID, isLeaf: true, tree: bt, keys: make([]K, 0), values: make([]V, 0), childPageIDs: make([]PageID, 0)}
+		rootNode := &Node[K, V]{pageID: rootPgID, isLeaf: true, tree: bt, keys: make([]K, 0), values: make([]V, 0), childPageIDs: make([]pagemanager.PageID, 0)}
 		// TODO: WAL Log creation of new root page with TxnID
 		return bt.insertNonFull(rootNode, rootPg, key, value, !exists, txnID) // insertNonFull unpins rootPg
 	}
@@ -576,8 +581,8 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		// Create the new in-memory root node
 		newRootNode := &Node[K, V]{
 			pageID:       newRootPageID,
-			isLeaf:       false,                   // New root is always an internal node
-			childPageIDs: []PageID{oldRootPageID}, // Old root becomes the first child
+			isLeaf:       false,                               // New root is always an internal node
+			childPageIDs: []pagemanager.PageID{oldRootPageID}, // Old root becomes the first child
 			tree:         bt,
 			keys:         make([]K, 0),
 			values:       make([]V, 0),
@@ -626,7 +631,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 
 // insertNonFull inserts a key-value pair into a node that is guaranteed not to be full.
 // It takes ownership of `node` and `page`, unpinning `page` before returning.
-func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value V, incrementSize bool, txnID uint64) error {
+func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, key K, value V, incrementSize bool, txnID uint64) error {
 	// Find the correct insertion position
 	idx := slices.IndexFunc(node.keys, func(k K) bool { return bt.keyOrder(key, k) <= 0 })
 	if idx == -1 { // Key is larger than all existing keys
@@ -765,7 +770,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *Page, key K, value 
 // It serializes and unpins `childToSplitPage` and the new sibling page.
 // It modifies `parentNode` and marks `parentPage` dirty, but *does not unpin* `parentPage`.
 // The caller (`insertNonFull`) is responsible for serializing and unpinning `parentPage`.
-func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *Page, childIdx int, childToSplitNode *Node[K, V], childToSplitPage *Page, txnID uint64) error {
+func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *pagemanager.Page, childIdx int, childToSplitNode *Node[K, V], childToSplitPage *pagemanager.Page, txnID uint64) error {
 	t := bt.degree // B-tree degree/order
 
 	// 1. Create a new page for the new sibling node
@@ -784,9 +789,9 @@ func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *Page, chil
 		values: make([]V, t-1),
 	}
 	if !childToSplitNode.isLeaf {
-		newSiblingNode.childPageIDs = make([]PageID, t) // t children for the right half
+		newSiblingNode.childPageIDs = make([]pagemanager.PageID, t) // t children for the right half
 	} else {
-		newSiblingNode.childPageIDs = make([]PageID, 0)
+		newSiblingNode.childPageIDs = make([]pagemanager.PageID, 0)
 	}
 
 	// 3. Find the middle key to promote to the parent
@@ -940,7 +945,7 @@ func (bt *BTree[K, V]) Delete(key K, txnID uint64) error {
 // deleteRecursive attempts to delete a key from the subtree rooted at `node`.
 // It takes ownership of `node` and `nodePage`, unpinning `nodePage` before returning.
 // Returns (true if a key was deleted, error).
-func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K, txnID uint64) (bool, error) {
+func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *pagemanager.Page, key K, txnID uint64) (bool, error) {
 	idx, found := slices.BinarySearchFunc(node.keys, key, bt.keyOrder)
 	var err error
 	var actuallyDeleted bool = false
@@ -1052,7 +1057,7 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *Page, key K, 
 // deleteFromInternalNode handles the case where the key to delete (`key`) is found in an internal `node`.
 // It replaces `key` with its predecessor or successor, and then recursively deletes that predecessor/successor.
 // It takes ownership of `node` and `nodePage`, responsible for serializing `nodePage` (if modified) and unpinning it.
-func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, key K, idxInNode int, txnID uint64) (bool, error) {
+func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *pagemanager.Page, key K, idxInNode int, txnID uint64) (bool, error) {
 	t := bt.degree
 	var err error
 	keyActuallyRemoved := false // This will be true if the replacement key is successfully deleted from child
@@ -1205,7 +1210,7 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *Page, 
 
 // findPredecessor finds the rightmost key in the subtree rooted at `node`.
 // It takes ownership of `node` and `nodePage`, unpinning `nodePage` before returning.
-func (bt *BTree[K, V]) findPredecessor(node *Node[K, V], nodePage *Page) (K, V) {
+func (bt *BTree[K, V]) findPredecessor(node *Node[K, V], nodePage *pagemanager.Page) (K, V) {
 	if node.isLeaf {
 		// If it's a leaf, the predecessor is simply the largest key in this node.
 		k := node.keys[len(node.keys)-1]
@@ -1236,7 +1241,7 @@ func (bt *BTree[K, V]) findPredecessor(node *Node[K, V], nodePage *Page) (K, V) 
 
 // findSuccessor finds the leftmost key in the subtree rooted at `node`.
 // It takes ownership of `node` and `nodePage`, unpinning `nodePage` before returning.
-func (bt *BTree[K, V]) findSuccessor(node *Node[K, V], nodePage *Page) (K, V) {
+func (bt *BTree[K, V]) findSuccessor(node *Node[K, V], nodePage *pagemanager.Page) (K, V) {
 	if node.isLeaf {
 		// If it's a leaf, the successor is simply the smallest key in this node.
 		k := node.keys[0]
@@ -1268,7 +1273,7 @@ func (bt *BTree[K, V]) findSuccessor(node *Node[K, V], nodePage *Page) (K, V) {
 // It takes ownership of `parentNode` and `parentPage` but *does not unpin `parentPage`*.
 // It fetches, modifies, serializes, and unpins the involved child and sibling pages.
 // It marks `parentPage` dirty if `parentNode` is modified.
-func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPage *Page, childIdx int, txnID uint64) error {
+func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPage *pagemanager.Page, childIdx int, txnID uint64) error {
 	childPageID := parentNode.childPageIDs[childIdx]
 	childNode, childPage, err := bt.fetchNode(childPageID) // Child is pinned
 	if err != nil {
@@ -1367,9 +1372,9 @@ func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPa
 // It takes ownership of all nodes/pages. It serializes and unpins `childPage` and `leftSiblingPage`.
 // It marks `parentPage` dirty but *does not unpin* it.
 func (bt *BTree[K, V]) borrowFromLeftSibling(
-	parentNode *Node[K, V], parentPage *Page, childIdx int,
-	childNode *Node[K, V], childPage *Page,
-	leftSiblingNode *Node[K, V], leftSiblingPage *Page, txnID uint64) error {
+	parentNode *Node[K, V], parentPage *pagemanager.Page, childIdx int,
+	childNode *Node[K, V], childPage *pagemanager.Page,
+	leftSiblingNode *Node[K, V], leftSiblingPage *pagemanager.Page, txnID uint64) error {
 
 	log.Printf("DEBUG: Txn %d: Borrowing from left sibling: parent %d, child %d, leftSibling %d", txnID, parentNode.pageID, childNode.pageID, leftSiblingNode.pageID)
 
@@ -1431,9 +1436,9 @@ func (bt *BTree[K, V]) borrowFromLeftSibling(
 // It takes ownership of all nodes/pages. It serializes and unpins `childPage` and `rightSiblingPage`.
 // It marks `parentPage` dirty but *does not unpin* it.
 func (bt *BTree[K, V]) borrowFromRightSibling(
-	parentNode *Node[K, V], parentPage *Page, childIdx int,
-	childNode *Node[K, V], childPage *Page,
-	rightSiblingNode *Node[K, V], rightSiblingPage *Page, txnID uint64) error {
+	parentNode *Node[K, V], parentPage *pagemanager.Page, childIdx int,
+	childNode *Node[K, V], childPage *pagemanager.Page,
+	rightSiblingNode *Node[K, V], rightSiblingPage *pagemanager.Page, txnID uint64) error {
 
 	log.Printf("DEBUG: Txn %d: Borrowing from right sibling: parent %d, child %d, rightSibling %d", txnID, parentNode.pageID, childNode.pageID, rightSiblingNode.pageID)
 
@@ -1498,11 +1503,11 @@ func (bt *BTree[K, V]) borrowFromRightSibling(
 // The `originalKeyToDelete` is the key that was found in the parent, now moved down, and needs
 // to be recursively deleted from the merged child.
 func (bt *BTree[K, V]) mergeChildrenAndKey(
-	parentNode *Node[K, V], parentPage *Page, leftMergeChildIdx int,
+	parentNode *Node[K, V], parentPage *pagemanager.Page, leftMergeChildIdx int,
 	// Hints for left/right nodes/pages; they will be fetched if nil.
 	// For clarity and directness, this function will always fetch them.
-	_leftNodeHint *Node[K, V], _leftPageHint *Page,
-	_rightNodeHint *Node[K, V], _rightPageHint *Page,
+	_leftNodeHint *Node[K, V], _leftPageHint *pagemanager.Page,
+	_rightNodeHint *Node[K, V], _rightPageHint *pagemanager.Page,
 	originalKeyToDelete K, // The key that was in parentNode and now needs to be deleted from the merged child
 	txnID uint64) error {
 
@@ -1628,9 +1633,9 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 	// This record needs to contain enough info to redo/undo the operations if needed.
 	// For V1, we'll log a generic PREPARE record. Full operations would be serialized into NewData.
 	// For now, we assume the Coordinator will re-send operations on COMMIT/ABORT.
-	lsn, err := bt.logManager.Append(&LogRecord{
+	lsn, err := bt.logManager.Append(&wal.LogRecord{
 		TxnID:  txnID,
-		Type:   LogRecordTypePrepare,
+		Type:   wal.LogRecordTypePrepare,
 		PageID: InvalidPageID, // Not specific to a page, but to the transaction
 	})
 	if err != nil {
@@ -1668,9 +1673,9 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 	log.Printf("INFO: Txn %d: Received COMMIT request. Logging COMMIT record.", txnID)
 
 	// Log the COMMIT record
-	lsn, err := bt.logManager.Append(&LogRecord{
+	lsn, err := bt.logManager.Append(&wal.LogRecord{
 		TxnID:  txnID,
-		Type:   LogRecordTypeCommitTxn,
+		Type:   wal.LogRecordTypeCommitTxn,
 		PageID: InvalidPageID,
 	})
 	if err != nil {
@@ -1706,9 +1711,9 @@ func (bt *BTree[K, V]) Abort(txnID uint64) error {
 	log.Printf("INFO: Txn %d: Received ABORT request. Logging ABORT record.", txnID)
 
 	// Log the ABORT record
-	lsn, err := bt.logManager.Append(&LogRecord{
+	lsn, err := bt.logManager.Append(&wal.LogRecord{
 		TxnID:  txnID,
-		Type:   LogRecordTypeAbortTxn,
+		Type:   wal.LogRecordTypeAbortTxn,
 		PageID: InvalidPageID,
 	})
 	if err != nil {
@@ -1922,16 +1927,16 @@ type BTreeIterator[K any, V any] interface {
 // pathEntry represents a node and the index of the child taken to reach the next level.
 type pathEntry[K any, V any] struct {
 	node *Node[K, V]
-	page *Page // Pinned and latched page for this node
-	idx  int   // Index of the child that was followed to get to the next level
+	page *pagemanager.Page // Pinned and latched page for this node
+	idx  int               // Index of the child that was followed to get to the next level
 }
 
 // bTreeIterator is the concrete implementation of BTreeIterator.
 type bTreeIterator[K, V any] struct {
 	tree              *BTree[K, V]
-	currentNode       *Node[K, V] // The current leaf node being iterated
-	currentPage       *Page       // The page object for currentNode (pinned and latched)
-	currentKeyIdx     int         // Index of the current key in currentNode.keys
+	currentNode       *Node[K, V]       // The current leaf node being iterated
+	currentPage       *pagemanager.Page // The page object for currentNode (pinned and latched)
+	currentKeyIdx     int               // Index of the current key in currentNode.keys
 	startKey          K
 	endKey            K
 	isExhausted       bool
@@ -2022,7 +2027,7 @@ func (bt *BTree[K, V]) FullScan() (BTreeIterator[K, V], error) {
 
 // findLeafForIterator recursively finds the leaf node where the iteration should start.
 // It uses read crabbing (S-latches) and populates the pathStack.
-func (bt *BTree[K, V]) findLeafForIterator(pageID PageID, key K, pathStack []pathEntry[K, V]) (*Node[K, V], *Page, error) {
+func (bt *BTree[K, V]) findLeafForIterator(pageID pagemanager.PageID, key K, pathStack []pathEntry[K, V]) (*Node[K, V], *pagemanager.Page, error) {
 	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
 	if err != nil {
 		return nil, nil, err
@@ -2189,7 +2194,7 @@ func (iter *bTreeIterator[K, V]) moveToNextLeaf() error {
 
 // findLeftmostLeaf recursively finds the leftmost leaf node in the subtree rooted at pageID.
 // It populates the pathStack as it descends.
-func (bt *BTree[K, V]) findLeftmostLeaf(pageID PageID, pathStack []pathEntry[K, V]) (*Node[K, V], *Page, error) {
+func (bt *BTree[K, V]) findLeftmostLeaf(pageID pagemanager.PageID, pathStack []pathEntry[K, V]) (*Node[K, V], *pagemanager.Page, error) {
 	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
 	if err != nil {
 		return nil, nil, err

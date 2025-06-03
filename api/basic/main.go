@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm" // Import the FSM for sharding info (e.g., GetSlotForHashKey, SlotRangeInfo)
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus" // Import the FSM for sharding info (e.g., GetSlotForHashKey, SlotRangeInfo)
 )
 
 const (

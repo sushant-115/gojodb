@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
-	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm"
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 	// For advanced CLI features like cursor movement and rich history,
 	// consider using a library like github.com/chzyer/readline or github.com/c-bata/go-prompt.
 	// These require external dependencies and cannot be directly integrated here.

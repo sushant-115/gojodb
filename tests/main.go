@@ -8,6 +8,7 @@ import (
 
 	// Import your btree package
 	"github.com/sushant-115/gojodb/core/indexing/btree"
+	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
 // Helper function to create default serializers for int64 keys and string values
@@ -51,7 +52,7 @@ func main() {
 	fmt.Println("--- Starting B-Tree Persistence and WAL Test ---")
 
 	// 1. Initialize LogManager
-	logManager, err := btree.NewLogManager(logDir, archiveDir, 4096, segmentSizeLimit)
+	logManager, err := wal.NewLogManager(logDir, archiveDir, 4096, segmentSizeLimit)
 	if err != nil {
 		log.Fatalf("Failed to create LogManager: %v", err)
 	}

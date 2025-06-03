@@ -1,4 +1,4 @@
-package btree
+package flushmanager
 
 import (
 	"bytes"
@@ -8,6 +8,23 @@ import (
 	"log"
 	"os"
 	"sync"
+
+	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
+)
+
+// --- Configuration & Constants ---
+
+const (
+	DefaultPageSize                      = 4096       // Bytes
+	FileHeaderPageID  pagemanager.PageID = 0          // Page ID for the database file header
+	InvalidPageID     pagemanager.PageID = 0          // Also used for header, but generally indicates invalid/unallocated
+	MaxFilenameLength                    = 255        // Example limit
+	DBMagic           uint32             = 0x6010DB00 // GoJoDB00
+
+	// dbFileHeaderSize must be a fixed size that matches how it's written/read.
+	// We'll ensure DBFileHeader struct matches this.
+	dbFileHeaderSize = 128 // Increased size for more metadata
+	checksumSize     = 4   // Size of CRC32 checksum
 )
 
 // --- DiskManager ---
@@ -19,11 +36,11 @@ type DBFileHeader struct {
 	Magic          uint32
 	Version        uint32
 	PageSize       uint32
-	RootPageID     PageID // uint64
+	RootPageID     pagemanager.PageID // uint64
 	Degree         uint32
 	TreeSize       uint64                               // Persisted tree size
-	FreeListPageID PageID                               // uint64
-	LastLSN        LSN                                  // uint64
+	FreeListPageID pagemanager.PageID                   // uint64
+	LastLSN        pagemanager.LSN                      // uint64
 	_              [dbFileHeaderSize - (4*4 + 4*8)]byte // Explicit padding: Corrected calculation
 }
 
@@ -69,6 +86,14 @@ func NewDiskManager(filePath string, pageSize int) (*DiskManager, error) {
 	}, nil
 }
 
+func (dm *DiskManager) GetPageSize() int {
+	return dm.pageSize
+}
+
+func (dm *DiskManager) GetNumPages() uint64 {
+	return dm.numPages
+}
+
 // OpenOrCreateFile attempts to open an existing database file or create a new one.
 // The 'create' flag determines behavior if the file doesn't exist or already exists.
 func (dm *DiskManager) OpenOrCreateFile(create bool, degree int, initialTreeSize uint64) (*DBFileHeader, error) {
@@ -99,11 +124,11 @@ func (dm *DiskManager) OpenOrCreateFile(create bool, degree int, initialTreeSize
 			Magic:          DBMagic,
 			Version:        1,
 			PageSize:       uint32(dm.pageSize),
-			RootPageID:     InvalidPageID, // Will be updated when B-tree root is created
+			RootPageID:     pagemanager.InvalidPageID, // Will be updated when B-tree root is created
 			Degree:         uint32(degree),
 			TreeSize:       initialTreeSize,
-			FreeListPageID: InvalidPageID, // To be initialized later
-			LastLSN:        InvalidLSN,
+			FreeListPageID: pagemanager.InvalidPageID, // To be initialized later
+			LastLSN:        pagemanager.InvalidLSN,
 		}
 
 		// Write the new header to page 0
@@ -196,6 +221,21 @@ func (dm *DiskManager) writeHeader(header *DBFileHeader) error {
 }
 
 // readHeader reads the DBFileHeader from the beginning of the file (offset 0).
+func (dm *DiskManager) ReadHeader(header *DBFileHeader) error {
+	return dm.readHeader(header)
+}
+
+// readHeader reads the DBFileHeader from the beginning of the file (offset 0).
+func (dm *DiskManager) SetNumPages(totalPages uint64) {
+	dm.numPages = totalPages
+}
+
+// readHeader reads the DBFileHeader from the beginning of the file (offset 0).
+func (dm *DiskManager) SetPageSize(pageSize int) {
+	dm.pageSize = pageSize
+}
+
+// readHeader reads the DBFileHeader from the beginning of the file (offset 0).
 func (dm *DiskManager) readHeader(header *DBFileHeader) error {
 	data := make([]byte, dbFileHeaderSize)
 	// Read exactly dbFileHeaderSize bytes from offset 0
@@ -236,7 +276,7 @@ func (dm *DiskManager) UpdateHeaderField(updateFunc func(header *DBFileHeader)) 
 }
 
 // ReadPage reads a page's data from disk into the provided pageData buffer.
-func (dm *DiskManager) ReadPage(pageID PageID, pageData []byte) error {
+func (dm *DiskManager) ReadPage(pageID pagemanager.PageID, pageData []byte) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	if dm.file == nil {
@@ -260,7 +300,7 @@ func (dm *DiskManager) ReadPage(pageID PageID, pageData []byte) error {
 }
 
 // WritePage writes pageData to disk at the specified pageID's location.
-func (dm *DiskManager) WritePage(pageID PageID, pageData []byte) error {
+func (dm *DiskManager) WritePage(pageID pagemanager.PageID, pageData []byte) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	if dm.file == nil {
@@ -279,32 +319,32 @@ func (dm *DiskManager) WritePage(pageID PageID, pageData []byte) error {
 }
 
 // allocateRawPageInternal extends the file to allocate a new page.
-func (dm *DiskManager) allocateRawPageInternal() (PageID, error) {
+func (dm *DiskManager) allocateRawPageInternal() (pagemanager.PageID, error) {
 	// TODO: Integrate Free Space Management.
 	// 1. Request a page from freeListPageManager.
 	// 2. If available, return that PageID.
 	// 3. If not, extend file as below.
-	newPageID := PageID(dm.numPages)
+	newPageID := pagemanager.PageID(dm.numPages)
 	emptyPageData := make([]byte, dm.pageSize)
 	offset := int64(newPageID) * int64(dm.pageSize)
 
 	// Write an empty page to extend the file
 	if _, err := dm.file.WriteAt(emptyPageData, offset); err != nil {
-		return InvalidPageID, fmt.Errorf("%w: extending file for new page %d: %v", ErrIO, newPageID, err)
+		return pagemanager.InvalidPageID, fmt.Errorf("%w: extending file for new page %d: %v", ErrIO, newPageID, err)
 	}
 	dm.numPages++
 	return newPageID, nil
 }
 
 // AllocatePage allocates a new page on disk and returns its ID.
-func (dm *DiskManager) AllocatePage() (PageID, error) { // Public, locked version
+func (dm *DiskManager) AllocatePage() (pagemanager.PageID, error) { // Public, locked version
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	return dm.allocateRawPageInternal()
 }
 
 // DeallocatePage marks a page as free (placeholder).
-func (dm *DiskManager) DeallocatePage(pageID PageID) error {
+func (dm *DiskManager) DeallocatePage(pageID pagemanager.PageID) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	// TODO: Integrate Free Space Management.

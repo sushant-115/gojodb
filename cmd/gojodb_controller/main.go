@@ -17,7 +17,7 @@ import (
 	"github.com/hashicorp/raft"                   // Raft library
 	raftboltdb "github.com/hashicorp/raft-boltdb" // BoltDB backend for Raft log and stable store
 
-	"github.com/sushant-115/gojodb/cmd/gojodb_controller/fsm" // Our custom FSM
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus" // Our custom FSM
 )
 
 const (
