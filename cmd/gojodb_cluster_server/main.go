@@ -20,6 +20,7 @@ import (
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"                 // NEW: Inverted Index package
 	replication "github.com/sushant-115/gojodb/core/replication/log_replication" // B-tree core package
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"          // FSM package for sharding info
+	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
 const (
@@ -49,7 +50,7 @@ const (
 var (
 	dbInstance            *btree_core.BTree[string, string] // Using string keys now
 	dbLock                sync.RWMutex                      // Global lock for the entire B-Tree operations
-	logManager            *btree_core.LogManager
+	logManager            *wal.LogManager
 	invertedIndexInstance *inverted_index.InvertedIndex // NEW: Global inverted index instance
 
 	// Storage Node identity
@@ -116,7 +117,7 @@ func initStorageNode() error {
 	uniqueInvertedIndexArchiveDir := fmt.Sprintf("data/%s_inverted_index_archives", myStorageNodeID)
 
 	// 2. Initialize LogManager for this Storage Node
-	logManager, err = btree_core.NewLogManager(uniqueLogDir, uniqueArchiveDir, logBufferSize, logSegmentSize)
+	logManager, err = wal.NewLogManager(uniqueLogDir, uniqueArchiveDir, logBufferSize, logSegmentSize)
 	if err != nil {
 		return fmt.Errorf("failed to create LogManager for storage node %s: %w", myStorageNodeID, err)
 	}
