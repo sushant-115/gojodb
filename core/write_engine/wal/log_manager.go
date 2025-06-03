@@ -38,6 +38,10 @@ const (
 	LogRecordTypeFreePage                           // Deallocation of a page
 	LogRecordTypeCheckpointStart
 	LogRecordTypeCheckpointEnd
+	LogTypeRTreeInsert
+	LogTypeRTreeSplit
+	LogTypeRTreeNewRoot
+	LogTypeRTreeUpdate
 	// --- NEW: 2PC Specific Log Record Types ---
 	LogRecordTypePrepare   // Transaction Prepare record
 	LogRecordTypeCommitTxn // Transaction Commit record (final phase 2)
