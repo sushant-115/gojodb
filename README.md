@@ -25,12 +25,12 @@ GojoDB provides a robust set of features to handle various data storage and retr
 
 * **Inverted Indexing:** Enables lightning-fast full-text search queries across stored values. This is ideal for applications requiring efficient search capabilities.  
 * **Log Replication:** Ensures data durability and high availability through a robust log-based replication mechanism. Data changes on the primary node are asynchronously or synchronously replicated to secondary nodes.  
-* **Tiered Storage Management:** Optimizes storage costs and performance by intelligently moving data between different storage tiers:  
+* **Tiered Storage Management:** Optimizes storage costs and performance by intelligently moving data between different storage tiers (Work in progress):  
   * **Hot Storage:** In-memory or fast local disk (e.g., filestore_adapter.go, efs_adapter.go).  
   * **Cold Storage:** Cost-effective, highly durable cloud storage (e.g., AWS S3 via s3_adapter.go, Google Cloud Storage via gcs_adapter.go).  
 * **B-Tree Indexing:** Utilizes B-trees for efficient key-value lookups and range queries, managed by a buffer pool and disk manager.  
 * **Data Archival & Restore:** Includes mechanisms for archiving old log segments to cold storage and restoring them when needed (archive_job.go, restore_job.go).  
-* **Security:** Basic cryptographic utilities (crypto_utils.go) for potential data encryption at rest or in transit.  
+* **Security:** Basic cryptographic utilities (crypto_utils.go) for potential data encryption at rest or in transit (Work in progress).  
 * **Multiple API Endpoints:**  
   * **Basic API:** For fundamental put/get operations (api/basic/main.go).  
   * **Bulk Writes API:** Optimized for high-throughput data ingestion (api/bulk_writes_service/main.go).  
