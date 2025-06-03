@@ -2,550 +2,710 @@ package spatial
 
 import (
 	"fmt"
-	"log"
 	"math"
+	"sync"
 )
 
-// Point represents a 2D geographical point.
-type Point struct {
-	Lat float64
-	Lon float64
-}
+const (
+	// M is the maximum number of entries in a node.
+	// This is a critical parameter affecting tree performance.
+	M = 8
+	// m is the minimum number of entries in a node.
+	// m must be <= M/2.
+	m = M / 2
+)
 
-// Rect represents a 2D bounding box (Minimum Bounding Rectangle).
+// Rect represents a 2D bounding box.
 type Rect struct {
-	Min Point
-	Max Point
+	MinX, MinY float64
+	MaxX, MaxY float64
 }
 
-// NewRect creates a new Rect from two points.
-func NewRect(p1, p2 Point) Rect {
-	minLat := math.Min(p1.Lat, p2.Lat)
-	maxLat := math.Max(p1.Lat, p2.Lat)
-	minLon := math.Min(p1.Lon, p2.Lon)
-	maxLon := math.Max(p1.Lon, p2.Lon)
-	return Rect{
-		Min: Point{Lat: minLat, Lon: minLon},
-		Max: Point{Lat: maxLat, Lon: maxLon},
-	}
+// NewRect creates a new Rect.
+func NewRect(minX, minY, maxX, maxY float64) Rect {
+	return Rect{MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY}
 }
 
-// Contains checks if a point is within the rectangle.
-func (r Rect) Contains(p Point) bool {
-	return p.Lat >= r.Min.Lat && p.Lat <= r.Max.Lat &&
-		p.Lon >= r.Min.Lon && p.Lon <= r.Max.Lon
+// Area calculates the area of the rectangle.
+func (r Rect) Area() float64 {
+	return (r.MaxX - r.MinX) * (r.MaxY - r.MinY)
 }
 
 // Intersects checks if two rectangles intersect.
-func (r1 Rect) Intersects(r2 Rect) bool {
-	return r1.Min.Lat <= r2.Max.Lat && r1.Max.Lat >= r2.Min.Lat &&
-		r1.Min.Lon <= r2.Max.Lon && r1.Max.Lon >= r2.Min.Lon
+func (r Rect) Intersects(other Rect) bool {
+	return r.MinX <= other.MaxX && r.MaxX >= other.MinX &&
+		r.MinY <= other.MaxY && r.MaxY >= other.MinY
 }
 
-// Union returns the smallest rectangle that contains both r1 and r2.
-func (r1 Rect) Union(r2 Rect) Rect {
+// Contains checks if the rectangle contains another rectangle.
+func (r Rect) Contains(other Rect) bool {
+	return r.MinX <= other.MinX && r.MaxX >= other.MaxX &&
+		r.MinY <= other.MinY && r.MaxY >= other.MaxY
+}
+
+// Union returns the smallest rectangle that encloses both rectangles.
+func (r Rect) Union(other Rect) Rect {
 	return Rect{
-		Min: Point{
-			Lat: math.Min(r1.Min.Lat, r2.Min.Lat),
-			Lon: math.Min(r1.Min.Lon, r2.Min.Lon),
-		},
-		Max: Point{
-			Lat: math.Max(r1.Max.Lat, r2.Max.Lat),
-			Lon: math.Max(r1.Max.Lon, r2.Max.Lon),
-		},
+		MinX: math.Min(r.MinX, other.MinX),
+		MinY: math.Min(r.MinY, other.MinY),
+		MaxX: math.Max(r.MaxX, other.MaxX),
+		MaxY: math.Max(r.MaxY, other.MaxY),
 	}
 }
 
-// Area returns the area of the rectangle.
-func (r Rect) Area() float64 {
-	return (r.Max.Lat - r.Min.Lat) * (r.Max.Lon - r.Min.Lon)
-}
-
-// Enlargement returns the increase in area if another rectangle is added.
+// Enlargement calculates the increase in area if `other` is added to `r`.
 func (r Rect) Enlargement(other Rect) float64 {
 	unionRect := r.Union(other)
 	return unionRect.Area() - r.Area()
 }
 
-// RTreeEntry represents an entry in the R-tree.
-type RTreeEntry struct {
-	Rect   Rect
-	DataID string // The ID of the document associated with this spatial data
+// SpatialData represents an entry in the R-tree, containing a rectangle and a data identifier.
+type SpatialData struct {
+	ID   string // Unique identifier for the data
+	Rect Rect   // Bounding box of the data
 }
 
-// RTreeNode represents a node in the R-tree.
-type RTreeNode struct {
-	IsLeaf   bool
-	Entries  []RTreeEntry // For leaf nodes, these are data entries. For internal nodes, these are child MBRs.
-	Children []*RTreeNode // For internal nodes, pointers to child nodes.
-	Parent   *RTreeNode
+// Entry represents an entry in an R-tree node. It can be a pointer to a child node
+// or a SpatialData object.
+type Entry struct {
+	Rect  Rect
+	Data  *SpatialData // For leaf nodes, points to actual data
+	Child *Node        // For internal nodes, points to a child node
 }
 
-// RTree is a basic R-tree implementation.
+// Node represents a node in the R-tree.
+type Node struct {
+	IsLeaf  bool
+	Entries []*Entry
+	Parent  *Node // Pointer to parent node for tree traversal upwards
+}
+
+// RTree represents the R-tree structure.
 type RTree struct {
-	Root       *RTreeNode
-	MinEntries int // Minimum number of entries per node (m)
-	MaxEntries int // Maximum number of entries per node (M)
+	Root *Node
+	mu   sync.RWMutex // Mutex for concurrent access
 }
 
-// NewRTree creates a new R-tree.
-func NewRTree(minEntries, maxEntries int) *RTree {
-	if minEntries < 2 || maxEntries < minEntries {
-		panic("RTree: minEntries must be at least 2 and maxEntries must be greater than or equal to minEntries")
+// NewRTree creates and initializes a new R-tree.
+func NewRTree() *RTree {
+	root := &Node{
+		IsLeaf:  true,
+		Entries: make([]*Entry, 0, M),
 	}
 	return &RTree{
-		Root:       &RTreeNode{IsLeaf: true},
-		MinEntries: minEntries,
-		MaxEntries: maxEntries,
+		Root: root,
 	}
 }
 
-// Insert adds a new spatial entry to the R-tree.
-func (rt *RTree) Insert(entry RTreeEntry) {
-	leaf := rt.chooseLeaf(rt.Root, entry.Rect)
-	leaf.Entries = append(leaf.Entries, entry)
+// Insert adds a new spatial data entry into the R-tree.
+func (rt *RTree) Insert(data SpatialData) error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 
-	if len(leaf.Entries) > rt.MaxEntries {
-		rt.handleOverflow(leaf)
+	// Create a new entry for the data
+	newEntry := &Entry{Rect: data.Rect, Data: &data}
+
+	// Find the best leaf node to insert the new entry
+	leaf := rt.chooseSubtree(rt.Root, newEntry)
+
+	// Add the entry to the chosen leaf
+	leaf.Entries = append(leaf.Entries, newEntry)
+
+	// If the leaf overflows, split it
+	var splitNode *Node
+	if len(leaf.Entries) > M {
+		splitNode = rt.splitNode(leaf)
+	}
+
+	// Adjust the tree from the leaf up to the root
+	rt.adjustTree(leaf, splitNode)
+	return nil
+}
+
+// Search finds all spatial data entries that intersect with the given query rectangle.
+func (rt *RTree) Search(queryRect Rect) []SpatialData {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	results := make([]SpatialData, 0)
+	rt.searchNode(rt.Root, queryRect, &results)
+	return results
+}
+
+// searchNode recursively searches for intersecting entries within a node.
+func (rt *RTree) searchNode(node *Node, queryRect Rect, results *[]SpatialData) {
+	for _, entry := range node.Entries {
+		if entry.Rect.Intersects(queryRect) {
+			if node.IsLeaf {
+				// If it's a leaf node and intersects, add the data to results
+				*results = append(*results, *entry.Data)
+			} else {
+				// If it's an internal node, recursively search its child
+				rt.searchNode(entry.Child, queryRect, results)
+			}
+		}
 	}
 }
 
-// chooseLeaf finds the best leaf node to insert a new rectangle.
-func (rt *RTree) chooseLeaf(node *RTreeNode, rect Rect) *RTreeNode {
+// Delete removes a spatial data entry from the R-tree.
+func (rt *RTree) Delete(dataID string, dataRect Rect) error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	// Find the leaf node containing the entry
+	leaf, entryIndex := rt.findLeafAndEntry(rt.Root, dataID, dataRect)
+	if leaf == nil || entryIndex == -1 {
+		return fmt.Errorf("entry with ID '%s' and rect %v not found", dataID, dataRect)
+	}
+
+	// Remove the entry from the leaf node
+	leaf.Entries = append(leaf.Entries[:entryIndex], leaf.Entries[entryIndex+1:]...)
+
+	// Condense the tree from the leaf up to the root
+	rt.condenseTree(leaf)
+
+	// If the root has only one child (and is not a leaf), make the child the new root
+	if rt.Root != nil && !rt.Root.IsLeaf && len(rt.Root.Entries) == 1 {
+		rt.Root = rt.Root.Entries[0].Child
+		rt.Root.Parent = nil // New root has no parent
+	} else if rt.Root != nil && rt.Root.IsLeaf && len(rt.Root.Entries) == 0 {
+		// If root becomes empty leaf, reset to empty tree
+		rt.Root = &Node{IsLeaf: true, Entries: make([]*Entry, 0, M)}
+	}
+
+	return nil
+}
+
+// findLeafAndEntry recursively finds the leaf node and index of a specific entry.
+func (rt *RTree) findLeafAndEntry(node *Node, dataID string, dataRect Rect) (*Node, int) {
+	for i, entry := range node.Entries {
+		if node.IsLeaf {
+			// Check if the data matches in a leaf node
+			if entry.Data != nil && entry.Data.ID == dataID && entry.Data.Rect == dataRect {
+				return node, i
+			}
+		} else {
+			// If it's an internal node and the child's MBR contains the data's MBR, recurse
+			if entry.Rect.Contains(dataRect) {
+				if leaf, index := rt.findLeafAndEntry(entry.Child, dataID, dataRect); leaf != nil {
+					return leaf, index
+				}
+			}
+		}
+	}
+	return nil, -1 // Not found
+}
+
+// chooseSubtree finds the best leaf node to insert a new entry.
+// It minimizes the enlargement of the MBR of the chosen node.
+func (rt *RTree) chooseSubtree(node *Node, entry *Entry) *Node {
 	if node.IsLeaf {
 		return node
 	}
 
-	// Find the child whose MBR requires the minimum enlargement to cover rect.
-	// Break ties by choosing the child with the smallest area.
-	var bestChild *RTreeNode
+	// Find the entry whose MBR requires the minimum enlargement
 	minEnlargement := math.MaxFloat64
 	minArea := math.MaxFloat64
+	var chosenEntry *Entry
 
-	for _, child := range node.Children {
-		childMBR := calculateMBR(child.Entries)
-		enlargement := childMBR.Enlargement(rect)
+	for _, e := range node.Entries {
+		enlargement := e.Rect.Enlargement(entry.Rect)
 		if enlargement < minEnlargement {
 			minEnlargement = enlargement
-			minArea = childMBR.Area()
-			bestChild = child
+			minArea = e.Rect.Area() // Tie-break by minimum area
+			chosenEntry = e
 		} else if enlargement == minEnlargement {
-			childArea := childMBR.Area()
-			if childArea < minArea {
-				minArea = childArea
-				bestChild = child
+			// Tie-break by choosing the entry with the smallest area
+			currentArea := e.Rect.Area()
+			if currentArea < minArea {
+				minArea = currentArea
+				chosenEntry = e
 			}
 		}
 	}
-	return rt.chooseLeaf(bestChild, rect)
-}
-
-// handleOverflow handles node overflow by splitting the node or propagating up.
-func (rt *RTree) handleOverflow(node *RTreeNode) {
-	if len(node.Entries) <= rt.MaxEntries {
-		return // No overflow
-	}
-
-	// Split the node
-	newNode1, newNode2 := rt.splitNode(node)
-
-	if node.Parent == nil {
-		// Root split
-		newRoot := &RTreeNode{IsLeaf: false}
-		newRoot.Children = []*RTreeNode{newNode1, newNode2}
-		newNode1.Parent = newRoot
-		newNode2.Parent = newRoot
-		rt.Root = newRoot
-	} else {
-		// Replace the old node with the two new nodes in the parent
-		parentEntries := []RTreeEntry{}
-		parentChildren := []*RTreeNode{}
-		for i, child := range node.Parent.Children {
-			if child == node {
-				parentChildren = append(parentChildren, newNode1, newNode2)
-				parentEntries = append(parentEntries, RTreeEntry{Rect: calculateMBR(newNode1.Entries)}, RTreeEntry{Rect: calculateMBR(newNode2.Entries)})
-			} else {
-				parentChildren = append(parentChildren, child)
-				parentEntries = append(parentEntries, node.Parent.Entries[i]) // Copy existing MBRs
-			}
-		}
-		node.Parent.Children = parentChildren
-		node.Parent.Entries = parentEntries // Update parent's entries to reflect new MBRs
-		newNode1.Parent = node.Parent
-		newNode2.Parent = node.Parent
-
-		if len(node.Parent.Entries) > rt.MaxEntries {
-			rt.handleOverflow(node.Parent) // Propagate overflow
-		}
-	}
+	return rt.chooseSubtree(chosenEntry.Child, entry)
 }
 
 // splitNode splits an overflowing node into two new nodes.
-// This is a simplified quadratic split algorithm.
-func (rt *RTree) splitNode(node *RTreeNode) (*RTreeNode, *RTreeNode) {
-	newNode1 := &RTreeNode{IsLeaf: node.IsLeaf}
-	newNode2 := &RTreeNode{IsLeaf: node.IsLeaf}
+// Implements the Quadratic Split algorithm.
+func (rt *RTree) splitNode(node *Node) *Node {
+	// Pick two entries to be the seeds for the new nodes
+	seed1, seed2, remainingEntries := rt.pickSeeds(node.Entries)
 
-	// Pick two entries to be the first elements of the new groups (seeds)
-	// Find the pair of entries that would waste the most area if put in the same group.
-	var seed1, seed2 RTreeEntry
-	maxWaste := -1.0
-	for i := 0; i < len(node.Entries); i++ {
-		for j := i + 1; j < len(node.Entries); j++ {
-			r1 := node.Entries[i].Rect
-			r2 := node.Entries[j].Rect
-			unionRect := r1.Union(r2)
-			waste := unionRect.Area() - r1.Area() - r2.Area()
-			if waste > maxWaste {
-				maxWaste = waste
-				seed1 = node.Entries[i]
-				seed2 = node.Entries[j]
-			}
-		}
-	}
+	newNode1 := &Node{IsLeaf: node.IsLeaf, Entries: make([]*Entry, 0, M)}
+	newNode2 := &Node{IsLeaf: node.IsLeaf, Entries: make([]*Entry, 0, M)}
 
-	// Add seeds to new nodes
 	newNode1.Entries = append(newNode1.Entries, seed1)
 	newNode2.Entries = append(newNode2.Entries, seed2)
 
-	// If node was internal, distribute children
+	// Set parent for child nodes if not leaf
 	if !node.IsLeaf {
-		// Find the corresponding children for the seeds and add them
-		var child1, child2 *RTreeNode
-		remainingChildren := []*RTreeNode{}
-		for _, child := range node.Children {
-			childMBR := calculateMBR(child.Entries)
-			if childMBR == seed1.Rect && child1 == nil { // Simple check, might need more robust ID matching
-				child1 = child
-			} else if childMBR == seed2.Rect && child2 == nil {
-				child2 = child
-			} else {
-				remainingChildren = append(remainingChildren, child)
-			}
-		}
-		if child1 != nil {
-			newNode1.Children = append(newNode1.Children, child1)
-			child1.Parent = newNode1
-		}
-		if child2 != nil {
-			newNode2.Children = append(newNode2.Children, child2)
-			child2.Parent = newNode2
-		}
-		node.Children = remainingChildren // Update remaining children for distribution
+		seed1.Child.Parent = newNode1
+		seed2.Child.Parent = newNode2
 	}
 
-	// Distribute remaining entries
-	remainingEntries := []RTreeEntry{}
-	for _, entry := range node.Entries {
-		if entry != seed1 && entry != seed2 {
+	mbr1 := seed1.Rect
+	mbr2 := seed2.Rect
+
+	// Distribute the remaining entries
+	for len(remainingEntries) > 0 {
+		// If one node needs more entries to meet 'm' minimum, add all remaining to it
+		if len(newNode1.Entries)+len(remainingEntries) <= m {
+			for _, entry := range remainingEntries {
+				newNode1.Entries = append(newNode1.Entries, entry)
+				if !node.IsLeaf {
+					entry.Child.Parent = newNode1
+				}
+			}
+			break
+		}
+		if len(newNode2.Entries)+len(remainingEntries) <= m {
+			for _, entry := range remainingEntries {
+				newNode2.Entries = append(newNode2.Entries, entry)
+				if !node.IsLeaf {
+					entry.Child.Parent = newNode2
+				}
+			}
+			break
+		}
+
+		// Find the entry that, if added to either group, would cause the least area enlargement
+		var bestEntry *Entry
+		maxDiff := -1.0 // Max difference in enlargement
+		bestIndex := -1
+
+		for i, entry := range remainingEntries {
+			enlargement1 := mbr1.Enlargement(entry.Rect)
+			enlargement2 := mbr2.Enlargement(entry.Rect)
+			diff := math.Abs(enlargement1 - enlargement2)
+
+			if diff > maxDiff {
+				maxDiff = diff
+				bestEntry = entry
+				bestIndex = i
+			} else if diff == maxDiff {
+				// Tie-break: choose the one that requires the least absolute enlargement
+				if math.Min(enlargement1, enlargement2) < math.Min(mbr1.Enlargement(bestEntry.Rect), mbr2.Enlargement(bestEntry.Rect)) {
+					bestEntry = entry
+					bestIndex = i
+				}
+			}
+		}
+
+		// Remove the best entry from remainingEntries
+		remainingEntries = append(remainingEntries[:bestIndex], remainingEntries[bestIndex+1:]...)
+
+		// Assign the best entry to the node whose MBR requires the least enlargement
+		enlargement1 := mbr1.Enlargement(bestEntry.Rect)
+		enlargement2 := mbr2.Enlargement(bestEntry.Rect)
+
+		if enlargement1 < enlargement2 {
+			newNode1.Entries = append(newNode1.Entries, bestEntry)
+			mbr1 = mbr1.Union(bestEntry.Rect)
+			if !node.IsLeaf {
+				bestEntry.Child.Parent = newNode1
+			}
+		} else if enlargement2 < enlargement1 {
+			newNode2.Entries = append(newNode2.Entries, bestEntry)
+			mbr2 = mbr2.Union(bestEntry.Rect)
+			if !node.IsLeaf {
+				bestEntry.Child.Parent = newNode2
+			}
+		} else {
+			// Tie-break: choose the node with the smaller area
+			if mbr1.Area() < mbr2.Area() {
+				newNode1.Entries = append(newNode1.Entries, bestEntry)
+				mbr1 = mbr1.Union(bestEntry.Rect)
+				if !node.IsLeaf {
+					bestEntry.Child.Parent = newNode1
+				}
+			} else if mbr2.Area() < mbr1.Area() {
+				newNode2.Entries = append(newNode2.Entries, bestEntry)
+				mbr2 = mbr2.Union(bestEntry.Rect)
+				if !node.IsLeaf {
+					bestEntry.Child.Parent = newNode2
+				}
+			} else {
+				// Tie-break: choose the node with fewer entries
+				if len(newNode1.Entries) < len(newNode2.Entries) {
+					newNode1.Entries = append(newNode1.Entries, bestEntry)
+					mbr1 = mbr1.Union(bestEntry.Rect)
+					if !node.IsLeaf {
+						bestEntry.Child.Parent = newNode1
+					}
+				} else {
+					newNode2.Entries = append(newNode2.Entries, bestEntry)
+					mbr2 = mbr2.Union(bestEntry.Rect)
+					if !node.IsLeaf {
+						bestEntry.Child.Parent = newNode2
+					}
+				}
+			}
+		}
+	}
+
+	// Replace the original node's entries with newNode1's entries
+	node.Entries = newNode1.Entries
+	// Update parent pointers for children of newNode1
+	if !node.IsLeaf {
+		for _, entry := range node.Entries {
+			entry.Child.Parent = node
+		}
+	}
+
+	// Return newNode2, which will be inserted into the parent
+	return newNode2
+}
+
+// pickSeeds selects two entries to initiate the split process (Quadratic PickSeeds).
+func (rt *RTree) pickSeeds(entries []*Entry) (*Entry, *Entry, []*Entry) {
+	maxNormalizedSeparation := -1.0
+	var seed1, seed2 *Entry
+	var seed1Index, seed2Index int
+
+	for i := 0; i < len(entries); i++ {
+		for j := i + 1; j < len(entries); j++ {
+			e1 := entries[i]
+			e2 := entries[j]
+
+			// Calculate the MBR of the two entries combined
+			unionRect := e1.Rect.Union(e2.Rect)
+			// Calculate the dead space (area of union - area of e1 - area of e2)
+			deadSpace := unionRect.Area() - e1.Rect.Area() - e2.Rect.Area()
+
+			// Normalize by the area of the union rectangle to avoid bias towards larger rectangles
+			normalizedSeparation := deadSpace / unionRect.Area()
+			if unionRect.Area() == 0 { // Handle case where union area is zero (e.g., points)
+				normalizedSeparation = 0
+			}
+
+			if normalizedSeparation > maxNormalizedSeparation {
+				maxNormalizedSeparation = normalizedSeparation
+				seed1 = e1
+				seed2 = e2
+				seed1Index = i
+				seed2Index = j
+			}
+		}
+	}
+
+	// Create a new slice for remaining entries, excluding the seeds
+	remainingEntries := make([]*Entry, 0, len(entries)-2)
+	for i, entry := range entries {
+		if i != seed1Index && i != seed2Index {
 			remainingEntries = append(remainingEntries, entry)
 		}
 	}
 
-	for len(remainingEntries) > 0 {
-		// If one group has too few entries to reach minEntries, add all remaining to it.
-		if len(newNode1.Entries)+len(remainingEntries) < rt.MinEntries {
-			newNode1.Entries = append(newNode1.Entries, remainingEntries...)
-			if !node.IsLeaf {
-				// Distribute corresponding children
-				for _, entry := range remainingEntries {
-					for i, child := range node.Children {
-						if calculateMBR(child.Entries) == entry.Rect {
-							newNode1.Children = append(newNode1.Children, child)
-							child.Parent = newNode1
-							node.Children = append(node.Children[:i], node.Children[i+1:]...) // Remove from original
-							break
-						}
-					}
-				}
-			}
-			break
-		}
-		if len(newNode2.Entries)+len(remainingEntries) < rt.MinEntries {
-			newNode2.Entries = append(newNode2.Entries, remainingEntries...)
-			if !node.IsLeaf {
-				// Distribute corresponding children
-				for _, entry := range remainingEntries {
-					for i, child := range node.Children {
-						if calculateMBR(child.Entries) == entry.Rect {
-							newNode2.Children = append(newNode2.Children, child)
-							child.Parent = newNode2
-							node.Children = append(node.Children[:i], node.Children[i+1:]...) // Remove from original
-							break
-						}
-					}
-				}
-			}
+	return seed1, seed2, remainingEntries
+}
+
+// adjustTree adjusts the MBRs of nodes and propagates splits up the tree.
+func (rt *RTree) adjustTree(node *Node, splitNode *Node) {
+	current := node
+	var newParentEntry *Entry // Entry for the splitNode to be added to parent
+
+	if splitNode != nil {
+		newParentEntry = &Entry{Rect: rt.calculateMBR(splitNode), Child: splitNode}
+		splitNode.Parent = current.Parent // Set parent for the new split node
+	}
+
+	for current != rt.Root {
+		parent := current.Parent
+		if parent == nil {
+			// This should not happen unless current is the root and splitNode is not nil,
+			// which is handled below.
 			break
 		}
 
-		// Pick next entry to assign
-		var nextEntry RTreeEntry
-		var bestIndex int
-		maxDiff := -1.0
-
-		for i, entry := range remainingEntries {
-			enlargement1 := calculateMBR(newNode1.Entries).Enlargement(entry.Rect)
-			enlargement2 := calculateMBR(newNode2.Entries).Enlargement(entry.Rect)
-			diff := math.Abs(enlargement1 - enlargement2)
-			if diff > maxDiff {
-				maxDiff = diff
-				nextEntry = entry
-				bestIndex = i
+		// Update the MBR of the entry pointing to 'current'
+		found := false
+		for _, entry := range parent.Entries {
+			if entry.Child == current {
+				entry.Rect = rt.calculateMBR(current)
+				found = true
+				break
 			}
 		}
+		if !found {
+			// This indicates a logical error in tree structure.
+			// Log or handle appropriately.
+			fmt.Printf("Error: Parent entry for node %p not found.\n", current)
+			return
+		}
 
-		// Assign to the node that requires less enlargement
-		enlargement1 := calculateMBR(newNode1.Entries).Enlargement(nextEntry.Rect)
-		enlargement2 := calculateMBR(newNode2.Entries).Enlargement(nextEntry.Rect)
+		// If a split occurred, add the new entry to the parent
+		if newParentEntry != nil {
+			parent.Entries = append(parent.Entries, newParentEntry)
+			newParentEntry.Child = parent // Set parent for the entry's child (splitNode)
 
-		if enlargement1 < enlargement2 {
-			newNode1.Entries = append(newNode1.Entries, nextEntry)
-		} else if enlargement2 < enlargement1 {
-			newNode2.Entries = append(newNode2.Entries, nextEntry)
-		} else {
-			// Tie-breaking: choose the node with smaller area, then fewer entries
-			area1 := calculateMBR(newNode1.Entries).Area()
-			area2 := calculateMBR(newNode2.Entries).Area()
-			if area1 < area2 {
-				newNode1.Entries = append(newNode1.Entries, nextEntry)
-			} else if area2 < area1 {
-				newNode2.Entries = append(newNode2.Entries, nextEntry)
+			// If parent overflows, split it and propagate
+			if len(parent.Entries) > M {
+				splitNode = rt.splitNode(parent)
+				newParentEntry = &Entry{Rect: rt.calculateMBR(splitNode), Child: splitNode}
+				splitNode.Parent = parent.Parent // Set parent for the new split node
 			} else {
-				if len(newNode1.Entries) < len(newNode2.Entries) {
-					newNode1.Entries = append(newNode1.Entries, nextEntry)
-				} else {
-					newNode2.Entries = append(newNode2.Entries, nextEntry)
-				}
+				splitNode = nil // No further split
+				newParentEntry = nil
 			}
 		}
 
-		// If node was internal, distribute corresponding child
-		if !node.IsLeaf {
-			for i, child := range node.Children {
-				if calculateMBR(child.Entries) == nextEntry.Rect {
-					if enlargement1 < enlargement2 { // Re-evaluate based on the chosen node
-						newNode1.Children = append(newNode1.Children, child)
-						child.Parent = newNode1
-					} else if enlargement2 < enlargement1 {
-						newNode2.Children = append(newNode2.Children, child)
-						child.Parent = newNode2
-					} else { // Tie-breaking for children distribution as well
-						area1 := calculateMBR(newNode1.Entries).Area()
-						area2 := calculateMBR(newNode2.Entries).Area()
-						if area1 < area2 {
-							newNode1.Children = append(newNode1.Children, child)
-							child.Parent = newNode1
-						} else if area2 < area1 {
-							newNode2.Children = append(newNode2.Children, child)
-							child.Parent = newNode2
-						} else {
-							if len(newNode1.Entries) < len(newNode2.Entries) {
-								newNode1.Children = append(newNode1.Children, child)
-								child.Parent = newNode1
-							} else {
-								newNode2.Children = append(newNode2.Children, child)
-								child.Parent = newNode2
-							}
-						}
-					}
-					node.Children = append(node.Children[:i], node.Children[i+1:]...) // Remove from original
+		current = parent
+	}
+
+	// Handle root split
+	if splitNode != nil {
+		newRoot := &Node{
+			IsLeaf:  false,
+			Entries: make([]*Entry, 0, M),
+		}
+		// The original root becomes one child
+		newRoot.Entries = append(newRoot.Entries, &Entry{Rect: rt.calculateMBR(rt.Root), Child: rt.Root})
+		rt.Root.Parent = newRoot
+
+		// The split node becomes the other child
+		newRoot.Entries = append(newRoot.Entries, newParentEntry)
+		newParentEntry.Child.Parent = newRoot
+
+		rt.Root = newRoot
+	}
+}
+
+// condenseTree removes entries from nodes and propagates changes up the tree,
+// handling underflow and reinserting orphaned entries.
+func (rt *RTree) condenseTree(node *Node) {
+	var entriesToReinsert []*Entry // Collect entries to reinsert
+
+	current := node
+	for current != rt.Root {
+		parent := current.Parent
+		if parent == nil {
+			// Should not happen unless current is the root
+			break
+		}
+
+		// Check for underflow
+		if len(current.Entries) < m {
+			// Remove the entry pointing to 'current' from its parent
+			// var entryToRemove *Entry
+			entryIndexInParent := -1
+			for i, entry := range parent.Entries {
+				if entry.Child == current {
+					// entryToRemove = entry
+					entryIndexInParent = i
+					break
+				}
+			}
+
+			if entryIndexInParent != -1 {
+				parent.Entries = append(parent.Entries[:entryIndexInParent], parent.Entries[entryIndexInParent+1:]...)
+				// Add all entries from the underflowed node to reinsert list
+				entriesToReinsert = append(entriesToReinsert, current.Entries...)
+				// If internal node, also add its children's entries to reinsert list
+				if !current.IsLeaf {
+					entriesToReinsert = append(entriesToReinsert, current.Entries...)
+				}
+			} else {
+				fmt.Printf("Error: Entry for node %p not found in parent %p during condense.\n", current, parent)
+			}
+		} else {
+			// Node is not underflowing, just update its MBR in the parent
+			for _, entry := range parent.Entries {
+				if entry.Child == current {
+					entry.Rect = rt.calculateMBR(current)
 					break
 				}
 			}
 		}
-
-		remainingEntries = append(remainingEntries[:bestIndex], remainingEntries[bestIndex+1:]...)
+		current = parent
 	}
 
-	return newNode1, newNode2
+	// Reinsert orphaned entries
+	for _, entry := range entriesToReinsert {
+		if entry.Data != nil { // It's a data entry (from a leaf node)
+			// Temporarily unlock to avoid deadlock during re-insertion, then re-lock
+			rt.mu.Unlock()
+			rt.Insert(*entry.Data)
+			rt.mu.Lock()
+		} else if entry.Child != nil { // It's a child node entry (from an internal node)
+			// When reinserting internal node entries, we need to reinsert the entire subtree
+			// by inserting the MBR of the child node.
+			// This is a simplification; a full reinsertion would re-add all individual data points.
+			// For production-grade, consider a more robust reinsertion strategy for subtrees.
+			// For now, we'll reinsert the MBR of the child, which will find a new parent for it.
+			reinsertEntry := &Entry{Rect: rt.calculateMBR(entry.Child), Child: entry.Child}
+			reinsertEntry.Child.Parent = nil // Clear parent for reinsertion
+			rt.reinsertChildNode(rt.Root, reinsertEntry)
+		}
+	}
 }
 
-// calculateMBR calculates the Minimum Bounding Rectangle for a set of entries.
-func calculateMBR(entries []RTreeEntry) Rect {
-	if len(entries) == 0 {
-		return Rect{} // Return an empty/zero rect
+// reinsertChildNode is a helper for condenseTree to reinsert an orphaned child node.
+// This is a specialized insert that takes an already formed Entry (with a Child node)
+// and finds a suitable place for it.
+func (rt *RTree) reinsertChildNode(node *Node, entryToReinsert *Entry) {
+	if node.IsLeaf {
+		// This case should ideally not happen if we are reinserting an internal node's child.
+		// It implies an internal node's child is being reinserted into a leaf.
+		// For robustness, we'll just add it here, but it might indicate a logic flaw.
+		node.Entries = append(node.Entries, entryToReinsert)
+		entryToReinsert.Child.Parent = node
+		if len(node.Entries) > M {
+			splitNode := rt.splitNode(node)
+			rt.adjustTree(node, splitNode)
+		}
+		return
 	}
-	mbr := entries[0].Rect
-	for i := 1; i < len(entries); i++ {
-		mbr = mbr.Union(entries[i].Rect)
+
+	// Find the best internal node to insert the child node's entry
+	minEnlargement := math.MaxFloat64
+	minArea := math.MaxFloat64
+	var chosenEntry *Entry
+
+	for _, e := range node.Entries {
+		enlargement := e.Rect.Enlargement(entryToReinsert.Rect)
+		if enlargement < minEnlargement {
+			minEnlargement = enlargement
+			minArea = e.Rect.Area()
+			chosenEntry = e
+		} else if enlargement == minEnlargement {
+			currentArea := e.Rect.Area()
+			if currentArea < minArea {
+				minArea = currentArea
+				chosenEntry = e
+			}
+		}
+	}
+	if chosenEntry != nil {
+		rt.reinsertChildNode(chosenEntry.Child, entryToReinsert)
+	} else {
+		// This should ideally not happen if the tree is not empty.
+		// If it does, it means no suitable child was found, implying the root is empty or invalid.
+		// For now, we'll add it to the current node if it's not a leaf.
+		node.Entries = append(node.Entries, entryToReinsert)
+		entryToReinsert.Child.Parent = node
+		if len(node.Entries) > M {
+			splitNode := rt.splitNode(node)
+			rt.adjustTree(node, splitNode)
+		}
+	}
+}
+
+// calculateMBR calculates the Minimum Bounding Rectangle for all entries in a node.
+func (rt *RTree) calculateMBR(node *Node) Rect {
+	if len(node.Entries) == 0 {
+		// Return an "empty" rectangle or handle as an error
+		return Rect{MinX: math.MaxFloat64, MinY: math.MaxFloat64, MaxX: -math.MaxFloat64, MaxY: -math.MaxFloat64}
+	}
+
+	mbr := node.Entries[0].Rect
+	for i := 1; i < len(node.Entries); i++ {
+		mbr = mbr.Union(node.Entries[i].Rect)
 	}
 	return mbr
 }
 
-// Delete removes a spatial entry from the R-tree.
-func (rt *RTree) Delete(entry RTreeEntry) bool {
-	// Find the leaf node containing the entry
-	leaf := rt.findLeaf(rt.Root, entry)
-	if leaf == nil {
-		return false // Entry not found
-	}
+// Validate checks the integrity of the R-tree. (For debugging/testing)
+func (rt *RTree) Validate() error {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
 
-	// Remove the entry from the leaf node
-	found := false
-	for i, e := range leaf.Entries {
-		if e.DataID == entry.DataID && e.Rect == entry.Rect { // Assuming DataID and Rect uniquely identify
-			leaf.Entries = append(leaf.Entries[:i], leaf.Entries[i+1:]...)
-			found = true
-			break
-		}
+	if rt.Root == nil {
+		return fmt.Errorf("root is nil")
 	}
-	if !found {
-		return false // Entry not found in the leaf
-	}
-
-	// Adjust tree upwards
-	rt.condenseTree(leaf)
-
-	// If root becomes empty and has one child, make the child the new root
-	if rt.Root != nil && !rt.Root.IsLeaf && len(rt.Root.Entries) == 0 && len(rt.Root.Children) == 1 {
-		rt.Root = rt.Root.Children[0]
-		rt.Root.Parent = nil
-	} else if rt.Root != nil && rt.Root.IsLeaf && len(rt.Root.Entries) == 0 {
-		// If root is a leaf and becomes empty, reset to empty tree
-		rt.Root = &RTreeNode{IsLeaf: true}
-	}
-
-	return true
+	return rt.validateNode(rt.Root, nil)
 }
 
-// findLeaf finds the leaf node containing a specific entry.
-func (rt *RTree) findLeaf(node *RTreeNode, entry RTreeEntry) *RTreeNode {
-	if node.IsLeaf {
-		for _, e := range node.Entries {
-			if e.DataID == entry.DataID && e.Rect == entry.Rect {
-				return node
-			}
-		}
-		return nil
+func (rt *RTree) validateNode(node *Node, parent *Node) error {
+	if node == nil {
+		return fmt.Errorf("nil node encountered during validation")
+	}
+	if node.Parent != parent {
+		return fmt.Errorf("node %p has incorrect parent pointer. Expected %p, got %p", node, parent, node.Parent)
 	}
 
-	for _, child := range node.Children {
-		childMBR := calculateMBR(child.Entries)
-		if childMBR.Contains(entry.Rect.Min) && childMBR.Contains(entry.Rect.Max) { // Check if child MBR contains the entry's MBR
-			if leaf := rt.findLeaf(child, entry); leaf != nil {
-				return leaf
+	if node != rt.Root && len(node.Entries) < m {
+		return fmt.Errorf("node %p underflowed: %d entries (min %d)", node, len(node.Entries), m)
+	}
+	if len(node.Entries) > M {
+		return fmt.Errorf("node %p overflowed: %d entries (max %d)", node, len(node.Entries), M)
+	}
+
+	calculatedMBR := rt.calculateMBR(node)
+	if parent != nil {
+		// Check that the MBR in the parent's entry for this node is correct
+		foundEntryInParent := false
+		for _, entry := range parent.Entries {
+			if entry.Child == node {
+				foundEntryInParent = true
+				if entry.Rect != calculatedMBR {
+					return fmt.Errorf("parent entry MBR for node %p is incorrect. Expected %v, got %v", node, calculatedMBR, entry.Rect)
+				}
+				break
 			}
+		}
+		if !foundEntryInParent {
+			return fmt.Errorf("node %p not found in parent's entries", node)
+		}
+	}
+
+	for _, entry := range node.Entries {
+		if node.IsLeaf {
+			if entry.Data == nil || entry.Child != nil {
+				return fmt.Errorf("leaf node entry %p has nil data or non-nil child", entry)
+			}
+			if entry.Rect != entry.Data.Rect {
+				return fmt.Errorf("leaf entry rect %v does not match data rect %v", entry.Rect, entry.Data.Rect)
+			}
+		} else {
+			if entry.Data != nil || entry.Child == nil {
+				return fmt.Errorf("internal node entry %p has non-nil data or nil child", entry)
+			}
+			if err := rt.validateNode(entry.Child, node); err != nil {
+				return err
+			}
+		}
+		// Check if entry's MBR contains its content
+		if !entry.Rect.Contains(rt.calculateMBR(entry.Child)) && !node.IsLeaf {
+			return fmt.Errorf("entry MBR %v does not contain child MBR %v for node %p", entry.Rect, rt.calculateMBR(entry.Child), entry.Child)
 		}
 	}
 	return nil
 }
 
-// condenseTree propagates changes up the tree after a deletion.
-func (rt *RTree) condenseTree(node *RTreeNode) {
-	// Collect nodes to reinsert
-	reinsertList := []*RTreeNode{}
-
-	currentNode := node
-	for currentNode != rt.Root {
-		parent := currentNode.Parent
-		if parent == nil {
-			break // Should not happen if not root
-		}
-
-		// Remove currentNode from parent's children and entries
-		newParentChildren := []*RTreeNode{}
-		newParentEntries := []RTreeEntry{}
-		removed := false
-		for i, child := range parent.Children {
-			if child == currentNode {
-				removed = true
-				// If the node has too few entries, add its children/entries to reinsertList
-				if len(currentNode.Entries) < rt.MinEntries {
-					if currentNode.IsLeaf {
-						for _, entry := range currentNode.Entries {
-							log.Println(entry)
-							// Reinsert individual entries if it's a leaf
-							// This is a simplification; a more robust R-tree would reinsert the data, not the node
-							// For this basic implementation, we'll just reinsert the data entries.
-							// This part needs careful consideration for actual implementation.
-							// For now, let's assume entries are just removed and not reinserted if the node is underflow.
-						}
-					} else {
-						// For internal nodes, reinsert children
-						reinsertList = append(reinsertList, currentNode.Children...)
-					}
-				}
-			} else {
-				newParentChildren = append(newParentChildren, child)
-				newParentEntries = append(newParentEntries, parent.Entries[i]) // Copy existing MBRs
-			}
-		}
-		parent.Children = newParentChildren
-		parent.Entries = newParentEntries
-
-		// If the node was removed due to underflow, update parent's MBR and continue condensing.
-		if removed && len(currentNode.Entries) < rt.MinEntries {
-			// Recalculate MBR for parent's entries
-			parent.Entries = []RTreeEntry{}
-			for _, child := range parent.Children {
-				parent.Entries = append(parent.Entries, RTreeEntry{Rect: calculateMBR(child.Entries)})
-			}
-		} else if removed {
-			// If not removed due to underflow, just update parent's MBR for this child
-			parent.Entries = []RTreeEntry{}
-			for _, child := range parent.Children {
-				parent.Entries = append(parent.Entries, RTreeEntry{Rect: calculateMBR(child.Entries)})
-			}
-		}
-
-		// Move up to the parent
-		currentNode = parent
-	}
-
-	// Reinsert collected entries/nodes
-	for _, nodeToReinsert := range reinsertList {
-		// This is a simplified reinsertion. In a real R-tree, you'd reinsert the actual data entries or child nodes.
-		// For this basic example, we're just demonstrating the condense phase.
-		// A proper reinsertion would involve calling rt.Insert for each entry/child.
-		if nodeToReinsert.IsLeaf {
-			for _, entry := range nodeToReinsert.Entries {
-				rt.Insert(entry) // Reinsert individual data entries
-			}
-		} else {
-			// Reinserting internal nodes is more complex, typically you'd reinsert their MBRs and children.
-			// For simplicity, we'll assume only leaf entries are reinserted.
-		}
-	}
+// String representation for debugging
+func (r Rect) String() string {
+	return fmt.Sprintf("[(%.2f,%.2f)-(%.2f,%.2f)]", r.MinX, r.MinY, r.MaxX, r.MaxY)
 }
 
-// Search finds all DataIDs whose MBRs intersect the query rectangle.
-func (rt *RTree) Search(queryRect Rect) []string {
-	results := []string{}
-	rt.searchNode(rt.Root, queryRect, &results)
-	return results
+func (e Entry) String() string {
+	if e.Data != nil {
+		return fmt.Sprintf("Data: %s %s", e.Data.ID, e.Rect.String())
+	}
+	if e.Child != nil {
+		return fmt.Sprintf("Child: %s", e.Rect.String())
+	}
+	return "Empty Entry"
 }
 
-// searchNode recursively searches the R-tree.
-func (rt *RTree) searchNode(node *RTreeNode, queryRect Rect, results *[]string) {
-	if node == nil {
-		return
+func (n Node) String() string {
+	nodeType := "Internal"
+	if n.IsLeaf {
+		nodeType = "Leaf"
 	}
-
-	if node.IsLeaf {
-		for _, entry := range node.Entries {
-			if entry.Rect.Intersects(queryRect) {
-				*results = append(*results, entry.DataID)
-			}
-		}
-	} else {
-		for _, child := range node.Children {
-			childMBR := calculateMBR(child.Entries)
-			if childMBR.Intersects(queryRect) {
-				rt.searchNode(child, queryRect, results)
-			}
-		}
-	}
+	return fmt.Sprintf("%s Node (Entries: %d)", nodeType, len(n.Entries))
 }
 
-// PrintTree (for debugging)
+// PrintTree prints the tree structure for debugging.
 func (rt *RTree) PrintTree() {
-	fmt.Println("--- R-Tree ---")
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	fmt.Println("--- R-Tree Structure ---")
 	rt.printNode(rt.Root, 0)
-	fmt.Println("--------------")
+	fmt.Println("------------------------")
 }
 
-func (rt *RTree) printNode(node *RTreeNode, level int) {
+func (rt *RTree) printNode(node *Node, level int) {
 	if node == nil {
 		return
 	}
@@ -554,20 +714,14 @@ func (rt *RTree) printNode(node *RTreeNode, level int) {
 		indent += "  "
 	}
 
-	nodeType := "Internal"
-	if node.IsLeaf {
-		nodeType = "Leaf"
-	}
-	fmt.Printf("%s[%s Node] MBR: %v, Entries: %d\n", indent, nodeType, calculateMBR(node.Entries), len(node.Entries))
+	fmt.Printf("%s%s (MBR: %s)\n", indent, node.String(), rt.calculateMBR(node).String())
 
-	if node.IsLeaf {
-		for _, entry := range node.Entries {
-			fmt.Printf("%s  - DataID: %s, Rect: %v\n", indent, entry.DataID, entry.Rect)
-		}
-	} else {
-		for i, child := range node.Children {
-			fmt.Printf("%s  Child %d:\n", indent, i)
-			rt.printNode(child, level+1)
+	for _, entry := range node.Entries {
+		if node.IsLeaf {
+			fmt.Printf("%s  %s\n", indent, entry.String())
+		} else {
+			fmt.Printf("%s  Entry MBR: %s -> Child:\n", indent, entry.Rect.String())
+			rt.printNode(entry.Child, level+1)
 		}
 	}
 }

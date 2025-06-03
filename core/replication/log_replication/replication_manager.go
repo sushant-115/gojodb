@@ -348,6 +348,23 @@ func (rm *ReplicationManager) SetAssignedNodeAddress(myAssignedSlots map[string]
 	rm.primaryMu.Unlock()
 }
 
+func (rm *ReplicationManager) getPrimarySlots() map[string]fsm.SlotRangeInfo {
+	// 2. Determine if this node is primary for any slot ranges
+	currentPrimarySlots := make(map[string]fsm.SlotRangeInfo)
+	myAssignedSlotsMu.RLock()
+	for rangeID, slotInfo := range rm.myAssignedSlots {
+		if slotInfo.PrimaryNodeID == rm.nodeID { // This node is primary for this range
+			currentPrimarySlots[rangeID] = slotInfo
+		}
+	}
+	myAssignedSlotsMu.RUnlock()
+
+	rm.primaryMu.Lock()
+	rm.primaryForSlots = currentPrimarySlots // Update local primary role cache
+	rm.primaryMu.Unlock()
+	return currentPrimarySlots
+}
+
 // manageOutboundReplication identifies primary roles and streams logs to replicas.
 func (rm *ReplicationManager) manageOutboundReplication() {
 	defer rm.wg.Done()
@@ -361,189 +378,185 @@ func (rm *ReplicationManager) manageOutboundReplication() {
 			log.Println("INFO: Outbound replication manager stopping.")
 			return
 		case <-ticker.C:
-			// 1. Get latest slot assignments from Controller (via main's fetchShardMapFromController)
-			// This is implicitly updated in `myAssignedSlots`.
+			// 1. Determine if this node is primary for any slot ranges
+			currentPrimarySlots := rm.getPrimarySlots()
+			// 2. For each primary slot, stream logs to its replicas
+			rm.initConnectionAndStreamLogs(currentPrimarySlots)
+		}
+	}
+}
 
-			// 2. Determine if this node is primary for any slot ranges
-			currentPrimarySlots := make(map[string]fsm.SlotRangeInfo)
-			myAssignedSlotsMu.RLock()
-			for rangeID, slotInfo := range rm.myAssignedSlots {
-				if slotInfo.PrimaryNodeID == rm.nodeID { // This node is primary for this range
-					currentPrimarySlots[rangeID] = slotInfo
-				}
+func (rm *ReplicationManager) initConnectionAndStreamLogs(currentPrimarySlots map[string]fsm.SlotRangeInfo) {
+	// 3. For each primary slot, stream logs to its replicas
+	for rangeID, slotInfo := range currentPrimarySlots {
+		for _, replicaID := range slotInfo.ReplicaNodeIDs {
+			// Get replica's address from storageNodeAddresses (from main's cache)
+			rm.storageNodeAddressesMu.RLock()
+			replicaAddr, ok := rm.storageNodeAddresses[replicaID]
+			rm.storageNodeAddressesMu.RUnlock()
+
+			if !ok || replicaAddr == "" {
+				log.Printf("WARNING: ReplicationManager: Replica %s address not found for slot %s. Cannot stream logs.", replicaID, rangeID)
+				continue
 			}
-			myAssignedSlotsMu.RUnlock()
 
+			// Get or establish connection to replica
+			bTreeReplicaPort, idxReplicaPort, err := getReplicaPort(replicaAddr)
+			if err != nil {
+				log.Println("Failed to get the replication port using default replication port: ", bTreeReplicaPort, idxReplicaPort)
+			}
+			if rm.replicationBTreeListenPort == bTreeReplicaPort || rm.replicationInvertedIndexListenPort == idxReplicaPort {
+				log.Println("Couldn't get the replica port: ", bTreeReplicaPort, idxReplicaPort)
+			}
+			// log.Println("Sending logstreams to: ", "localhost:"+bTreeReplicaPort, " for Btree and to localhost:"+idxReplicaPort, " for InvertedIdx")
 			rm.primaryMu.Lock()
-			rm.primaryForSlots = currentPrimarySlots // Update local primary role cache
-			rm.primaryMu.Unlock()
+			bTreeConn, connExists := rm.replicaClients[replicaAddr+"_btree_conn"]
+			if !connExists {
+				var err error
 
-			// 3. For each primary slot, stream logs to its replicas
-			for rangeID, slotInfo := range currentPrimarySlots {
-				for _, replicaID := range slotInfo.ReplicaNodeIDs {
-					// Get replica's address from storageNodeAddresses (from main's cache)
-					rm.storageNodeAddressesMu.RLock()
-					replicaAddr, ok := rm.storageNodeAddresses[replicaID]
-					rm.storageNodeAddressesMu.RUnlock()
-
-					if !ok || replicaAddr == "" {
-						log.Printf("WARNING: ReplicationManager: Replica %s address not found for slot %s. Cannot stream logs.", replicaID, rangeID)
-						continue
-					}
-
-					// Get or establish connection to replica
-					bTreeReplicaPort, idxReplicaPort, err := getReplicaPort(replicaAddr)
-					if err != nil {
-						log.Println("Failed to get the replication port using default replication port: ", bTreeReplicaPort, idxReplicaPort)
-					}
-					if rm.replicationBTreeListenPort == bTreeReplicaPort || rm.replicationInvertedIndexListenPort == idxReplicaPort {
-						log.Println("Couldn't get the replica port: ", bTreeReplicaPort, idxReplicaPort)
-					}
-					// log.Println("Sending logstreams to: ", "localhost:"+bTreeReplicaPort, " for Btree and to localhost:"+idxReplicaPort, " for InvertedIdx")
-					rm.primaryMu.Lock()
-					bTreeConn, connExists := rm.replicaClients[replicaAddr+"_btree_conn"]
-					if !connExists {
-						var err error
-
-						bTreeConn, err = net.DialTimeout("tcp", "localhost:"+bTreeReplicaPort, storageNodeDialTimeout)
-						if err != nil {
-							log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
-							rm.primaryMu.Unlock()
-							continue
-						}
-						rm.replicaClients[replicaAddr+"_btree_conn"] = bTreeConn
-						rm.lastSentLSN[replicaAddr+"_btree"] = 0 // Initialize B-tree LSN
-						log.Printf("INFO: ReplicationManager: Established new replication client connection to replica %s at %s.", replicaID, replicaAddr)
-						// Stream logs to this replica
-						go rm.streamLogsToReplica(bTreeConn, replicaAddr, replicaID, LOG_BTREE)
-					}
-					idxConn, connExists := rm.replicaClients[replicaAddr+"_inverted_index_conn"]
-					if !connExists {
-						var err error
-
-						idxConn, err = net.DialTimeout("tcp", "localhost:"+idxReplicaPort, storageNodeDialTimeout)
-						if err != nil {
-							log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
-							rm.primaryMu.Unlock()
-							continue
-						}
-						rm.replicaClients[replicaAddr+"_inverted_index_conn"] = idxConn
-						rm.lastSentLSN[replicaAddr+"_inverted_index"] = 0 // Initialize Inverted Index LSN
-						log.Printf("INFO: ReplicationManager: Established new replication client connection to replica %s at %s.", replicaID, replicaAddr)
-						// Stream logs to this replica
-						go rm.streamLogsToReplica(idxConn, replicaAddr, replicaID, LOG_INVERTED_INDEX)
-					}
+				bTreeConn, err = net.DialTimeout("tcp", "localhost:"+bTreeReplicaPort, storageNodeDialTimeout)
+				if err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
 					rm.primaryMu.Unlock()
+					continue
 				}
+				rm.replicaClients[replicaAddr+"_btree_conn"] = bTreeConn
+				rm.lastSentLSN[replicaAddr+"_btree"] = 0 // Initialize B-tree LSN
+				log.Printf("INFO: ReplicationManager: Established new replication client connection to replica %s at %s.", replicaID, replicaAddr)
+				// Stream logs to this replica
+				go rm.streamLogsToReplica(replicaAddr, replicaID, LOG_BTREE)
 			}
+			idxConn, connExists := rm.replicaClients[replicaAddr+"_inverted_index_conn"]
+			if !connExists {
+				var err error
+
+				idxConn, err = net.DialTimeout("tcp", "localhost:"+idxReplicaPort, storageNodeDialTimeout)
+				if err != nil {
+					log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
+					rm.primaryMu.Unlock()
+					continue
+				}
+				rm.replicaClients[replicaAddr+"_inverted_index_conn"] = idxConn
+				rm.lastSentLSN[replicaAddr+"_inverted_index"] = 0 // Initialize Inverted Index LSN
+				log.Printf("INFO: ReplicationManager: Established new replication client connection to replica %s at %s.", replicaID, replicaAddr)
+				// Stream logs to this replica
+				go rm.streamLogsToReplica(replicaAddr, replicaID, LOG_INVERTED_INDEX)
+			}
+			rm.primaryMu.Unlock()
 		}
 	}
 }
 
 // streamLogsToReplica sends new log records to a specific replica.
 // It concurrently streams logs from both the B-tree's log manager and the inverted index's log manager.
-func (rm *ReplicationManager) streamLogsToReplica(conn net.Conn, replicaAddr, replicaID string, logType int) {
+func (rm *ReplicationManager) streamLogsToReplica(replicaAddr, replicaID string, logType int) {
 	var wg sync.WaitGroup
 	stopStreaming := make(chan struct{}) // Channel to signal goroutines to stop
 
 	// Stream B-tree logs
 	if logType == LOG_BTREE {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rm.primaryMu.Lock()
-			lastBTreeLSN := rm.lastSentLSN[replicaAddr+"_btree"]
-			rm.primaryMu.Unlock()
-
-			log.Printf("DEBUG: ReplicationManager: Streaming B-tree logs to replica %s from LSN %d.", replicaID, lastBTreeLSN)
-			bTreeLogStream, err := rm.logManager.StartLogStream(lastBTreeLSN)
-			if err != nil {
-				log.Printf("ERROR: ReplicationManager: Failed to start B-tree log stream for replica %s: %v", replicaID, err)
-				rm.closeReplicaConnection(replicaAddr)
-				return
-			}
-
-			for {
-				select {
-				case lr, ok := <-bTreeLogStream:
-					if !ok {
-						log.Printf("INFO: ReplicationManager: B-tree log stream for replica %s closed.", replicaID)
-						return
-					}
-					serializedRecord, err := lr.Serialize()
-					if err != nil {
-						log.Printf("ERROR: ReplicationManager: Failed to serialize B-tree log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
-						rm.closeReplicaConnection(replicaAddr)
-						return
-					}
-					_, err = conn.Write(serializedRecord)
-					if err != nil {
-						log.Printf("ERROR: ReplicationManager: Failed to send B-tree log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
-						rm.closeReplicaConnection(replicaAddr)
-						return
-					}
-					rm.primaryMu.Lock()
-					rm.lastSentLSN[replicaAddr+"_btree"] = lr.LSN
-					rm.primaryMu.Unlock()
-					log.Printf("DEBUG: ReplicationManager: Sent B-tree log record LSN %d to replica %s.", lr.LSN, replicaID)
-				case <-stopStreaming:
-					log.Printf("INFO: B-tree log streaming goroutine for replica %s stopping.", replicaID)
-					return
-				}
-			}
-		}()
+		rm.streamBtreeIndexLogs(&wg, replicaAddr, replicaID, stopStreaming)
 	}
 	if logType == LOG_INVERTED_INDEX {
-		// Stream Inverted Index logs
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rm.primaryMu.Lock()
-			lastInvertedIndexLSN := rm.lastSentLSN[replicaAddr+"_inverted_index"]
-			rm.primaryMu.Unlock()
-
-			log.Printf("DEBUG: ReplicationManager: Streaming Inverted Index logs to replica %s from LSN %d.", replicaID, lastInvertedIndexLSN)
-			invertedIndexLogStream, err := rm.invertedIndex.GetLogManager().StartLogStream(lastInvertedIndexLSN) // Access inverted index's log manager
-			if err != nil {
-				log.Printf("ERROR: ReplicationManager: Failed to start Inverted Index log stream for replica %s: %v", replicaID, err)
-				rm.closeReplicaConnection(replicaAddr)
-				return
-			}
-
-			for {
-				select {
-				case lr, ok := <-invertedIndexLogStream:
-					if !ok {
-						log.Printf("INFO: ReplicationManager: Inverted Index log stream for replica %s closed.", replicaID)
-						return
-					}
-					serializedRecord, err := lr.Serialize()
-					if err != nil {
-						log.Printf("ERROR: ReplicationManager: Failed to serialize Inverted Index log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
-						rm.closeReplicaConnection(replicaAddr)
-						return
-					}
-					_, err = conn.Write(serializedRecord)
-					if err != nil {
-						log.Printf("ERROR: ReplicationManager: Failed to send Inverted Index log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
-						rm.closeReplicaConnection(replicaAddr)
-						return
-					}
-					rm.primaryMu.Lock()
-					rm.lastSentLSN[replicaAddr+"_inverted_index"] = lr.LSN
-					rm.primaryMu.Unlock()
-					log.Printf("DEBUG: ReplicationManager: Sent Inverted Index log record LSN %d to replica %s.", lr.LSN, replicaID)
-				case <-stopStreaming:
-					log.Printf("INFO: Inverted Index log streaming goroutine for replica %s stopping.", replicaID)
-					return
-				}
-			}
-		}()
+		// Stream Inverted Index logs
+		go rm.streamInvertedIndexLogs(&wg, replicaAddr, replicaID, stopStreaming)
 	}
 	// Wait for both streaming goroutines to finish or for a stop signal
 	wg.Wait()
 	close(stopStreaming) // Signal goroutines to stop if they haven't already
 	log.Printf("INFO: All log streams to replica %s ended.", replicaID)
+}
+
+func (rm *ReplicationManager) streamBtreeIndexLogs(wg *sync.WaitGroup, replicaAddr string, replicaID string, stopChan chan struct{}) {
+	defer wg.Done()
+	rm.primaryMu.Lock()
+	lastBTreeLSN := rm.lastSentLSN[replicaAddr+"_btree"]
+	conn := rm.replicaClients[replicaAddr+"_btree_conn"]
+	rm.primaryMu.Unlock()
+
+	log.Printf("DEBUG: ReplicationManager: Streaming B-tree logs to replica %s from LSN %d.", replicaID, lastBTreeLSN)
+	bTreeLogStream, err := rm.logManager.StartLogStream(lastBTreeLSN)
+	if err != nil {
+		log.Printf("ERROR: ReplicationManager: Failed to start B-tree log stream for replica %s: %v", replicaID, err)
+		rm.closeReplicaConnection(replicaAddr)
+		return
+	}
+
+	for {
+		select {
+		case lr, ok := <-bTreeLogStream:
+			if !ok {
+				log.Printf("INFO: ReplicationManager: B-tree log stream for replica %s closed.", replicaID)
+				return
+			}
+			serializedRecord, err := lr.Serialize()
+			if err != nil {
+				log.Printf("ERROR: ReplicationManager: Failed to serialize B-tree log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
+				rm.closeReplicaConnection(replicaAddr)
+				return
+			}
+			_, err = conn.Write(serializedRecord)
+			if err != nil {
+				log.Printf("ERROR: ReplicationManager: Failed to send B-tree log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
+				rm.closeReplicaConnection(replicaAddr)
+				return
+			}
+			rm.primaryMu.Lock()
+			rm.lastSentLSN[replicaAddr+"_btree"] = lr.LSN
+			rm.primaryMu.Unlock()
+			log.Printf("DEBUG: ReplicationManager: Sent B-tree log record LSN %d to replica %s.", lr.LSN, replicaID)
+		case <-stopChan:
+			log.Printf("INFO: B-tree log streaming goroutine for replica %s stopping.", replicaID)
+			return
+		}
+	}
+}
+
+func (rm *ReplicationManager) streamInvertedIndexLogs(wg *sync.WaitGroup, replicaAddr string, replicaID string, stopChan chan struct{}) {
+	defer wg.Done()
+	rm.primaryMu.Lock()
+	conn := rm.replicaClients[replicaAddr+"_inverted_index_conn"]
+	lastInvertedIndexLSN := rm.lastSentLSN[replicaAddr+"_inverted_index"]
+	rm.primaryMu.Unlock()
+
+	log.Printf("DEBUG: ReplicationManager: Streaming Inverted Index logs to replica %s from LSN %d.", replicaID, lastInvertedIndexLSN)
+	invertedIndexLogStream, err := rm.invertedIndex.GetLogManager().StartLogStream(lastInvertedIndexLSN) // Access inverted index's log manager
+	if err != nil {
+		log.Printf("ERROR: ReplicationManager: Failed to start Inverted Index log stream for replica %s: %v", replicaID, err)
+		rm.closeReplicaConnection(replicaAddr)
+		return
+	}
+
+	for {
+		select {
+		case lr, ok := <-invertedIndexLogStream:
+			if !ok {
+				log.Printf("INFO: ReplicationManager: Inverted Index log stream for replica %s closed.", replicaID)
+				return
+			}
+			serializedRecord, err := lr.Serialize()
+			if err != nil {
+				log.Printf("ERROR: ReplicationManager: Failed to serialize Inverted Index log record LSN %d for replica %s: %v", lr.LSN, replicaID, err)
+				rm.closeReplicaConnection(replicaAddr)
+				return
+			}
+			_, err = conn.Write(serializedRecord)
+			if err != nil {
+				log.Printf("ERROR: ReplicationManager: Failed to send Inverted Index log record LSN %d to replica %s: %v", lr.LSN, replicaID, err)
+				rm.closeReplicaConnection(replicaAddr)
+				return
+			}
+			rm.primaryMu.Lock()
+			rm.lastSentLSN[replicaAddr+"_inverted_index"] = lr.LSN
+			rm.primaryMu.Unlock()
+			log.Printf("DEBUG: ReplicationManager: Sent Inverted Index log record LSN %d to replica %s.", lr.LSN, replicaID)
+		case <-stopChan:
+			log.Printf("INFO: Inverted Index log streaming goroutine for replica %s stopping.", replicaID)
+			return
+		}
+	}
 }
 
 // closeReplicaConnection closes an outbound connection to a replica.
