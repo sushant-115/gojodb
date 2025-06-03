@@ -7,6 +7,8 @@ import (
 	"hash/crc32"
 	"io"
 	"log"
+
+	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 )
 
 // --- BTree Node Serialization/Deserialization ---
@@ -21,11 +23,11 @@ import (
 
 // Node represents an in-memory B-tree node.
 type Node[K any, V any] struct {
-	pageID       PageID
+	pageID       pagemanager.PageID
 	isLeaf       bool
 	keys         []K
 	values       []V
-	childPageIDs []PageID
+	childPageIDs []pagemanager.PageID
 	tree         *BTree[K, V] // Reference to the parent BTree for BPM/DiskManager access
 }
 
@@ -36,17 +38,17 @@ type Node[K any, V any] struct {
 // 	}
 // }
 
-func (n *Node[K, V]) GetPageID() PageID {
+func (n *Node[K, V]) GetPageID() pagemanager.PageID {
 	return n.pageID
 }
 
 // serialize converts the Node into a byte slice and writes it to the provided Page's data buffer.
 // It also calculates and writes the checksum.
-func (n *Node[K, V]) serialize(page *Page, keySerializer func(K) ([]byte, error), valueSerializer func(V) ([]byte, error)) error {
+func (n *Node[K, V]) serialize(page *pagemanager.Page, keySerializer func(K) ([]byte, error), valueSerializer func(V) ([]byte, error)) error {
 	if n.tree == nil || n.tree.bpm == nil {
 		return ErrBTreeNotInitializedProperly
 	}
-	pageSize := n.tree.bpm.pageSize
+	pageSize := n.tree.bpm.GetPageSize()
 	buffer := new(bytes.Buffer)
 
 	// Write Node Header:
@@ -153,14 +155,14 @@ func (n *Node[K, V]) serialize(page *Page, keySerializer func(K) ([]byte, error)
 
 // deserialize reads node data from the provided Page's data buffer and reconstructs the Node.
 // It also verifies the checksum.
-func (n *Node[K, V]) deserialize(page *Page, keyDeserializer func([]byte) (K, error), valueDeserializer func([]byte) (V, error)) error {
+func (n *Node[K, V]) deserialize(page *pagemanager.Page, keyDeserializer func([]byte) (K, error), valueDeserializer func([]byte) (V, error)) error {
 	if n.tree == nil || n.tree.bpm == nil {
 		n.keys = make([]K, 0) // Initialize slices even on error for safety
 		n.values = make([]V, 0)
-		n.childPageIDs = make([]PageID, 0)
+		n.childPageIDs = make([]pagemanager.PageID, 0)
 		return ErrBTreeNotInitializedProperly
 	}
-	pageSize := n.tree.bpm.pageSize
+	pageSize := n.tree.bpm.GetPageSize()
 	pageData := page.GetData()
 
 	// --- CRITICAL CHECKSUM VERIFICATION ---
@@ -182,7 +184,7 @@ func (n *Node[K, V]) deserialize(page *Page, keyDeserializer func([]byte) (K, er
 		// Initialize node slices to empty to prevent using corrupt data
 		n.keys = make([]K, 0)
 		n.values = make([]V, 0)
-		n.childPageIDs = make([]PageID, 0)
+		n.childPageIDs = make([]pagemanager.PageID, 0)
 		return fmt.Errorf("%w: stored=0x%x, calculated=0x%x for page %d", ErrChecksumMismatch, storedChecksum, calculatedChecksum, page.GetPageID())
 	}
 	// --- END CRITICAL CHECKSUM VERIFICATION ---
@@ -245,14 +247,14 @@ func (n *Node[K, V]) deserialize(page *Page, keyDeserializer func([]byte) (K, er
 		if err := binary.Read(buffer, binary.LittleEndian, &numChildren); err != nil {
 			return fmt.Errorf("%w: reading numChildren: %v", ErrDeserialization, err)
 		}
-		n.childPageIDs = make([]PageID, numChildren)
+		n.childPageIDs = make([]pagemanager.PageID, numChildren)
 		for i := uint16(0); i < numChildren; i++ {
 			if err := binary.Read(buffer, binary.LittleEndian, &n.childPageIDs[i]); err != nil {
 				return fmt.Errorf("%w: reading childPageID %d: %v", ErrDeserialization, i, err)
 			}
 		}
 	} else {
-		n.childPageIDs = make([]PageID, 0) // Ensure it's an empty slice for leaves
+		n.childPageIDs = make([]pagemanager.PageID, 0) // Ensure it's an empty slice for leaves
 	}
 
 	n.pageID = page.GetPageID() // Set the node's page ID from the page object

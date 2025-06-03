@@ -16,6 +16,9 @@ import (
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
+	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
+	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
+	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
 const (
@@ -33,7 +36,7 @@ var (
 // ReplicationManager manages sending and receiving log streams for replication.
 type ReplicationManager struct {
 	nodeID                             string
-	logManager                         *btree_core.LogManager // B-tree's log manager
+	logManager                         *wal.LogManager // B-tree's log manager
 	dbInstance                         *btree_core.BTree[string, string]
 	dbLock                             *sync.RWMutex
 	invertedIndex                      *inverted_index.InvertedIndex // NEW: Inverted index instance
@@ -43,9 +46,9 @@ type ReplicationManager struct {
 	// State for Primary role (sending logs)
 	primaryForSlots        map[string]fsm.SlotRangeInfo // SlotRangeID -> SlotRangeInfo (where this node is primary)
 	myAssignedSlots        map[string]fsm.SlotRangeInfo
-	replicaClients         map[string]net.Conn       // ReplicaNodeAddr -> TCP connection to replica
-	lastSentLSN            map[string]btree_core.LSN // ReplicaNodeAddr + "_btree" or "_inverted_index" -> Last LSN sent to this replica
-	primaryMu              sync.Mutex                // Protects primary role state
+	replicaClients         map[string]net.Conn // ReplicaNodeAddr -> TCP connection to replica
+	lastSentLSN            map[string]wal.LSN  // ReplicaNodeAddr + "_btree" or "_inverted_index" -> Last LSN sent to this replica
+	primaryMu              sync.Mutex          // Protects primary role state
 	storageNodeAddressesMu sync.RWMutex
 	storageNodeAddresses   map[string]string
 
@@ -57,7 +60,7 @@ type ReplicationManager struct {
 }
 
 // NewReplicationManager creates and initializes a ReplicationManager.
-func NewReplicationManager(nodeID string, lm *btree_core.LogManager, db *btree_core.BTree[string, string], lock *sync.RWMutex, ii *inverted_index.InvertedIndex) *ReplicationManager {
+func NewReplicationManager(nodeID string, lm *wal.LogManager, db *btree_core.BTree[string, string], lock *sync.RWMutex, ii *inverted_index.InvertedIndex) *ReplicationManager {
 	return &ReplicationManager{
 		nodeID:                             nodeID,
 		logManager:                         lm,
@@ -66,7 +69,7 @@ func NewReplicationManager(nodeID string, lm *btree_core.LogManager, db *btree_c
 		invertedIndex:                      ii, // Store the inverted index instance
 		primaryForSlots:                    make(map[string]fsm.SlotRangeInfo),
 		replicaClients:                     make(map[string]net.Conn),
-		lastSentLSN:                        make(map[string]btree_core.LSN),
+		lastSentLSN:                        make(map[string]wal.LSN),
 		stopChan:                           make(chan struct{}),
 		storageNodeAddresses:               make(map[string]string),
 		replicationBTreeListenPort:         os.Getenv("BTREE_REPLICATION_LISTEN_PORT"),
@@ -166,7 +169,7 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 			return
 		default:
 			// Read and deserialize log record
-			var lr btree_core.LogRecord
+			var lr wal.LogRecord
 			// Use the B-tree's log manager's ReadLogRecord as a generic reader for the stream
 			// Assuming all log records (B-tree and Inverted Index) are serialized in the same format.
 			err := rm.logManager.ReadLogRecord(reader, &lr)
@@ -204,7 +207,7 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 				// This is a B-tree log record, apply as before
 				rm.dbLock.Lock() // Acquire global DB write lock for B-tree operations
 				switch lr.Type {
-				case btree_core.LogRecordTypeNewPage:
+				case wal.LogRecordTypeNewPage:
 					log.Println("DEBUG Applying new page for: ", lr.PageID)
 					// Ensure the underlying disk space is allocated for this PageID if it's beyond current numPages.
 					// This is similar to LogManager.Recover's handling for NewPage.
@@ -217,7 +220,7 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 							continue
 						}
 						// Update DiskManager's numPages
-						if lr.PageID >= btree_core.PageID(rm.dbInstance.GetNumPages()) {
+						if lr.PageID >= pagemanager.PageID(rm.dbInstance.GetNumPages()) {
 							rm.dbInstance.SetNumPages(uint64(lr.PageID) + 1)
 						}
 					}
@@ -246,7 +249,7 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 						log.Printf("ERROR: ReplicationManager: Failed to flush page %d after NEW_PAGE application: %v", page.GetPageID(), errFlush)
 					}
 
-				case btree_core.LogRecordTypeUpdate:
+				case wal.LogRecordTypeUpdate:
 					log.Println("DEBUG Applying update page for: ", lr.PageID)
 					page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
 					if fetchErr != nil {
@@ -268,27 +271,27 @@ func (rm *ReplicationManager) handleInboundReplicationStream(conn net.Conn, logT
 						log.Printf("ERROR: ReplicationManager: Failed to flush page %d after UPDATE application: %v", page.GetPageID(), errFlush)
 					}
 
-				case btree_core.LogRecordTypeRootChange: // Handle root page ID changes
-					newRootPageID := btree_core.PageID(binary.LittleEndian.Uint64(lr.NewData))
+				case wal.LogRecordTypeRootChange: // Handle root page ID changes
+					newRootPageID := pagemanager.PageID(binary.LittleEndian.Uint64(lr.NewData))
 					log.Printf("INFO: ReplicationManager: Replica applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
 
 					// Update the B-tree's in-memory rootPageID
 					rm.dbInstance.SetRootPageID(newRootPageID, lr.TxnID) // Pass TxnID
 
 					// Update the disk header for persistence
-					if err := rm.dbInstance.GetDiskManager().UpdateHeaderField(func(h *btree_core.DBFileHeader) {
+					if err := rm.dbInstance.GetDiskManager().UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
 						h.RootPageID = newRootPageID
 					}); err != nil {
 						log.Printf("ERROR: ReplicationManager: Failed to update disk header with new root page ID %d: %v", newRootPageID, err)
 					}
 
-				case btree_core.LogRecordTypePrepare:
+				case wal.LogRecordTypePrepare:
 					log.Printf("DEBUG: ReplicationManager: Replica received PREPARE for Txn %d. (V1: no active processing beyond data apply)", lr.TxnID)
-				case btree_core.LogRecordTypeCommitTxn:
+				case wal.LogRecordTypeCommitTxn:
 					log.Printf("DEBUG: ReplicationManager: Replica received COMMIT for Txn %d.", lr.TxnID)
-				case btree_core.LogRecordTypeAbortTxn:
+				case wal.LogRecordTypeAbortTxn:
 					log.Printf("DEBUG: ReplicationManager: Replica received ABORT for Txn %d.", lr.TxnID)
-				case btree_core.LogRecordTypeInsertKey, btree_core.LogRecordTypeDeleteKey, btree_core.LogRecordTypeNodeSplit, btree_core.LogRecordTypeNodeMerge:
+				case wal.LogRecordTypeInsertKey, wal.LogRecordTypeDeleteKey, wal.LogRecordTypeNodeSplit, wal.LogRecordTypeNodeMerge:
 					log.Printf(`WARNING: ReplicationManager: Received structural/logical log record type %v (LSN %d). 
 						Physical page changes should already be covered by UPDATE/NEW_PAGE. Skipping.`, lr.Type, lr.LSN)
 				default:

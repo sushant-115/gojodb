@@ -56,21 +56,24 @@ func (p *Page) Reset() {
 		p.data[i] = 0
 	}
 }
-func (p *Page) GetLruElement() *list.Element { return p.lruElement }
-func (p *Page) GetData() []byte              { return p.data }
-func (p *Page) SetData(newData []byte) bool  { copy(p.data, newData); return true }
-func (p *Page) GetPageID() PageID            { return p.id }
-func (p *Page) IsDirty() bool                { return p.isDirty }
-func (p *Page) Pin()                         { p.pinCount++ }
+func (p *Page) GetLruElement() *list.Element     { return p.lruElement }
+func (p *Page) SetLruElement(elem *list.Element) { p.lruElement = elem }
+func (p *Page) GetData() []byte                  { return p.data }
+func (p *Page) SetData(newData []byte) bool      { copy(p.data, newData); return true }
+func (p *Page) GetPageID() PageID                { return p.id }
+func (p *Page) SetPageID(id PageID)              { p.id = id }
+func (p *Page) IsDirty() bool                    { return p.isDirty }
+func (p *Page) Pin()                             { p.pinCount++ }
 func (p *Page) Unpin() {
 	if p.pinCount > 0 {
 		p.pinCount--
 	}
 }
-func (p *Page) GetPinCount() uint32 { return p.pinCount }
-func (p *Page) SetDirty(dirty bool) { p.isDirty = dirty }
-func (p *Page) GetLSN() LSN         { return p.lsn }
-func (p *Page) SetLSN(lsn LSN)      { p.lsn = lsn }
+func (p *Page) GetPinCount() uint32         { return p.pinCount }
+func (p *Page) SetPinCount(pinCount uint32) { p.pinCount = pinCount }
+func (p *Page) SetDirty(dirty bool)         { p.isDirty = dirty }
+func (p *Page) GetLSN() LSN                 { return p.lsn }
+func (p *Page) SetLSN(lsn LSN)              { p.lsn = lsn }
 func (p *PageID) GetID() uint64 {
 	return uint64(*p)
 }

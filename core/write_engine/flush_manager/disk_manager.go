@@ -221,6 +221,21 @@ func (dm *DiskManager) writeHeader(header *DBFileHeader) error {
 }
 
 // readHeader reads the DBFileHeader from the beginning of the file (offset 0).
+func (dm *DiskManager) ReadHeader(header *DBFileHeader) error {
+	return dm.readHeader(header)
+}
+
+// readHeader reads the DBFileHeader from the beginning of the file (offset 0).
+func (dm *DiskManager) SetNumPages(totalPages uint64) {
+	dm.numPages = totalPages
+}
+
+// readHeader reads the DBFileHeader from the beginning of the file (offset 0).
+func (dm *DiskManager) SetPageSize(pageSize int) {
+	dm.pageSize = pageSize
+}
+
+// readHeader reads the DBFileHeader from the beginning of the file (offset 0).
 func (dm *DiskManager) readHeader(header *DBFileHeader) error {
 	data := make([]byte, dbFileHeaderSize)
 	// Read exactly dbFileHeaderSize bytes from offset 0
