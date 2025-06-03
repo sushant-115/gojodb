@@ -11,6 +11,7 @@ import (
 	"sync" // For global B-Tree lock
 
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree" // Adjust this import path to your actual module path
+	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
 const (
@@ -30,7 +31,7 @@ const (
 var (
 	dbInstance *btree_core.BTree[string, string]
 	dbLock     sync.RWMutex // Global lock for the entire B-Tree operations
-	logManager *btree_core.LogManager
+	logManager *wal.LogManager
 )
 
 // Request represents a parsed client request.
@@ -51,7 +52,7 @@ func initDatabase() error {
 	var err error
 
 	// Initialize LogManager
-	logManager, err = btree_core.NewLogManager(logDir, archiveDir, logBufferSize, logSegmentSize)
+	logManager, err = wal.NewLogManager(logDir, archiveDir, logBufferSize, logSegmentSize)
 	if err != nil {
 		return fmt.Errorf("failed to create LogManager: %w", err)
 	}
