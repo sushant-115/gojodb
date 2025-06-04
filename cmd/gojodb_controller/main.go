@@ -21,10 +21,7 @@ import (
 )
 
 const (
-	defaultRaftPort      = 8081
-	defaultHTTPPort      = 8080
-	defaultNodeID        = "node1"
-	defaultRaftDir       = "raft_data"
+	defaultRaftDir       = "raft_data_new"
 	defaultRaftSnapshots = 2                // Number of Raft snapshots to retain
 	heartbeatInterval    = 5 * time.Second  // Interval for Storage Node heartbeats
 	heartbeatTimeout     = 15 * time.Second // Timeout for Storage Node health
@@ -59,6 +56,7 @@ func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir 
 	}
 
 	// Setup Raft
+	log.Println("Join addr: ", joinAddr)
 	if err := c.setupRaft(joinAddr); err != nil {
 		return nil, fmt.Errorf("failed to setup Raft: %w", err)
 	}
@@ -580,15 +578,15 @@ func main() {
 
 	nodeID := os.Getenv("NODE_ID")
 	if nodeID == "" {
-		nodeID = defaultNodeID // Default for single node testing
+		log.Fatal("NODE_ID is not set in environmnet")
 	}
 	raftBindAddr := os.Getenv("RAFT_BIND_ADDR")
 	if raftBindAddr == "" {
-		raftBindAddr = fmt.Sprintf("localhost:%d", defaultRaftPort)
+		log.Fatal("RAFT_BIND_ADDR is not set in environmnet")
 	}
 	httpAddr := os.Getenv("HTTP_ADDR")
 	if httpAddr == "" {
-		httpAddr = fmt.Sprintf("localhost:%d", defaultHTTPPort)
+		log.Fatal("HTTP_ADDR is not set in environmnet")
 	}
 	joinAddr := os.Getenv("JOIN_ADDR") // Optional: address of an existing node to join
 

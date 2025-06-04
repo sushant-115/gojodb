@@ -263,7 +263,7 @@ func sendHeartbeatsToController() {
 			}
 			heartbeatTargetPort := controllerHeartbeatTargetPort // Assuming heartbeat listener is HTTP port + 1
 
-			conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: heartbeatTargetPort})
+			conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP(parts[0]), Port: heartbeatTargetPort})
 			if err != nil {
 				log.Printf("ERROR: Failed to dial UDP for heartbeat to %s (port %d): %v", addr, heartbeatTargetPort, err)
 				continue
