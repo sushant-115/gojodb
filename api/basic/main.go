@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -17,13 +18,15 @@ import (
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus" // Import the FSM for sharding info (e.g., GetSlotForHashKey, SlotRangeInfo)
 )
 
+var (
+	apiServiceAddr          = os.Getenv("API_SERVICE_ADDR")
+	controllerHTTPAddresses = os.Getenv("RAFT_ADDRESS") // Comma-separated list of Controller HTTP addresses
+)
+
 const (
-	apiServiceHost            = "localhost"
-	apiServicePort            = "8090"                                         // Default port for API Service
-	controllerHTTPAddresses   = "localhost:8080,localhost:8083,localhost:8085" // Comma-separated list of Controller HTTP addresses
-	shardMapFetchInterval     = 5 * time.Second                                // How often to fetch shard map
-	controllerMonitorInterval = 2 * time.Second                                // How often to monitor controller cluster
-	storageNodeDialTimeout    = 2 * time.Second                                // Timeout for connecting to a storage node
+	shardMapFetchInterval     = 5 * time.Second // How often to fetch shard map
+	controllerMonitorInterval = 2 * time.Second // How often to monitor controller cluster
+	storageNodeDialTimeout    = 2 * time.Second // Timeout for connecting to a storage node
 	CLIENT_TIMEOUT            = 5 * time.Second
 	// Basic API Key for admin endpoints
 	adminAPIKey = "GOJODB_ADMIN_KEY" // Replace with a strong, secret key in production
@@ -1117,7 +1120,7 @@ func main() {
 	// Set up HTTP handler for the main router
 	http.HandleFunc("/", service.handleAPIRequest) // Route all incoming requests through handleAPIRequest
 
-	log.Printf("INFO: GojoDB API Service listening on %s:%s", apiServiceHost, apiServicePort)
+	log.Printf("INFO: GojoDB API Service listening on %s", apiServiceAddr)
 	log.Println("INFO: API Endpoints:")
 	log.Println("  - /api/data (POST): { \"command\": \"PUT/GET/DELETE\", \"key\": \"...\", \"value\": \"...\" }")
 	log.Println("    (Use GOJODB.TEXT(your text) for text indexing in PUT value)")
@@ -1130,5 +1133,5 @@ func main() {
 	log.Println("  - /status (GET): Get aggregated status of Controller cluster and Storage Nodes")
 	log.Printf("  Admin API Key: %s (for X-API-Key header)", adminAPIKey)
 
-	log.Fatal(http.ListenAndServe(apiServiceHost+":"+apiServicePort, nil))
+	log.Fatal(http.ListenAndServe(apiServiceAddr, nil))
 }

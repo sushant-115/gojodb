@@ -36,7 +36,6 @@ const (
 
 	// Controller interaction configuration
 	controllerHeartbeatTargetPort = 8086             // Default UDP port on Controller for heartbeats
-	controllerHTTPAddresses       = "localhost:8080" // Comma-separated list of Controller HTTP addresses
 	heartbeatInterval             = 5 * time.Second  // How often to send heartbeats
 	shardMapFetchInterval         = 10 * time.Second // How often to fetch shard map
 	storageNodeDialTimeout        = 2 * time.Second  // Timeout for connecting to a storage node
@@ -62,7 +61,8 @@ var (
 	myAssignedSlotsMu sync.RWMutex
 	myAssignedSlots   map[string]fsm.SlotRangeInfo // Cache of slot ranges assigned to THIS node
 	// Replication Manager instance
-	replicationManager *replication.ReplicationManager
+	replicationManager      *replication.ReplicationManager
+	controllerHTTPAddresses = os.Getenv("RAFT_ADDRESS")
 )
 
 // Request represents a parsed client request for single operations.
