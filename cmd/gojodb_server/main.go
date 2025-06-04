@@ -677,7 +677,7 @@ func handleRequest(req Request) Response {
 		queryRect := spatial.Rect{
 			req.MinX, req.MinY, req.MaxX, req.MaxY,
 		}
-		results, queryErr := spatialIndexManager.Search(queryRect)
+		results, queryErr := spatialIndexManager.Query(queryRect)
 		if queryErr != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("QUERY_SPATIAL failed: %v", queryErr)}
 			return resp

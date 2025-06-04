@@ -48,6 +48,7 @@ const (
 	LogRecordTypeAbortTxn  // Transaction Abort record (final phase 2)
 	// --- END NEW ---
 	LogRecordTypeRootChange // NEW: Log record for B-tree root page ID change
+	LogTypeRTreeDelete
 )
 
 // LogRecord represents a single entry in the Write-Ahead Log.
