@@ -38,12 +38,17 @@ const (
 	LogRecordTypeFreePage                           // Deallocation of a page
 	LogRecordTypeCheckpointStart
 	LogRecordTypeCheckpointEnd
+	LogTypeRTreeInsert
+	LogTypeRTreeSplit
+	LogTypeRTreeNewRoot
+	LogTypeRTreeUpdate
 	// --- NEW: 2PC Specific Log Record Types ---
 	LogRecordTypePrepare   // Transaction Prepare record
 	LogRecordTypeCommitTxn // Transaction Commit record (final phase 2)
 	LogRecordTypeAbortTxn  // Transaction Abort record (final phase 2)
 	// --- END NEW ---
 	LogRecordTypeRootChange // NEW: Log record for B-tree root page ID change
+	LogTypeRTreeDelete
 )
 
 // LogRecord represents a single entry in the Write-Ahead Log.

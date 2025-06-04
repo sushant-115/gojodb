@@ -1,8 +1,7 @@
 package main
 
 import (
-	"bufio" // Added for bytes.SplitN
-	// Added for PageID serialization/deserialization
+	"bufio"         // Added for bytes.SplitN
 	"encoding/json" // Needed for (de)serializing TransactionOperations
 	"fmt"
 	"io"
@@ -17,7 +16,8 @@ import (
 	"time"
 
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree"               // B-tree core package
-	"github.com/sushant-115/gojodb/core/indexing/inverted_index"                 // NEW: Inverted Index package
+	"github.com/sushant-115/gojodb/core/indexing/inverted_index"                 // Inverted Index package
+	"github.com/sushant-115/gojodb/core/indexing/spatial"                        // NEW: Spatial Index package
 	replication "github.com/sushant-115/gojodb/core/replication/log_replication" // B-tree core package
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"          // FSM package for sharding info
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
@@ -48,10 +48,11 @@ const (
 
 // Global database instance and its lock for simple concurrency control
 var (
-	dbInstance            *btree_core.BTree[string, string] // Using string keys now
+	dbInstance            *btree_core.BTree[string, string] // Using string keys
 	dbLock                sync.RWMutex                      // Global lock for the entire B-Tree operations
 	logManager            *wal.LogManager
-	invertedIndexInstance *inverted_index.InvertedIndex // NEW: Global inverted index instance
+	invertedIndexInstance *inverted_index.InvertedIndex // Global inverted index instance
+	spatialIndexManager   *spatial.SpatialIndexManager  // NEW: Global spatial index instance
 
 	// Storage Node identity
 	myStorageNodeID   string
@@ -72,7 +73,12 @@ type Request struct {
 	TxnID    uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
 	StartKey string // For range query
 	EndKey   string // For range query
-	Query    string // NEW: For text search queries
+	Query    string // For text search queries
+	// NEW: Spatial query parameters
+	MinX float64
+	MinY float64
+	MaxX float64
+	MaxY float64
 }
 
 // Response represents a server's reply to a client request.
@@ -115,6 +121,11 @@ func initStorageNode() error {
 	uniqueInvertedIndexFilePath := fmt.Sprintf("data/%s_inverted_index.db", myStorageNodeID)
 	uniqueInvertedIndexLogDir := fmt.Sprintf("data/%s_inverted_index_logs", myStorageNodeID)
 	uniqueInvertedIndexArchiveDir := fmt.Sprintf("data/%s_inverted_index_archives", myStorageNodeID)
+
+	// Use a unique file path for the inverted index data file (changed from .json to .db)
+	uniqueSpatialIndexFilePath := fmt.Sprintf("data/%s_spatial_index.db", myStorageNodeID)
+	uniqueSpatialIndexLogDir := fmt.Sprintf("data/%s_spatial_index_logs", myStorageNodeID)
+	uniqueSpatialIndexArchiveDir := fmt.Sprintf("data/%s_spatial_index_archives", myStorageNodeID)
 
 	// 2. Initialize LogManager for this Storage Node
 	logManager, err = wal.NewLogManager(uniqueLogDir, uniqueArchiveDir, logBufferSize, logSegmentSize)
@@ -165,7 +176,7 @@ func initStorageNode() error {
 	}
 	log.Printf("INFO: Storage Node %s database initialized successfully. Root PageID: %d", myStorageNodeID, dbInstance.GetRootPageID())
 
-	// NEW: 4. Initialize Inverted Index for this Storage Node
+	// 4. Initialize Inverted Index for this Storage Node
 	// Pass unique log and archive directories for the inverted index
 	invertedIndexInstance, err = inverted_index.NewInvertedIndex(uniqueInvertedIndexFilePath, uniqueInvertedIndexLogDir, uniqueInvertedIndexArchiveDir)
 	if err != nil {
@@ -173,23 +184,29 @@ func initStorageNode() error {
 	}
 	log.Printf("INFO: Storage Node %s inverted index initialized successfully.", myStorageNodeID)
 
-	// 5. Initialize local shard map cache
+	// NEW: 5. Initialize Spatial Index for this Storage Node
+	spatialIndexManager, err = spatial.NewSpatialIndexManager(uniqueSpatialIndexArchiveDir, uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath, logBufferSize, logSegmentSize, dbPageSize, 6, 2)
+	if err != nil {
+		return fmt.Errorf("failed to create SpatialIndex for storage node %s: %w", myStorageNodeID, err)
+	}
+	log.Printf("INFO: Storage Node %s spatial index initialized successfully.", myStorageNodeID)
+
+	// 6. Initialize local shard map cache
 	myAssignedSlots = make(map[string]fsm.SlotRangeInfo)
 
-	// --- NEW: Initialize Replication Manager ---
+	// 7. Initialize Replication Manager
 	// Pass the invertedIndexInstance to the ReplicationManager
 	replicationManager = replication.NewReplicationManager(myStorageNodeID, logManager, dbInstance, &dbLock, invertedIndexInstance)
 	replicationManager.Start() // Start replication background tasks
-	// --- END NEW ---
 
-	// 6. Start background tasks
+	// 8. Start background tasks
 	go sendHeartbeatsToController()
 	go fetchShardMapFromController(replicationManager)
 
 	return nil
 }
 
-// closeStorageNode closes the B-tree, LogManager, and InvertedIndex cleanly.
+// closeStorageNode closes the B-tree, LogManager, InvertedIndex, and SpatialIndex cleanly.
 func closeStorageNode() {
 	log.Println("INFO: Shutting down Storage Node database...")
 	if dbInstance != nil {
@@ -202,12 +219,19 @@ func closeStorageNode() {
 			log.Printf("ERROR: Failed to close LogManager for Storage Node %s: %v", myStorageNodeID, err)
 		}
 	}
-	// NEW: Close Inverted Index
+	// Close Inverted Index
 	if invertedIndexInstance != nil {
 		if err := invertedIndexInstance.Close(); err != nil {
 			log.Printf("ERROR: Failed to close InvertedIndex for Storage Node %s: %v", myStorageNodeID, err)
 		}
 	}
+	// Spatial Index does not have a Close method in the provided code, but if it did, call it here.
+	// if spatialIndexManager != nil {
+	// 	if err := spatialIndexManager.Close(); err != nil {
+	// 		log.Printf("ERROR: Failed to close SpatialIndex for Storage Node %s: %v", myStorageNodeID, err)
+	// 	}
+	// }
+
 	// Stop Replication Manager
 	if replicationManager != nil {
 		replicationManager.Stop()
@@ -347,7 +371,7 @@ func fetchShardMapFromController(rm *replication.ReplicationManager) {
 }
 
 // parseRequest parses a raw string command into a Request struct.
-// It's updated to handle 2PC commands and TEXT_SEARCH.
+// It's updated to handle 2PC commands, TEXT_SEARCH, and new SPATIAL commands.
 func parseRequest(raw string) (Request, error) {
 	parts := strings.Fields(raw)
 	if len(parts) == 0 {
@@ -358,7 +382,7 @@ func parseRequest(raw string) (Request, error) {
 	req := Request{Command: command, TxnID: 0} // Default TxnID to 0 for auto-commit
 
 	switch command {
-	case "PUT", "PUT_TEXT": // NEW: Handle PUT_TEXT
+	case "PUT", "PUT_TEXT": // Handle PUT_TEXT
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("%s requires key and value", command)
 		}
@@ -386,11 +410,76 @@ func parseRequest(raw string) (Request, error) {
 		req.StartKey = parts[0]
 		req.EndKey = parts[1]
 
-	case "TEXT_SEARCH": // NEW: Handle TEXT_SEARCH
+	case "TEXT_SEARCH": // Handle TEXT_SEARCH
 		if len(parts) < 2 {
 			return Request{}, fmt.Errorf("TEXT_SEARCH requires a query string")
 		}
 		req.Query = strings.Join(parts[1:], " ") // The rest is the query
+	case "PUT_SPATIAL": // NEW: Handle PUT_SPATIAL
+		if len(parts) < 6 {
+			return Request{}, fmt.Errorf("PUT_SPATIAL requires key, minX, minY, maxX, maxY")
+		}
+		req.Key = parts[1]
+		var err error
+		req.MinX, err = strconv.ParseFloat(parts[2], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid minX: %w", err)
+		}
+		req.MinY, err = strconv.ParseFloat(parts[3], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid minY: %w", err)
+		}
+		req.MaxX, err = strconv.ParseFloat(parts[4], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid maxX: %w", err)
+		}
+		req.MaxY, err = strconv.ParseFloat(parts[5], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid maxY: %w", err)
+		}
+	case "DELETE_SPATIAL": // NEW: Handle DELETE_SPATIAL
+		if len(parts) < 6 {
+			return Request{}, fmt.Errorf("DELETE_SPATIAL requires key, minX, minY, maxX, maxY")
+		}
+		req.Key = parts[1]
+		var err error
+		req.MinX, err = strconv.ParseFloat(parts[2], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid minX: %w", err)
+		}
+		req.MinY, err = strconv.ParseFloat(parts[3], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid minY: %w", err)
+		}
+		req.MaxX, err = strconv.ParseFloat(parts[4], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid maxX: %w", err)
+		}
+		req.MaxY, err = strconv.ParseFloat(parts[5], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid maxY: %w", err)
+		}
+	case "QUERY_SPATIAL": // NEW: Handle QUERY_SPATIAL
+		if len(parts) < 5 {
+			return Request{}, fmt.Errorf("QUERY_SPATIAL requires minX, minY, maxX, maxY")
+		}
+		var err error
+		req.MinX, err = strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid minX: %w", err)
+		}
+		req.MinY, err = strconv.ParseFloat(parts[2], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid minY: %w", err)
+		}
+		req.MaxX, err = strconv.ParseFloat(parts[3], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid maxX: %w", err)
+		}
+		req.MaxY, err = strconv.ParseFloat(parts[4], 64)
+		if err != nil {
+			return Request{}, fmt.Errorf("invalid maxY: %w", err)
+		}
 	case "PREPARE":
 		if len(parts) < 3 {
 			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
@@ -417,8 +506,7 @@ func parseRequest(raw string) (Request, error) {
 }
 
 // handleRequest processes a parsed Request and returns a Response.
-// It now includes 2PC command handling and passes TxnID to B-tree operations.
-// It also handles new PUT_TEXT and TEXT_SEARCH commands for the inverted index.
+// It now includes 2PC command handling, TEXT_SEARCH, and SPATIAL commands.
 func handleRequest(req Request) Response {
 	var resp Response
 	var err error
@@ -426,8 +514,9 @@ func handleRequest(req Request) Response {
 	// --- Sharding Awareness: Check if key belongs to this node (for data ops) ---
 	// 2PC commands (PREPARE, COMMIT, ABORT) are sent directly to the participant,
 	// so they don't need shard routing check here.
-	// TEXT_SEARCH is handled by any node (for V1), so it doesn't need shard routing check.
-	isDataOperation := req.Command == "PUT" || req.Command == "PUT_TEXT" || req.Command == "GET" || req.Command == "DELETE"
+	// TEXT_SEARCH and SPATIAL_QUERY are handled by any node (for V1), so they don't need shard routing check.
+	isDataOperation := req.Command == "PUT" || req.Command == "PUT_TEXT" || req.Command == "GET" || req.Command == "DELETE" ||
+		req.Command == "PUT_SPATIAL" || req.Command == "DELETE_SPATIAL" // Spatial operations also need sharding check for their key
 	if isDataOperation {
 		targetSlot := fsm.GetSlotForHashKey(req.Key)
 
@@ -464,7 +553,7 @@ func handleRequest(req Request) Response {
 		} else {
 			resp = Response{Status: "OK", Message: "Key-value pair inserted/updated."}
 		}
-	case "PUT_TEXT": // NEW: Handle PUT_TEXT command
+	case "PUT_TEXT": // Handle PUT_TEXT command
 		// Extract raw text from GOJODB.TEXT() wrapper
 		pureText := ""
 		if strings.HasPrefix(req.Value, gojoDBTextPrefix) && strings.HasSuffix(req.Value, gojoDBTextSuffix) {
@@ -475,7 +564,6 @@ func handleRequest(req Request) Response {
 		}
 
 		// Insert into Inverted Index (non-transactional for V1)
-		// invertedIndexInstance.Insert returns an error now
 		if err := invertedIndexInstance.Insert(pureText, req.Key); err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_TEXT (inverted index part) failed: %v", err)}
 			return resp
@@ -490,6 +578,30 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_TEXT (B-tree part) failed: %v", err)}
 		} else {
 			resp = Response{Status: "OK", Message: "Key-value pair and text indexed."}
+		}
+	case "PUT_SPATIAL": // NEW: Handle PUT_SPATIAL command
+		rect := spatial.Rect{req.MinX, req.MinY, req.MaxX, req.MaxY}
+		sd := spatial.SpatialData{req.Key}
+		log.Println("Info: spatial request: ", req, sd)
+		if err := spatialIndexManager.Insert(rect, sd); err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_SPATIAL (spatial index part) failed: %v", err)}
+			return resp
+		}
+		log.Printf("INFO: Spatial Index: Indexed key '%s' with rect %v", req.Key, rect)
+
+		// Also store the spatial data as a JSON string in the B-tree
+		rectJSON, marshalErr := json.Marshal(rect)
+		if marshalErr != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_SPATIAL failed to marshal rect to JSON: %v", marshalErr)}
+			return resp
+		}
+		dbLock.Lock()
+		err = dbInstance.Insert(req.Key, string(rectJSON), req.TxnID)
+		dbLock.Unlock()
+		if err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_SPATIAL (B-tree part) failed: %v", err)}
+		} else {
+			resp = Response{Status: "OK", Message: "Spatial data indexed and stored."}
 		}
 	case "GET":
 		dbLock.RLock() // Acquire read lock for GET
@@ -532,7 +644,7 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "OK", Message: string(b)}
 			iterator.Close()
 		}
-	case "TEXT_SEARCH": // NEW: Handle TEXT_SEARCH command
+	case "TEXT_SEARCH": // Handle TEXT_SEARCH command
 		// Perform search on the inverted index
 		resultKeys, searchErr := invertedIndexInstance.Search(req.Query) // Capture error from InvertedIndex.Search
 		if searchErr != nil {
@@ -563,6 +675,24 @@ func handleRequest(req Request) Response {
 		} else {
 			resp = Response{Status: "OK", Message: string(entriesJSON)}
 		}
+	case "QUERY_SPATIAL": // NEW: Handle QUERY_SPATIAL command
+		queryRect := spatial.Rect{
+			req.MinX, req.MinY, req.MaxX, req.MaxY,
+		}
+		results, queryErr := spatialIndexManager.Query(queryRect)
+		if queryErr != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("QUERY_SPATIAL failed: %v", queryErr)}
+			return resp
+		}
+		log.Printf("INFO: Spatial Index: Query for %v returned %d results.", queryRect, len(results))
+
+		// Marshal the spatial data results (SpatialData contains ID and Rect)
+		resultsJSON, marshalErr := json.Marshal(results)
+		if marshalErr != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Failed to marshal spatial query results: %v", marshalErr)}
+		} else {
+			resp = Response{Status: "OK", Message: string(resultsJSON)}
+		}
 	case "DELETE":
 		dbLock.Lock()                               // Acquire write lock for DELETE
 		err = dbInstance.Delete(req.Key, req.TxnID) // Pass TxnID
@@ -571,6 +701,23 @@ func handleRequest(req Request) Response {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE failed: %v", err)}
 		} else {
 			resp = Response{Status: "OK", Message: "Key deleted."}
+		}
+	case "DELETE_SPATIAL": // NEW: Handle DELETE_SPATIAL command
+		rect := spatial.Rect{req.MinX, req.MinY, req.MaxX, req.MaxY}
+		// if err := spatialIndexManager.DeleteSpatialData(req.Key, rect); err != nil {
+		// 	resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE_SPATIAL (spatial index part) failed: %v", err)}
+		// 	return resp
+		// }
+		log.Printf("INFO: Spatial Index: Deleted key '%s' with rect %v", req.Key, rect)
+
+		// Also delete from the B-tree
+		dbLock.Lock()
+		err = dbInstance.Delete(req.Key, req.TxnID)
+		dbLock.Unlock()
+		if err != nil {
+			resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE_SPATIAL (B-tree part) failed: %v", err)}
+		} else {
+			resp = Response{Status: "OK", Message: "Spatial data deleted."}
 		}
 	case "SIZE":
 		// SIZE command is global to this node's local B-tree, not sharded.
@@ -582,7 +729,7 @@ func handleRequest(req Request) Response {
 		} else {
 			resp = Response{Status: "OK", Message: fmt.Sprintf("%d", size)}
 		}
-	// --- NEW: 2PC Command Handlers ---
+	// --- 2PC Command Handlers ---
 	case "PREPARE":
 		// Operations are passed as a JSON string in req.Value
 		log.Println("Server Operations: ", req.Value)
@@ -730,8 +877,18 @@ func main() {
 	defer listener.Close()
 
 	log.Printf("INFO: GojoDB Storage Node %s listening for client traffic on %s", myStorageNodeID, myStorageNodeAddr)
-	log.Println("INFO: Commands: PUT <key> <value>, PUT_TEXT <key> GOJODB.TEXT(<value>), GET <key>, DELETE <key>, SIZE, TEXT_SEARCH <query>") // NEW: Commands
-	log.Println("INFO: 2PC Commands (from Coordinator only): PREPARE <TxnID> <ops_json>, COMMIT <TxnID>, ABORT <TxnID>")
+	log.Println("INFO: Commands:")
+	log.Println("  - PUT <key> <value>")
+	log.Println("  - PUT_TEXT <key> GOJODB.TEXT(<value>)")
+	log.Println("  - PUT_SPATIAL <key> <minX> <minY> <maxX> <maxY>")
+	log.Println("  - GET <key>")
+	log.Println("  - GET_RANGE <start_key> <end_key>")
+	log.Println("  - DELETE <key>")
+	log.Println("  - DELETE_SPATIAL <key> <minX> <minY> <maxX> <maxY>")
+	log.Println("  - SIZE")
+	log.Println("  - TEXT_SEARCH <query>")
+	log.Println("  - QUERY_SPATIAL <minX> <minY> <maxX> <maxY>")
+	log.Println("  - 2PC Commands (from Coordinator only): PREPARE <TxnID> <ops_json>, COMMIT <TxnID>, ABORT <TxnID>")
 
 	for {
 		// Accept incoming connections

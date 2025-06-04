@@ -26,6 +26,15 @@ type BufferPoolManager struct {
 	lruMap      map[int]*list.Element      // Frame index to LRU list element
 	mu          sync.Mutex
 	pageSize    int
+	numPages    pagemanager.PageID
+}
+
+func (bpm *BufferPoolManager) GetNumPages() pagemanager.PageID {
+	return bpm.numPages
+}
+
+func (bpm *BufferPoolManager) SetNextPageID(pageID pagemanager.PageID) {
+	bpm.numPages = pageID
 }
 
 // NewBufferPoolManager creates and initializes a new BufferPoolManager.
