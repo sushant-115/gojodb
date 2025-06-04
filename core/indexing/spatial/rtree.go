@@ -396,17 +396,20 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 			return fmt.Errorf("failed to serialize new root node: %w", err)
 		}
 		rt.bpm.UnpinPage(newRootPageID, true) // Mark dirty
+		log.Println("Old rootpage ID: ", rt.rootPageID)
 
 		rt.rootPageID = newRootPageID
-		log.Printf("INFO: Spatial Index: Created new root node at page %d for first insert.", newRootPageID)
+		log.Printf("INFO: Spatial Index: Created new root node at page %d for first insert. %d", newRootPageID, rt.rootPageID)
+		log.Println("New rootpage ID: ", rt.rootPageID)
 
 		// Log the new root creation
 		logRecord := &wal.LogRecord{
 			Type:    wal.LogTypeRTreeNewRoot,
 			PageID:  newRootPageID,
-			NewData: binary.LittleEndian.AppendUint64(nil, uint64(newRootPageID)), // Store new root ID
+			NewData: page.GetData(), // Store new root ID
 			LSN:     rt.lm.GetCurrentLSN(),
 		}
+		log.Println("Log append: ", logRecord)
 		if _, err := rt.lm.Append(logRecord); err != nil {
 			return fmt.Errorf("failed to log R-tree new root: %w", err)
 		}
@@ -421,17 +424,17 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 
 		return nil
 	}
-
+	log.Println("Before calling chooseLead: ", rt.rootPageID)
 	// Find the leaf node to insert into
-	leafNode, _, err := rt.chooseLeaf(rt.rootPageID, entry)
+	leafNode, path, err := rt.chooseLeaf(rt.rootPageID, entry)
 	if err != nil {
 		return fmt.Errorf("failed to choose leaf node: %w", err)
 	}
 	defer rt.bpm.UnpinPage(leafNode.pageID, false) // Unpin after operations
-
-	leafNode.mu.Lock() // Lock leaf node for modification
+	log.Println("After calling chooseLead: ", rt.rootPageID)
+	//leafNode.mu.Lock() // Lock leaf node for modification
 	leafNode.AddEntry(entry)
-
+	log.Println("After calling chooseLead 437: ", rt.rootPageID, leafNode, path)
 	// Log the insert operation before serialization
 	logRecord := &wal.LogRecord{
 		Type:    wal.LogTypeRTreeInsert,
@@ -440,7 +443,7 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 		LSN:     rt.lm.GetCurrentLSN(),
 	}
 	if _, err := rt.lm.Append(logRecord); err != nil {
-		leafNode.mu.Unlock()
+		//leafNode.mu.Unlock()
 		return fmt.Errorf("failed to log R-tree insert: %w", err)
 	}
 
@@ -449,37 +452,41 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 		log.Printf("INFO: Spatial Index: Leaf node %d overflowed, splitting.", leafNode.pageID)
 		newNode, err := rt.splitNode(leafNode)
 		if err != nil {
-			leafNode.mu.Unlock()
+			//leafNode.mu.Unlock()
 			return fmt.Errorf("failed to split leaf node: %w", err)
 		}
 
 		// Update parent entries for both original and new node
 		if err := rt.adjustTree(leafNode, newNode); err != nil {
-			leafNode.mu.Unlock()
+			//leafNode.mu.Unlock()
 			return fmt.Errorf("failed to adjust tree after split: %w", err)
 		}
 	} else {
 		// If no split, just update the MBRs up the tree
+		log.Println("Adjust tree calling: ", rt.rootPageID, leafNode)
 		if err := rt.adjustTree(leafNode, nil); err != nil {
-			leafNode.mu.Unlock()
+			//leafNode.mu.Unlock()
 			return fmt.Errorf("failed to adjust tree after insert: %w", err)
 		}
 	}
 
 	// Serialize and unpin the modified leaf node (and potentially its parent/ancestors)
+	log.Println("Before fetch node: 474", rt.rootPageID, leafNode)
 	page, err := rt.bpm.FetchPage(leafNode.pageID)
 	if err != nil {
-		leafNode.mu.Unlock()
+		//leafNode.mu.Unlock()
 		return fmt.Errorf("failed to fetch leaf page %d for serialization: %w", leafNode.pageID, err)
 	}
+	log.Println("After fetch node: 474", rt.rootPageID, leafNode)
 	if err := leafNode.serialize(page); err != nil {
 		rt.bpm.UnpinPage(leafNode.pageID, false)
-		leafNode.mu.Unlock()
+		//leafNode.mu.Unlock()
 		return fmt.Errorf("failed to serialize leaf node %d: %w", leafNode.pageID, err)
 	}
+	log.Println("After serialize fetch node: 474", rt.rootPageID, leafNode)
 	rt.bpm.UnpinPage(leafNode.pageID, true) // Mark dirty
-	leafNode.mu.Unlock()
-
+	//leafNode.mu.Unlock()
+	log.Println("After fetch node: 474", rt.rootPageID, leafNode)
 	return nil
 }
 
@@ -487,13 +494,15 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 // It returns the leaf node and the path of nodes traversed from root to leaf.
 func (rt *RTree) chooseLeaf(currentPageID pagemanager.PageID, entry Entry) (*Node, []*Node, error) {
 	path := []*Node{}
+	log.Println("Choose leaf: ", rt.rootPageID, currentPageID)
 	currentNode, err := rt.fetchNode(currentPageID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to fetch root node %d: %w", currentPageID, err)
 	}
-
+	log.Println("Choose leaf 498: ", rt.rootPageID, currentPageID, currentNode)
 	for !currentNode.isLeaf {
 		path = append(path, currentNode)
+		log.Println("Choose leaf 501: ", rt.rootPageID, currentPageID, currentNode)
 		// Find entry in current node whose rectangle needs least enlargement
 		// to cover the new entry's rectangle. Break ties by choosing the entry
 		// with the smallest area.
@@ -524,14 +533,17 @@ func (rt *RTree) chooseLeaf(currentPageID pagemanager.PageID, entry Entry) (*Nod
 		if chosenEntry.ChildID == pagemanager.InvalidPageID {
 			return nil, nil, fmt.Errorf("chosen entry has invalid ChildID in non-leaf node %d", currentNode.pageID)
 		}
-
+		log.Println("Choose leaf 532: ", rt.rootPageID, currentPageID, currentNode)
 		// Move to the child node
 		currentNode, err = rt.fetchNode(chosenEntry.ChildID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to fetch child node %d: %w", chosenEntry.ChildID, err)
 		}
+		log.Println("Choose leaf 538: ", rt.rootPageID, currentPageID, currentNode)
 	}
+
 	path = append(path, currentNode) // Add the leaf node to the path
+	log.Println("Choose leaf 538: ", rt.rootPageID, currentPageID, currentNode, path)
 	return currentNode, path, nil
 }
 
@@ -615,6 +627,7 @@ func (rt *RTree) splitNode(oldNode *Node) (*Node, error) {
 
 // adjustTree adjusts the MBRs of nodes up the tree after an insertion or split.
 func (rt *RTree) adjustTree(node *Node, newNode *Node) error {
+	log.Println("Adjust tree: ", rt.rootPageID, node, newNode)
 	var nodesToProcess []*Node
 	nodesToProcess = append(nodesToProcess, node)
 	if newNode != nil {
@@ -1020,7 +1033,9 @@ func (rt *RTree) deleteRecursive(currentPageID pagemanager.PageID, targetRect Re
 
 // writeHeader writes the R-tree header to disk.
 func (rt *RTree) writeHeader(header *SpatialIndexHeader) error {
+	log.Println("write header 1027: ", rt.rootPageID)
 	headerPage, err := rt.bpm.FetchPage(SpatialIndexHeaderPageID)
+	log.Println("write header 1029: ", rt.rootPageID)
 	if err != nil {
 		// If header page doesn't exist, allocate it
 		if err == flushmanager.ErrPageNotFound {
@@ -1028,18 +1043,21 @@ func (rt *RTree) writeHeader(header *SpatialIndexHeader) error {
 			if headerPage == nil || err != nil {
 				return fmt.Errorf("failed to allocate new header page")
 			}
+			log.Println("write header 1037: ", rt.rootPageID)
 			if headerPage.GetPageID() != SpatialIndexHeaderPageID {
 				return fmt.Errorf("allocated header page has wrong ID: got %d, want %d", headerPage.GetPageID(), SpatialIndexHeaderPageID)
 			}
 		} else {
 			return fmt.Errorf("failed to fetch spatial index header page for writing: %w", err)
 		}
+		log.Println("write header 1044: ", rt.rootPageID)
 	}
 	defer rt.bpm.UnpinPage(headerPage.GetPageID(), true) // Mark dirty
-
+	log.Println("write header 1047: ", rt.rootPageID)
 	if err := header.serialize(headerPage); err != nil {
 		return fmt.Errorf("failed to serialize spatial index header: %w", err)
 	}
+	log.Println("write header 1051: ", rt.rootPageID, header, headerPage)
 	log.Printf("INFO: Spatial Index: Wrote header: RootPageID=%d, NextPageID=%d", header.RootPageID, header.NextPageID)
 	return nil
 }

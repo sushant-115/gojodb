@@ -581,7 +581,9 @@ func handleRequest(req Request) Response {
 		}
 	case "PUT_SPATIAL": // NEW: Handle PUT_SPATIAL command
 		rect := spatial.Rect{req.MinX, req.MinY, req.MaxX, req.MaxY}
-		if err := spatialIndexManager.Insert(rect, spatial.SpatialData{}); err != nil {
+		sd := spatial.SpatialData{req.Key}
+		log.Println("Info: spatial request: ", req, sd)
+		if err := spatialIndexManager.Insert(rect, sd); err != nil {
 			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_SPATIAL (spatial index part) failed: %v", err)}
 			return resp
 		}
