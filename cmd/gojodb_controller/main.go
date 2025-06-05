@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -45,6 +46,12 @@ type Controller struct {
 	heartbeatListenAddress string               // Configurable UDP port for heartbeats
 }
 
+type HeartbeatMessage struct {
+	NodeID    string `json:"node_id"`
+	Address   string `json:"address"`
+	Timestamp int64  `json:"timestamp"` // Unix timestamp
+}
+
 // NewController creates and initializes a new Controller node.
 func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenAddress string) (*Controller, error) {
 	c := &Controller{
@@ -66,7 +73,8 @@ func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir 
 	go c.startHTTPServer(httpAddr)
 
 	// Start Heartbeat Listener for Storage Nodes
-	go c.startHeartbeatListener()
+	// go c.startHeartbeatListener()
+	go c.ReceiveHeartbeatsTCP(context.Background(), heartbeatListenAddress, 10*time.Second)
 
 	// Start background goroutine for monitoring Storage Nodes
 	go c.monitorStorageNodes()
@@ -523,8 +531,106 @@ func (c *Controller) recordHeartbeat(nodeID string, addr string) {
 			log.Printf("DEBUG: Applied heartbeat for Storage Node %s (%s) to Raft FSM.", nodeID, addr)
 		}
 	} else {
-		log.Printf("DEBUG: Received heartbeat from Storage Node %s (%s) but not leader. Not applying to Raft.", nodeID, addr)
+		// log.Printf("DEBUG: Received heartbeat from Storage Node %s (%s) but not leader. Not applying to Raft.", nodeID, addr)
 	}
+}
+
+// ReceiveHeartbeatsTCP listens for incoming heartbeat messages on a given TCP address.
+// It updates a map of active nodes and removes nodes that haven't sent heartbeats recently.
+// The context allows for graceful shutdown.
+func (c *Controller) ReceiveHeartbeatsTCP(ctx context.Context, listenAddr string, timeout time.Duration) {
+	log.Printf("Starting TCP heartbeat receiver on %s", listenAddr)
+
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("Failed to start TCP listener on %s: %v", listenAddr, err)
+	}
+	defer listener.Close()
+
+	// Map to store last heartbeat time for each node
+	activeNodes := make(map[string]HeartbeatMessage)
+	var mu sync.RWMutex // Mutex to protect activeNodes map
+
+	// Goroutine to periodically clean up timed-out nodes
+	go func() {
+		cleanupTicker := time.NewTicker(timeout / 2) // Check more frequently than timeout
+		defer cleanupTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Heartbeat receiver cleanup routine stopped.")
+				return
+			case <-cleanupTicker.C:
+				mu.Lock()
+				for nodeID, msg := range activeNodes {
+					// Check if the last heartbeat is older than the timeout
+					if time.Now().UnixNano()-msg.Timestamp > int64(timeout) {
+						log.Printf("Node %s (%s) timed out. Removing from active nodes.", nodeID, msg.Address)
+						delete(activeNodes, nodeID)
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	// Goroutine to accept incoming connections
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Heartbeat receiver stopping connection acceptance.")
+				return
+			default:
+				// Set a deadline for accepting new connections
+				conn, err := listener.Accept()
+				if err != nil {
+					if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+						continue // Timeout, try again
+					}
+					log.Printf("Failed to accept connection: %v", err)
+					continue
+				}
+				//conn.SetDeadline(time.Now().Add(time.Second))
+
+				// Handle each connection in a new goroutine
+				go func(conn net.Conn) {
+					defer conn.Close()
+					reader := bufio.NewReader(conn)
+					for {
+						// Read until newline delimiter
+						data, err := reader.ReadBytes('\n')
+						if err != nil {
+							if err.Error() == "EOF" {
+								// Connection closed by sender
+								// log.Printf("Connection from %s closed.", c.RemoteAddr())
+							} else {
+								log.Printf("Error reading heartbeat from %s: %v", conn.RemoteAddr(), err)
+							}
+							return
+						}
+
+						var msg HeartbeatMessage
+						if err := json.Unmarshal(data, &msg); err != nil {
+							log.Printf("Failed to unmarshal heartbeat message from %s: %v", conn.RemoteAddr(), err)
+							continue
+						}
+
+						mu.Lock()
+						activeNodes[msg.NodeID] = msg
+						mu.Unlock()
+						// log.Printf("Received heartbeat from NodeID: %s, Address: %s (Last seen: %s)",
+						// 	msg.NodeID, msg.Address, time.Unix(0, msg.Timestamp).Format(time.StampMilli))
+						c.recordHeartbeat(msg.NodeID, msg.Address)
+					}
+				}(conn)
+			}
+		}
+	}()
+
+	<-ctx.Done() // Block until context is cancelled
+	log.Println("Heartbeat receiver fully stopped.")
 }
 
 // monitorStorageNodes periodically checks the health of registered Storage Nodes.

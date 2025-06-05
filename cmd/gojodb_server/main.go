@@ -1,7 +1,8 @@
 package main
 
 import (
-	"bufio"         // Added for bytes.SplitN
+	"bufio" // Added for bytes.SplitN
+	"context"
 	"encoding/json" // Needed for (de)serializing TransactionOperations
 	"fmt"
 	"io"
@@ -62,7 +63,8 @@ var (
 	myAssignedSlots   map[string]fsm.SlotRangeInfo // Cache of slot ranges assigned to THIS node
 	// Replication Manager instance
 	replicationManager      *replication.ReplicationManager
-	controllerHTTPAddresses = os.Getenv("RAFT_ADDRESS")
+	controllerHeartbeatAddr = os.Getenv("RAFT_HEARTBEAT_ADDRESS")
+	raftControllerAddress   = os.Getenv("RAFT_HTTP_ADDRESS")
 )
 
 // Request represents a parsed client request for single operations.
@@ -90,6 +92,12 @@ type Response struct {
 type Entry struct {
 	Key   string
 	Value string
+}
+
+type HeartbeatMessage struct {
+	NodeID    string `json:"node_id"`
+	Address   string `json:"address"`
+	Timestamp int64  `json:"timestamp"` // Unix timestamp
 }
 
 type TransactionOperations struct {
@@ -200,7 +208,12 @@ func initStorageNode() error {
 	replicationManager.Start() // Start replication background tasks
 
 	// 8. Start background tasks
-	go sendHeartbeatsToController()
+	// go sendHeartbeatsToController()
+	for _, controllerAddress := range strings.Split(controllerHeartbeatAddr, ",") {
+		log.Println("Setup heartbeat for :", controllerAddress)
+		go SendHeartbeatsTCP(context.Background(), myStorageNodeID, myStorageNodeAddr, controllerAddress, heartbeatInterval)
+	}
+	log.Println("Calling fetch shard map")
 	go fetchShardMapFromController(replicationManager)
 
 	return nil
@@ -239,12 +252,63 @@ func closeStorageNode() {
 	log.Println("INFO: Storage Node shutdown complete.")
 }
 
+// SendHeartbeatsTCP sends periodic heartbeat messages to a target address over TCP.
+// It runs in a goroutine and sends heartbeats every `interval`.
+// The context allows for graceful shutdown.
+func SendHeartbeatsTCP(ctx context.Context, nodeID string, localAddr string, targetAddr string, interval time.Duration) {
+	log.Printf("Starting TCP heartbeat sender for NodeID: %s, LocalAddr: %s, TargetAddr: %s", nodeID, localAddr, targetAddr)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Heartbeat sender for NodeID %s stopped due to context cancellation.", nodeID)
+			return
+		case <-ticker.C:
+			// Create a new connection for each heartbeat.
+			// For a more robust system, consider maintaining a persistent connection
+			// or using connection pooling.
+			conn, err := net.Dial("tcp", targetAddr)
+			if err != nil {
+				log.Printf("Failed to connect to %s for heartbeat (NodeID: %s): %v", targetAddr, nodeID, err)
+				continue
+			}
+
+			// Create the heartbeat message
+			msg := HeartbeatMessage{
+				NodeID:    nodeID,
+				Address:   localAddr,
+				Timestamp: time.Now().UnixNano(),
+			}
+
+			// Encode the message to JSON
+			jsonData, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("Failed to marshal heartbeat message for NodeID %s: %v", nodeID, err)
+				conn.Close()
+				continue
+			}
+
+			// Send the message followed by a newline delimiter
+			_, err = conn.Write(append(jsonData, '\n'))
+			if err != nil {
+				log.Printf("Failed to send heartbeat to %s (NodeID: %s): %v", targetAddr, nodeID, err)
+			} else {
+				// log.Printf("Sent heartbeat from NodeID: %s to %s", nodeID, targetAddr)
+			}
+			conn.Close() // Close the connection after sending
+		}
+	}
+}
+
 // sendHeartbeatsToController periodically sends heartbeats to all known Controller addresses.
 func sendHeartbeatsToController() {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
-	controllerAddrs := strings.Split(controllerHTTPAddresses, ",")
+	controllerAddrs := strings.Split(controllerHeartbeatAddr, ",")
 	heartbeatMessage := fmt.Sprintf("%s:%s", myStorageNodeID, myStorageNodeAddr)
 
 	for range ticker.C {
@@ -292,92 +356,100 @@ func sendHeartbeatsToController() {
 
 // fetchShardMapFromController periodically fetches the latest slot assignments from the Controller leader.
 func fetchShardMapFromController(rm *replication.ReplicationManager) {
+	log.Println("Called shard map")
 	ticker := time.NewTicker(shardMapFetchInterval)
 	defer ticker.Stop()
 
-	controllerAddrs := strings.Split(controllerHTTPAddresses, ",")
+	controllerAddrs := strings.Split(raftControllerAddress, ",")
 
-	for range ticker.C {
-		leaderAddr := ""
-		// 1. Find the current Controller leader
-		for _, addr := range controllerAddrs {
-			resp, err := http.Get(fmt.Sprintf("http://%s/status", addr))
+	for {
+		select {
+		case <-ticker.C:
+			leaderAddr := ""
+			// 1. Find the current Controller leader
+			for _, addr := range controllerAddrs {
+				resp, err := http.Get(fmt.Sprintf("http://%s/status", addr))
+				if err != nil {
+					// log.Printf("DEBUG: Failed to reach Controller %s for status: %v", addr, err) // Too noisy
+					continue
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode == http.StatusOK {
+					bodyBytes, _ := io.ReadAll(resp.Body)
+					bodyString := string(bodyBytes)
+					if strings.Contains(bodyString, "State: Leader") {
+						// Extract leader address from status response (assuming it's in "Leader: <addr>")
+						leaderLine := ""
+						for _, line := range strings.Split(bodyString, "\n") {
+							if strings.HasPrefix(line, "Leader:") {
+								leaderLine = strings.TrimSpace(strings.TrimPrefix(line, "Leader:"))
+								break
+							}
+						}
+						if leaderLine != "" && leaderLine != "unknown" && leaderLine != "none" {
+							leaderAddr = addr
+							break // Found leader, stop searching
+						}
+					}
+				}
+			}
+
+			if leaderAddr == "" {
+				log.Println("No leader found")
+				//log.Printf("WARNING: No Controller leader found. Cannot fetch shard map.")
+				continue
+			}
+			//log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
+
+			// 2. Fetch all slot assignments from the leader
+			resp, err := http.Get(fmt.Sprintf("http://%s/admin/get_all_slot_assignments", leaderAddr)) // New endpoint needed
 			if err != nil {
-				// log.Printf("DEBUG: Failed to reach Controller %s for status: %v", addr, err) // Too noisy
+				log.Printf("ERROR: Failed to fetch slot assignments from Controller leader %s: %v", leaderAddr, err)
 				continue
 			}
 			defer resp.Body.Close()
 
-			if resp.StatusCode == http.StatusOK {
-				bodyBytes, _ := io.ReadAll(resp.Body)
-				bodyString := string(bodyBytes)
-				if strings.Contains(bodyString, "State: Leader") {
-					// Extract leader address from status response (assuming it's in "Leader: <addr>")
-					leaderLine := ""
-					for _, line := range strings.Split(bodyString, "\n") {
-						if strings.HasPrefix(line, "Leader:") {
-							leaderLine = strings.TrimSpace(strings.TrimPrefix(line, "Leader:"))
-							break
-						}
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("ERROR: Failed to fetch slot assignments: HTTP Status %s", resp.Status)
+				continue
+			}
+			// bodyBytes, _ := io.ReadAll(resp.Body)
+			// bodyString := string(bodyBytes)
+			// log.Println("Controller Address 418:  ", bodyString)
+			var allSlotAssignments map[string]fsm.SlotRangeInfo
+			if err := json.NewDecoder(resp.Body).Decode(&allSlotAssignments); err != nil {
+				log.Printf("ERROR: Failed to decode slot assignments from Controller: %v", err)
+				continue
+			}
+
+			// 3. Update local cache with assignments relevant to this node
+			newAssignedSlots := make(map[string]fsm.SlotRangeInfo)
+			for rangeID, slotInfo := range allSlotAssignments {
+				if slotInfo.AssignedNodeID == myStorageNodeID {
+					newAssignedSlots[rangeID] = slotInfo
+				}
+				// 2. Fetch all slot assignments from the leader
+				for _, nodeID := range slotInfo.ReplicaNodeIDs {
+					resp, err = http.Get(fmt.Sprintf("http://%s/admin/get_storage_node_address?nodeID=%s", leaderAddr, nodeID)) // New endpoint needed
+					if err != nil {
+						log.Printf("ERROR: Failed to fetch slot assignments from Controller leader %s: %v", leaderAddr, err)
+						continue
 					}
-					if leaderLine != "" && leaderLine != "unknown" && leaderLine != "none" {
-						leaderAddr = addr
-						break // Found leader, stop searching
-					}
+					body, _ := ioutil.ReadAll(resp.Body)
+					rm.SetStorageNodeAddress(nodeID, string(body))
 				}
 			}
+
+			myAssignedSlotsMu.Lock()
+			myAssignedSlots = newAssignedSlots
+			log.Println("Fetched slot assignments: ", newAssignedSlots)
+			rm.SetAssignedNodeAddress(myAssignedSlots)
+			myAssignedSlotsMu.Unlock()
+
+			//rm.primaryForSlots = newAssignedSlots
+			//log.Printf("INFO: Storage Node %s fetched and cached %d assigned slot ranges.", myStorageNodeID, len(myAssignedSlots))
 		}
-
-		if leaderAddr == "" {
-			//log.Printf("WARNING: No Controller leader found. Cannot fetch shard map.")
-			continue
-		}
-		//log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
-
-		// 2. Fetch all slot assignments from the leader
-		resp, err := http.Get(fmt.Sprintf("http://%s/admin/get_all_slot_assignments", leaderAddr)) // New endpoint needed
-		if err != nil {
-			log.Printf("ERROR: Failed to fetch slot assignments from Controller leader %s: %v", leaderAddr, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("ERROR: Failed to fetch slot assignments: HTTP Status %s", resp.Status)
-			continue
-		}
-
-		var allSlotAssignments map[string]fsm.SlotRangeInfo
-		if err := json.NewDecoder(resp.Body).Decode(&allSlotAssignments); err != nil {
-			log.Printf("ERROR: Failed to decode slot assignments from Controller: %v", err)
-			continue
-		}
-
-		// 3. Update local cache with assignments relevant to this node
-		newAssignedSlots := make(map[string]fsm.SlotRangeInfo)
-		for rangeID, slotInfo := range allSlotAssignments {
-			if slotInfo.AssignedNodeID == myStorageNodeID {
-				newAssignedSlots[rangeID] = slotInfo
-			}
-			// 2. Fetch all slot assignments from the leader
-			for _, nodeID := range slotInfo.ReplicaNodeIDs {
-				resp, err = http.Get(fmt.Sprintf("http://%s/admin/get_storage_node_address?nodeID=%s", leaderAddr, nodeID)) // New endpoint needed
-				if err != nil {
-					log.Printf("ERROR: Failed to fetch slot assignments from Controller leader %s: %v", leaderAddr, err)
-					continue
-				}
-				body, _ := ioutil.ReadAll(resp.Body)
-				rm.SetStorageNodeAddress(nodeID, string(body))
-			}
-		}
-
-		myAssignedSlotsMu.Lock()
-		myAssignedSlots = newAssignedSlots
-		rm.SetAssignedNodeAddress(myAssignedSlots)
-		myAssignedSlotsMu.Unlock()
-
-		//rm.primaryForSlots = newAssignedSlots
-		//log.Printf("INFO: Storage Node %s fetched and cached %d assigned slot ranges.", myStorageNodeID, len(myAssignedSlots))
 	}
 }
 
@@ -785,7 +857,9 @@ func handleRequest(req Request) Response {
 		case "CONFIG":
 			switch req.Value {
 			case "REPLICA_PORT":
-				resp = Response{Status: "OK", Message: fmt.Sprint(os.Getenv("BTREE_REPLICATION_LISTEN_PORT") + " " + os.Getenv("INVERTED_IDX_REPLICATION_LISTEN_PORT"))}
+				parts := strings.Split(myStorageNodeAddr, ":")
+				response := fmt.Sprintf("%s:%s %s:%s", parts[0], os.Getenv("BTREE_REPLICATION_LISTEN_PORT"), parts[0], os.Getenv("INVERTED_IDX_REPLICATION_LISTEN_PORT"))
+				resp = Response{Status: "OK", Message: response}
 				// log.Println("SHOW CONFIG REPLICA_PORT: ", resp)
 			default:
 				resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Value)}

@@ -21,11 +21,11 @@ import (
 )
 
 const (
-	apiServiceURL         = "http://localhost:8090/api/data"        // Target URL for the API Service's data endpoint
-	adminServiceURL       = "http://localhost:8090/admin/"          // Base URL for admin endpoints
-	statusServiceURL      = "http://localhost:8090/status"          // URL for cluster status
-	queryServiceURL       = "http://localhost:8090/api/query"       // URL for range queries
-	transactionServiceURL = "http://localhost:8090/api/transaction" // URL for 2PC transactions
+	apiServiceURL         = "http://localhost:8082/api/data"        // Target URL for the API Service's data endpoint
+	adminServiceURL       = "http://localhost:8082/admin/"          // Base URL for admin endpoints
+	statusServiceURL      = "http://localhost:8082/status"          // URL for cluster status
+	queryServiceURL       = "http://localhost:8082/api/query"       // URL for range queries
+	transactionServiceURL = "http://localhost:8082/api/transaction" // URL for 2PC transactions
 	clientTimeout         = 10 * time.Second
 	adminAPIKey           = "GOJODB_ADMIN_KEY" // Must match the key in api_service/main.go
 )

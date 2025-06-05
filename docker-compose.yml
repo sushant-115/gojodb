@@ -106,14 +106,16 @@ services:
       - STORAGE_NODE_ADDR=server-1:9090
       # Ports for replication mechanisms
       - BTREE_REPLICATION_LISTEN_PORT=9117
-      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9120
+      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9127
       # Address of a controller for Raft communication (points to controller-1's HTTP API)
-      - RAFT_ADDRESS=controller-1:8087
+      - RAFT_HEARTBEAT_ADDRESS=controller-1:8087,controller-2:8088,controller-3:8089
+      - RAFT_HTTP_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
+      
     ports:
       # Map container ports to host ports
       - "9090:9090" # Expose Storage Node API
       - "9117:9117" # Expose B-tree replication port
-      - "9120:9120" # Expose Inverted index replication port
+      - "9127:9127" # Expose Inverted index replication port
     networks:
       - gojodb_network
     # Ensure controllers are up before starting servers
@@ -132,9 +134,14 @@ services:
     environment:
       - STORAGE_NODE_ID=storage_node_2
       - STORAGE_NODE_ADDR=server-2:9092
-      - BTREE_REPLICATION_LISTEN_PORT=9117
-      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9120
-      - RAFT_ADDRESS=controller-1:8087
+      - BTREE_REPLICATION_LISTEN_PORT=9118
+      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9128
+      - RAFT_HEARTBEAT_ADDRESS=controller-1:8087,controller-2:8088,controller-3:8089
+      - RAFT_HTTP_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
+    ports:
+      - "9092:9092"
+      - "9118:9118" # Expose B-tree replication port
+      - "9128:9128" # Expose Inverted index replication port
     networks:
       - gojodb_network
     depends_on:
@@ -152,9 +159,14 @@ services:
     environment:
       - STORAGE_NODE_ID=storage_node_3
       - STORAGE_NODE_ADDR=server-3:9093
-      - BTREE_REPLICATION_LISTEN_PORT=9117
-      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9120
-      - RAFT_ADDRESS=controller-1:8087
+      - BTREE_REPLICATION_LISTEN_PORT=9119
+      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9129
+      - RAFT_HEARTBEAT_ADDRESS=controller-1:8087,controller-2:8088,controller-3:8089
+      - RAFT_HTTP_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
+    ports:
+      - "9093:9093"
+      - "9119:9119" # Expose B-tree replication port
+      - "9129:9129" # Expose Inverted index replication port
     networks:
       - gojodb_network
     depends_on:
