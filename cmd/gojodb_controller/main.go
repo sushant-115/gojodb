@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -38,21 +39,21 @@ type Controller struct {
 	nodeID       string
 
 	// Node Manager (Initial)
-	localHeartbeatMap   map[string]time.Time // Local map to track last heartbeat time for timeout detection
-	storageNodesMu      sync.Mutex           // Protects local heartbeat tracking map
-	heartbeatListener   *net.UDPConn         // Listener for incoming heartbeats from Storage Nodes
-	heartbeatListenPort int                  // Configurable UDP port for heartbeats
+	localHeartbeatMap      map[string]time.Time // Local map to track last heartbeat time for timeout detection
+	storageNodesMu         sync.Mutex           // Protects local heartbeat tracking map
+	heartbeatListener      *net.Listener        // Listener for incoming heartbeats from Storage Nodes
+	heartbeatListenAddress string               // Configurable UDP port for heartbeats
 }
 
 // NewController creates and initializes a new Controller node.
-func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenPort int) (*Controller, error) {
+func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenAddress string) (*Controller, error) {
 	c := &Controller{
-		fsm:                 fsm.NewGojoDBFSM(), // Initialize our FSM
-		raftDir:             raftDir,
-		raftBindAddr:        raftBindAddr,
-		nodeID:              nodeID,
-		localHeartbeatMap:   make(map[string]time.Time), // Initialize local map
-		heartbeatListenPort: heartbeatListenPort,        // Set configurable port
+		fsm:                    fsm.NewGojoDBFSM(), // Initialize our FSM
+		raftDir:                raftDir,
+		raftBindAddr:           raftBindAddr,
+		nodeID:                 nodeID,
+		localHeartbeatMap:      make(map[string]time.Time), // Initialize local map
+		heartbeatListenAddress: heartbeatListenAddress,     // Set configurable port
 	}
 
 	// Setup Raft
@@ -142,8 +143,12 @@ func (c *Controller) setupRaft(joinAddr string) error {
 	} else {
 		log.Printf("INFO: Attempting to join Raft cluster at %s", joinAddr)
 		// Attempt to join an existing cluster
-		if err := c.joinRaftCluster(joinAddr); err != nil {
-			return fmt.Errorf("failed to join Raft cluster: %w", err)
+		for i := 1; i < 4; i++ {
+			if err := c.joinRaftCluster(joinAddr); err != nil && i >= 4 {
+				return fmt.Errorf("failed to join Raft cluster: %w", err)
+			}
+			log.Println("WARN: couldn't join the raft cluster, retrying in ", i*5, "Seconds")
+			time.Sleep(time.Duration(i) * 5 * time.Second)
 		}
 	}
 
@@ -446,36 +451,47 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 
 // startHeartbeatListener starts a UDP listener for Storage Node heartbeats.
 func (c *Controller) startHeartbeatListener() {
-	addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(c.heartbeatListenPort))
-	if err != nil {
-		log.Fatalf("FATAL: Failed to resolve UDP address for heartbeat listener: %v", err)
-	}
-	listener, err := net.ListenUDP("udp", addr)
+	// addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(c.heartbeatListenPort))
+	// if err != nil {
+	// 	log.Fatalf("FATAL: Failed to resolve UDP address for heartbeat listener: %v", err)
+	// }
+	listener, err := net.Listen("tcp", c.heartbeatListenAddress)
 	if err != nil {
 		log.Fatalf("FATAL: Failed to start UDP heartbeat listener: %v", err)
 	}
-	c.heartbeatListener = listener
-	log.Printf("INFO: Heartbeat listener started on UDP %s", listener.LocalAddr().String())
+	c.heartbeatListener = &listener
+	log.Printf("INFO: Heartbeat listener started on UDP %s", listener.Addr().String())
 
-	buffer := make([]byte, 1024)
 	for {
-		n, remoteAddr, err := listener.ReadFromUDP(buffer)
+		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("ERROR: Error reading heartbeat: %v", err)
 			continue
 		}
-		// Assuming heartbeat message is just the Storage Node ID and its address
-		// Format: "NODE_ID:ADDRESS" e.g., "storage1:localhost:9000"
-		heartbeatMsg := string(buffer[:n])
-		parts := strings.SplitN(heartbeatMsg, ":", 2)
-		if len(parts) != 2 {
-			log.Printf("WARNING: Invalid heartbeat format from %s: '%s'", remoteAddr.String(), heartbeatMsg)
-			continue
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			heartbeatMessage := scanner.Text()
+			if strings.TrimSpace(heartbeatMessage) == "" {
+				continue
+			}
+			parts := strings.SplitN(heartbeatMessage, ":", 2)
+			if len(parts) != 2 {
+				log.Printf("WARNING: Invalid heartbeat format from %s: '%s'", conn.RemoteAddr().String(), heartbeatMessage)
+				continue
+			}
+			storageNodeID := parts[0]
+			storageNodeAddr := parts[1]
+			log.Println("Received heartbeat: ", parts)
+			c.recordHeartbeat(storageNodeID, storageNodeAddr)
+			log.Printf("Received heartbeat from %s: %s", conn.RemoteAddr().String(), heartbeatMessage)
 		}
-		storageNodeID := parts[0]
-		storageNodeAddr := parts[1]
 
-		c.recordHeartbeat(storageNodeID, storageNodeAddr)
+		if err := scanner.Err(); err != nil {
+			log.Printf("Connection error from %s: %v", conn.RemoteAddr().String(), err)
+		} else {
+			log.Printf("Connection closed from %s", conn.RemoteAddr().String())
+		}
+
 	}
 }
 
@@ -591,14 +607,9 @@ func main() {
 	joinAddr := os.Getenv("JOIN_ADDR") // Optional: address of an existing node to join
 
 	// Configurable Heartbeat Listen Port for Controller
-	heartbeatListenPortStr := os.Getenv("HEARTBEAT_LISTEN_PORT")
-	heartbeatListenPort := defaultHeartbeatListenPort
-	if heartbeatListenPortStr != "" {
-		parsedPort, err := strconv.Atoi(heartbeatListenPortStr)
-		if err != nil {
-			log.Fatalf("FATAL: Invalid HEARTBEAT_LISTEN_PORT: %v", err)
-		}
-		heartbeatListenPort = parsedPort
+	heartbeatListenAddress := os.Getenv("HEARTBEAT_LISTEN_ADDR")
+	if heartbeatListenAddress == "" {
+		log.Fatal("HEARTBEAT_LISTEN_ADDR is not set in environmnet")
 	}
 
 	// Simulated Storage Node parameters (for testing heartbeat integration)
@@ -623,7 +634,7 @@ func main() {
 	}
 	log.Printf("INFO: Raft data directory for %s: %s", nodeID, raftDataPath)
 
-	_, err := NewController(nodeID, raftBindAddr, httpAddr, raftDataPath, joinAddr, heartbeatListenPort) // Pass heartbeatListenPort
+	_, err := NewController(nodeID, raftBindAddr, httpAddr, raftDataPath, joinAddr, heartbeatListenAddress) // Pass heartbeatListenPort
 	if err != nil {
 		log.Fatalf("FATAL: Failed to create controller: %v", err)
 	}

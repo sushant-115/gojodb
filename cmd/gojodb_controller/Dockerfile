@@ -35,9 +35,7 @@ COPY --from=builder /usr/local/bin/app .
 # Expose the ports that the application will listen on.
 # You will need to uncomment and adjust these lines based on the specific component:
 # For cmd/gojodb_controller:
-EXPOSE 8080
-EXPOSE 8081
-EXPOSE 8086
+
 # For cmd/gojodb_server:
 # EXPOSE 9090
 # EXPOSE 9117

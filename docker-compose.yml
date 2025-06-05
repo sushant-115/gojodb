@@ -22,18 +22,19 @@ services:
       # Unique identifier for this Raft node
       - NODE_ID=node1
       # Raft binding address within the Docker network
-      - RAFT_BIND_ADDR=controller-1:8081
+      - RAFT_BIND_ADDR=controller-1:7081
       # HTTP API address within the Docker network
-      - HTTP_ADDR=controller-1:8080
+      - HTTP_ADDR=controller-1:7080
       # Heartbeat listener port
-      - HEARTBEAT_LISTEN_PORT=8086
+      - HEARTBEAT_LISTEN_ADDR=controller-1:8087
       # Initial Raft cluster members (comma-separated list of NODE_ID=RAFT_BIND_ADDR)
       - RAFT_CLUSTER=node1=controller-1:8081,node2=controller-2:8081,node3=controller-3:8081
     ports:
       # Map container ports to host ports for external access (optional for internal communication)
-      - "8080:8080" # Expose HTTP API
-      - "8081:8081" # Expose Raft communication port
-      - "8086:8086" # Expose Heartbeat port
+      - "7080:7080" # Expose HTTP API
+      - "7081:7081" # Expose Raft communication port
+      - "8087:8087" # Expose Heartbeat port
+      - "8095:8095/udp" # Expose Heartbeat port
     networks:
       - gojodb_network
 
@@ -46,11 +47,17 @@ services:
     container_name: gojodb_controller_2
     environment:
       - NODE_ID=node2
-      - RAFT_BIND_ADDR=controller-2:8081
-      - HTTP_ADDR=controller-2:8080
-      - HEARTBEAT_LISTEN_PORT=8086
+      - RAFT_BIND_ADDR=controller-2:7082
+      - HTTP_ADDR=controller-2:7083
+      - HEARTBEAT_LISTEN_ADDR=controller-2:8088
       - RAFT_CLUSTER=node1=controller-1:8081,node2=controller-2:8081,node3=controller-3:8081
-      - JOIN_ADDR=controller-1:8080
+      - JOIN_ADDR=controller-1:7080
+    ports:
+      # Map container ports to host ports for external access (optional for internal communication)
+      - "7082:7082" # Expose HTTP API
+      - "7083:7083" # Expose Raft communication port
+      - "8088:8088" # Expose Heartbeat port
+      - "8096:8096/udp"
     networks:
       - gojodb_network
     depends_on:
@@ -65,11 +72,17 @@ services:
     container_name: gojodb_controller_3
     environment:
       - NODE_ID=node3
-      - RAFT_BIND_ADDR=controller-3:8081
-      - HTTP_ADDR=controller-3:8080
-      - HEARTBEAT_LISTEN_PORT=8086
+      - RAFT_BIND_ADDR=controller-3:7084
+      - HTTP_ADDR=controller-3:7085
+      - HEARTBEAT_LISTEN_ADDR=controller-3:8089
       - RAFT_CLUSTER=node1=controller-1:8081,node2=controller-2:8081,node3=controller-3:8081
-      - JOIN_ADDR=controller-1:8080
+      - JOIN_ADDR=controller-1:7080
+    ports:
+      # Map container ports to host ports for external access (optional for internal communication)
+      - "7084:7084" # Expose HTTP API
+      - "7085:7085" # Expose Raft communication port
+      - "8089:8089" # Expose Heartbeat port
+      - "8097:8097/udp"
     networks:
       - gojodb_network
     depends_on:
@@ -95,7 +108,7 @@ services:
       - BTREE_REPLICATION_LISTEN_PORT=9117
       - INVERTED_IDX_REPLICATION_LISTEN_PORT=9120
       # Address of a controller for Raft communication (points to controller-1's HTTP API)
-      - RAFT_ADDRESS=controller-1:8080
+      - RAFT_ADDRESS=controller-1:8087
     ports:
       # Map container ports to host ports
       - "9090:9090" # Expose Storage Node API
@@ -118,10 +131,10 @@ services:
     container_name: gojodb_server_2
     environment:
       - STORAGE_NODE_ID=storage_node_2
-      - STORAGE_NODE_ADDR=server-2:9090
+      - STORAGE_NODE_ADDR=server-2:9092
       - BTREE_REPLICATION_LISTEN_PORT=9117
       - INVERTED_IDX_REPLICATION_LISTEN_PORT=9120
-      - RAFT_ADDRESS=controller-1:8080
+      - RAFT_ADDRESS=controller-1:8087
     networks:
       - gojodb_network
     depends_on:
@@ -138,10 +151,10 @@ services:
     container_name: gojodb_server_3
     environment:
       - STORAGE_NODE_ID=storage_node_3
-      - STORAGE_NODE_ADDR=server-3:9090
+      - STORAGE_NODE_ADDR=server-3:9093
       - BTREE_REPLICATION_LISTEN_PORT=9117
       - INVERTED_IDX_REPLICATION_LISTEN_PORT=9120
-      - RAFT_ADDRESS=controller-1:8080
+      - RAFT_ADDRESS=controller-1:8087
     networks:
       - gojodb_network
     depends_on:
@@ -159,7 +172,7 @@ services:
         COMPONENT_PATH: ./api/basic
     container_name: gojodb_api_basic
     environment:
-      - RAFT_ADDRESS=controller-1:8080
+      - RAFT_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
       - API_SERVICE_ADDR=:8082
     # Assuming the basic API server listens on port 8082
     ports:
@@ -169,6 +182,8 @@ services:
     # API servers depend on controllers and servers for database operations
     depends_on:
       - controller-1
+      - controller-2
+      - controller-3
       - server-1
 
   api-graphql:

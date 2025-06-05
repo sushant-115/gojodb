@@ -262,19 +262,30 @@ func sendHeartbeatsToController() {
 				continue
 			}
 			heartbeatTargetPort := controllerHeartbeatTargetPort // Assuming heartbeat listener is HTTP port + 1
-
-			conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP(parts[0]), Port: heartbeatTargetPort})
+			heartbeatTargetPort, _ = strconv.Atoi(parts[1])
+			// conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP(parts[0]), Port: heartbeatTargetPort})
+			// if err != nil {
+			// 	log.Printf("ERROR: Failed to dial UDP for heartbeat to %s (port %d): %v", addr, heartbeatTargetPort, err)
+			// 	continue
+			// }
+			// _, err = conn.Write([]byte(heartbeatMessage))
+			// if err != nil {
+			// 	log.Printf("ERROR: Failed to send heartbeat to Controller %s (port %d): %v", addr, heartbeatTargetPort, err)
+			// } else {
+			// 	//log.Printf("DEBUG: Storage Node %s sent heartbeat to Controller %s (port %d).", myStorageNodeID, addr, heartbeatTargetPort)
+			// }
+			tcpConn, err := net.Dial("tcp", addr)
 			if err != nil {
-				log.Printf("ERROR: Failed to dial UDP for heartbeat to %s (port %d): %v", addr, heartbeatTargetPort, err)
+				log.Printf("Failed to send heartbeat to connect: %v", err)
 				continue
 			}
-			_, err = conn.Write([]byte(heartbeatMessage))
+			_, err = fmt.Fprintln(tcpConn, heartbeatMessage) // Sends message with newline
 			if err != nil {
-				log.Printf("ERROR: Failed to send heartbeat to Controller %s (port %d): %v", addr, heartbeatTargetPort, err)
-			} else {
-				//log.Printf("DEBUG: Storage Node %s sent heartbeat to Controller %s (port %d).", myStorageNodeID, addr, heartbeatTargetPort)
+				log.Printf("Heartbeat error: %v", err)
 			}
-			conn.Close() // Close connection after sending
+			log.Println("Sent heartbeat to: ", parts[0], heartbeatTargetPort, heartbeatMessage)
+			// conn.Close() // Close connection after sending
+			tcpConn.Close()
 		}
 	}
 }
