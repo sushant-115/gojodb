@@ -90,7 +90,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 
 	// 1. Initialize LogManager for the inverted index
 	var err error
-	idx.lm, err = wal.NewLogManager(logDir, archiveDir, invertedIndexLogBufferSize, invertedIndexLogSegmentSize)
+	idx.lm, err = wal.NewLogManager(logDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for inverted index: %w", err)
 	}
@@ -192,12 +192,12 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 
 	// 5. Perform recovery for the inverted index (reapply logs)
 	// This will replay any changes to postings lists that were not flushed to disk.
-	if err := idx.lm.Recover(idx.dm, wal.LSN(idx.header.LastLSN)); err != nil {
-		idx.bpm.FlushAllPages() // This will flush pages, but recovery failed, so state might be inconsistent
-		idx.dm.Close()
-		idx.lm.Close()
-		return nil, fmt.Errorf("inverted index recovery failed: %w", err)
-	}
+	// if err := idx.lm.Recover(idx.dm, wal.LSN(idx.header.LastLSN)); err != nil {
+	// 	idx.bpm.FlushAllPages() // This will flush pages, but recovery failed, so state might be inconsistent
+	// 	idx.dm.Close()
+	// 	idx.lm.Close()
+	// 	return nil, fmt.Errorf("inverted index recovery failed: %w", err)
+	// }
 
 	// 6. Load the term dictionary (from dedicated JSON file for simplicity)
 	if err := idx.loadTermDictionary(); err != nil {
@@ -398,12 +398,12 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 		logData.Write(metadataBytes)
 
 		lr := &wal.LogRecord{
-			TxnID:   0,                         // Not part of a 2PC transaction for now
-			Type:    wal.LogRecordTypeUpdate,   // Using generic update type
-			PageID:  pagemanager.InvalidPageID, // Not a specific page, but a logical update to the term dictionary
-			NewData: logData.Bytes(),
+			TxnID:  0,                         // Not part of a 2PC transaction for now
+			Type:   wal.LogRecordTypeUpdate,   // Using generic update type
+			PageID: pagemanager.InvalidPageID, // Not a specific page, but a logical update to the term dictionary
+			Data:   logData.Bytes(),
 		}
-		if _, err := idx.lm.Append(lr); err != nil {
+		if _, err := idx.lm.AppendRecord(lr, wal.LogTypeInvertedIndex); err != nil {
 			log.Printf("WARNING: Failed to log inverted index update for term '%s': %v", term, err)
 		}
 	}

@@ -106,7 +106,7 @@ func NewSpatialIndexManager(
 	minEntries int, // Min entries per R-tree node
 ) (*SpatialIndexManager, error) {
 
-	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir, uniqueSpatialIndexArchiveDir, logBufferSize, int64(logSegmentSize))
+	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for spatial index: %w", err)
 	}

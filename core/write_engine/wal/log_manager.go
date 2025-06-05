@@ -2,32 +2,35 @@ package wal
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time" // Added for time.Ticker
+	"time" // Added for LastHeartbeat
 
-	"github.com/sushant-115/gojodb/core/transaction"
-	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
+	"go.uber.org/zap"
 )
 
-// --- Write-Ahead Logging (WAL) Constants and Types ---
+const (
+	walFilePrefix            = "wal-"
+	walFileSuffix            = ".log"
+	defaultMaxWalSegmentSize = 16 * 1024 * 1024 // 16MB per WAL segment
+	defaultArchiveDir        = "archive"
+	defaultMinLSNToKeep      = LSN(0) // Default LSN to keep, can be updated by replication slots
+)
 
-type LSN pagemanager.LSN // Log Sequence Number
-const InvalidLSN LSN = 0
+type LSN uint64
 
 // LogRecordType defines the type of operation logged.
-type LogRecordType byte
+type LogRecordType uint8
 
+// ... (existing LogRecordType constants)
 const (
 	LogRecordTypeUpdate    LogRecordType = iota + 1 // Update existing page data
 	LogRecordTypeInsertKey                          // B-Tree key insert (higher level)
@@ -49,1081 +52,662 @@ const (
 	// --- END NEW ---
 	LogRecordTypeRootChange // NEW: Log record for B-tree root page ID change
 	LogTypeRTreeDelete
+	// Add other types as needed
+	LogRecordTypeNoOp
 )
 
-// LogRecord represents a single entry in the Write-Ahead Log.
+type LogType uint
+
+const (
+	LogTypeBtree LogType = iota + 1
+	LogTypeInvertedIndex
+	LogTypeSpatial
+)
+
+// LogRecord represents a single log entry in the WAL.
 type LogRecord struct {
-	LSN     LSN
-	PrevLSN LSN    // LSN of the previous log record by the same transaction (for undo)
-	TxnID   uint64 // Transaction ID (0 if not part of a transaction or single op)
-	Type    LogRecordType
-	PageID  pagemanager.PageID // Page affected (if applicable)
-	Offset  uint16             // Offset within the page (if applicable for UPDATE)
-	OldData []byte             // For UNDO (and REDO if needed for physiological logging)
-	NewData []byte             // For REDO
-	// Other type-specific fields for specific log record types would go here.
+	LSN        LSN
+	Type       LogRecordType
+	Timestamp  int64              // Unix Nano
+	TxnID      uint64             // Transaction ID, 0 if not part of a transaction
+	PageID     pagemanager.PageID // Page ID, relevant for page-level operations
+	Data       []byte             // Actual log data (e.g., page diff, transaction info)
+	PrevLSN    LSN                // LSN of the previous log record for this transaction/page (optional, for recovery)
+	CRC        uint32             // Checksum for integrity
+	LogType    LogType            // General type for routing to index specific apply logic
+	SegmentID  uint64             // ID of the WAL segment this record belongs to
+	RecordSize uint32             // Size of this record on disk
 }
 
-// LogManager manages the Write-Ahead Log file(s).
-// It is responsible for appending log records, managing log segments,
-// ensuring durability, and providing a basic archiving mechanism.
+// ReplicationSlot tracks a consumer of WAL records.
+type ReplicationSlot struct {
+	SlotName       string    `json:"slot_name"`        // Unique name for the slot (e.g., replica_node_id + "_" + index_type)
+	ConsumerNodeID string    `json:"consumer_node_id"` // ID of the node consuming the WALs
+	IndexType      string    `json:"index_type"`       // Type of index this slot is for (e.g., "btree", "inverted_index")
+	RequiredLSN    LSN       `json:"required_lsn"`     // The oldest LSN this consumer still needs. WALs up to this LSN cannot be deleted.
+	SnapshotLSN    LSN       `json:"snapshot_lsn"`     // The LSN at which the consumer started (e.g., from a snapshot).
+	IsActive       bool      `json:"is_active"`        // Whether the slot is currently considered active for WAL retention.
+	LastHeartbeat  time.Time `json:"last_heartbeat"`   // Last time the consumer confirmed activity.
+	CreationTime   time.Time `json:"creation_time"`
+}
+
 type LogManager struct {
-	logDir                   string         // Directory where active log segments reside
-	archiveDir               string         // Directory for archived log segments
-	logFile                  *os.File       // Current active log segment file handle
-	currentSegmentID         uint64         // ID of the current active log segment
-	currentLSN               LSN            // The next LSN to be assigned (global, monotonically increasing)
-	currentSegmentFileOffset int64          // Current byte offset within the active log segment file
-	buffer                   *bytes.Buffer  // In-memory buffer for log records before flushing
-	mu                       sync.Mutex     // Protects access to LogManager state (currentLSN, buffer, logFile, segmentID)
-	flushCond                *sync.Cond     // For signaling when buffer needs flushing (e.g., buffer is full)
-	bufferSize               int            // Maximum size of the in-memory buffer
-	segmentSizeLimit         int64          // Maximum size of a single log segment file before rotation
-	stopChan                 chan struct{}  // Channel to signal stopping the flusher goroutine
-	wg                       sync.WaitGroup // WaitGroup for flusher goroutine
+	walDir             string
+	currentSegmentFile *os.File
+	currentSegmentID   uint64
+	currentLSN         LSN
+	maxSegmentSize     int64
+	archiveDir         string
+	logger             *zap.Logger
+	mu                 sync.RWMutex // Protects currentLSN, segment switching, and replicationSlots
 
-	// --- NEW: Recovery State (for Analysis Pass) ---
-	// This would typically be part of a dedicated RecoveryManager,
-	// but for V1, we'll keep it here for simplicity.
-	// Maps to track transaction states during recovery
-	recoveryTxnStates map[uint64]transaction.TransactionState // TxnID -> state (e.g., PREPARED, COMMITTED, ABORTED)
-	// --- END NEW ---
-	// --- NEW: For Log Streaming (Replication) ---
-	// Channel to signal new log records are available (for streaming readers)
-	newLogReady chan struct{}
-	// --- END NEW ---
+	// Replication Slots Management
+	replicationSlots map[string]*ReplicationSlot // Key: SlotName
 }
 
-// NewLogManager creates and initializes a new LogManager.
-// It sets up log and archive directories, finds the latest log segment,
-// and starts a background flusher goroutine.
-func NewLogManager(logDir string, archiveDir string, bufferSize int, segmentSizeLimit int64) (*LogManager, error) {
-	if bufferSize <= 0 {
-		return nil, fmt.Errorf("log buffer size must be positive")
-	}
-	if segmentSizeLimit <= 0 {
-		return nil, fmt.Errorf("log segment size limit must be positive")
-	}
-	if segmentSizeLimit < int64(bufferSize) {
-		return nil, fmt.Errorf("log segment size limit (%d) must be greater than or equal to buffer size (%d)", segmentSizeLimit, bufferSize)
+// NewLogManager creates or opens a LogManager for the given directory.
+func NewLogManager(walDir string) (*LogManager, error) {
+	if err := os.MkdirAll(walDir, 0750); err != nil {
+		return nil, fmt.Errorf("failed to create WAL directory %s: %w", walDir, err)
 	}
 
-	// Ensure log and archive directories exist
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create log directory %s: %w", logDir, err)
+	archivePath := filepath.Join(walDir, defaultArchiveDir)
+	if err := os.MkdirAll(archivePath, 0750); err != nil {
+		return nil, fmt.Errorf("failed to create WAL archive directory %s: %w", archivePath, err)
 	}
-	if err := os.MkdirAll(archiveDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create archive directory %s: %w", archiveDir, err)
-	}
+
+	// Initialize logger (ideally passed in, but creating a default one for now)
+	logger, _ := zap.NewDevelopment() // TODO: Pass logger as argument
 
 	lm := &LogManager{
-		logDir:           logDir,
-		archiveDir:       archiveDir,
-		currentSegmentID: 0,                                            // Will be determined by findOrCreateLatestLogSegment
-		currentLSN:       0,                                            // Will be determined by findOrCreateLatestLogSegment
-		buffer:           bytes.NewBuffer(make([]byte, 0, bufferSize)), // Pre-allocate buffer capacity
-		bufferSize:       bufferSize,
-		segmentSizeLimit: segmentSizeLimit,
-		stopChan:         make(chan struct{}),
-		// --- NEW: Initialize Recovery State ---
-		recoveryTxnStates: make(map[uint64]transaction.TransactionState),
-		// --- END NEW ---
-		// --- NEW: Initialize newLogReady channel ---
-		newLogReady: make(chan struct{}, 1), // Buffered channel to avoid blocking appends
-		// --- END NEW ---
-	}
-	lm.flushCond = sync.NewCond(&lm.mu)
-
-	// Find or create the latest log segment and set initial LSN
-	if err := lm.findOrCreateLatestLogSegment(); err != nil {
-		return nil, fmt.Errorf("failed to initialize log segment: %w", err)
+		walDir:           walDir,
+		maxSegmentSize:   defaultMaxWalSegmentSize,
+		archiveDir:       archivePath,
+		logger:           logger.Named("log_manager"),
+		replicationSlots: make(map[string]*ReplicationSlot),
 	}
 
-	// Start a background goroutine to periodically flush the buffer
-	lm.wg.Add(1)
-	go lm.flusher()
+	if err := lm.recover(); err != nil {
+		return nil, fmt.Errorf("failed to recover log manager: %w", err)
+	}
+	// TODO: Load replication slots from a persistent store (e.g., a metadata file in walDir or via FSM)
+	// For now, they are in-memory and lost on restart.
+	// lm.loadReplicationSlots()
 
-	log.Printf("INFO: LogManager initialized. Log directory: %s, Archive directory: %s, Current Segment ID: %d, Initial Global LSN: %d",
-		logDir, archiveDir, lm.currentSegmentID, lm.currentLSN)
 	return lm, nil
 }
 
-// GetCurrentLSN returns the current global LSN of the log manager.
-func (lm *LogManager) GetCurrentLSN() LSN {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	return lm.currentLSN
+func (l *LogManager) GetCurrentLSN() LSN {
+	return l.currentLSN
 }
 
-// findOrCreateLatestLogSegment scans the log directory to find the latest segment,
-// or creates the first one if none exist. It sets lm.logFile, lm.currentSegmentID, and lm.currentLSN.
-// This method MUST be called with lm.mu locked.
-func (lm *LogManager) findOrCreateLatestLogSegment() error {
-	var segmentFiles []struct {
-		path string
-		id   uint64
-		size int64
+// recover attempts to restore the LogManager state from existing WAL files.
+func (lm *LogManager) recover() error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	files, err := os.ReadDir(lm.walDir)
+	if err != nil {
+		return fmt.Errorf("failed to read WAL directory %s: %w", lm.walDir, err)
 	}
 
-	// 1. Collect all log segments (archived and active)
-	dirs := []string{lm.logDir, lm.archiveDir}
-	for _, dir := range dirs {
-		files, err := os.ReadDir(dir)
-		if err != nil {
-			return fmt.Errorf("failed to read directory %s: %w", dir, err)
+	var lastSegmentID uint64 = 0
+	var lastLSN LSN = 0
+	foundSegments := false
+
+	for _, file := range files {
+		if file.IsDir() || !strings.HasPrefix(file.Name(), walFilePrefix) || !strings.HasSuffix(file.Name(), walFileSuffix) {
+			continue
 		}
-		for _, file := range files {
-			if file.IsDir() {
-				continue
+		foundSegments = true
+		segmentIDStr := strings.TrimSuffix(strings.TrimPrefix(file.Name(), walFilePrefix), walFileSuffix)
+		segmentID, err := strconv.ParseUint(segmentIDStr, 10, 64)
+		if err != nil {
+			lm.logger.Warn("Skipping invalid WAL segment file name", zap.String("filename", file.Name()), zap.Error(err))
+			continue
+		}
+
+		if segmentID >= lastSegmentID { // Find the highest segment ID
+			segmentPath := filepath.Join(lm.walDir, file.Name())
+			tempLastLSN, err := lm.findLastLSNInSegment(segmentPath)
+			if err != nil {
+				lm.logger.Error("Failed to find last LSN in segment, segment might be corrupt or empty", zap.String("segmentPath", segmentPath), zap.Error(err))
+				// If the highest segment is problematic, this could be an issue.
+				// For now, we'll just take the segment ID and assume LSN starts from 0 if it's a new segment or this fails.
+				// A more robust recovery would try to repair or truncate.
 			}
-			if strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
-				parts := strings.Split(strings.TrimSuffix(file.Name(), ".log"), "_")
-				if len(parts) == 2 {
-					id, parseErr := strconv.ParseUint(parts[1], 10, 64)
-					if parseErr == nil {
-						info, _ := file.Info() // Get file info to read size
-						segmentFiles = append(segmentFiles, struct {
-							path string
-							id   uint64
-							size int64
-						}{filepath.Join(dir, file.Name()), id, info.Size()})
-					}
+
+			// If this segment is definitely later or findLastLSNInSegment succeeded for it
+			if segmentID > lastSegmentID || (segmentID == lastSegmentID && tempLastLSN > lastLSN) {
+				lastSegmentID = segmentID
+				if tempLastLSN > 0 { // Only update if a valid LSN was found
+					lastLSN = tempLastLSN
 				}
 			}
 		}
 	}
 
-	// Sort segments by their ID
-	sort.Slice(segmentFiles, func(i, j int) bool {
-		return segmentFiles[i].id < segmentFiles[j].id
-	})
-
-	var currentGlobalLSN LSN = 0
-	var latestActiveSegmentID uint64 = 0
-	var latestActiveSegmentSize int64 = 0
-
-	// 2. Calculate global LSN by summing sizes of all segments.
-	// Identify the latest segment that's still in the active log directory.
-	for _, seg := range segmentFiles {
-		// Sum up all segment sizes to determine the true current LSN
-		currentGlobalLSN += LSN(seg.size)
-		if filepath.Dir(seg.path) == lm.logDir {
-			latestActiveSegmentID = seg.id
-			latestActiveSegmentSize = seg.size
-		}
-	}
-
-	if latestActiveSegmentID == 0 {
-		// No existing log segments in logDir, start with segment 1
+	if !foundSegments {
+		// No WAL segments found, start fresh
 		lm.currentSegmentID = 1
-		lm.currentLSN = 0 // Global LSN starts at 0 for the very first log record
-		lm.currentSegmentFileOffset = 0
-	} else {
-		lm.currentSegmentID = latestActiveSegmentID
-		lm.currentLSN = currentGlobalLSN                      // Set current LSN to the end of all existing segments
-		lm.currentSegmentFileOffset = latestActiveSegmentSize // Set initial offset in current segment
+		lm.currentLSN = 0 // LSNs are 1-based, so first LSN will be 1
+		lm.logger.Info("No existing WAL segments found, starting with new segment.", zap.Uint64("segmentID", lm.currentSegmentID))
+		return lm.openNewSegment(lm.currentSegmentID)
 	}
 
-	latestLogFilePath := lm.getLogSegmentPath(lm.currentSegmentID)
-	logFile, err := os.OpenFile(latestLogFilePath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	// Found existing segments, open the last one
+	lm.currentSegmentID = lastSegmentID
+	lm.currentLSN = lastLSN // The next LSN will be lastLSN + 1
+	segmentPath := filepath.Join(lm.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, lm.currentSegmentID, walFileSuffix))
+
+	lm.logger.Info("Recovered from existing WAL segments",
+		zap.Uint64("lastSegmentID", lm.currentSegmentID),
+		zap.Uint64("lastLSN", uint64(lm.currentLSN)))
+
+	f, err := os.OpenFile(segmentPath, os.O_APPEND|os.O_RDWR, 0640)
 	if err != nil {
-		return fmt.Errorf("failed to open/create log segment %s: %w", latestLogFilePath, err)
+		// If append fails, it might be due to corruption or incomplete write.
+		// A more complex recovery might try to truncate the last entry or start a new segment.
+		// For now, try opening a new segment if the last one is problematic.
+		lm.logger.Error("Failed to open last WAL segment for append, attempting to start new segment", zap.String("path", segmentPath), zap.Error(err))
+		lm.currentSegmentID++
+		lm.currentLSN = 0 // Reset LSN if starting a new segment due to unrecoverable old one.
+		return lm.openNewSegment(lm.currentSegmentID)
 	}
-	lm.logFile = logFile
+	lm.currentSegmentFile = f
 
-	log.Printf("DEBUG: LogManager: Initialized currentSegmentID: %d, Initial Global LSN: %d, Initial Segment File Offset: %d",
-		lm.currentSegmentID, lm.currentLSN, lm.currentSegmentFileOffset)
-
-	return nil
-}
-
-// getLogSegmentPath returns the full path for a log segment file.
-func (lm *LogManager) getLogSegmentPath(segmentID uint64) string {
-	return filepath.Join(lm.logDir, fmt.Sprintf("log_%05d.log", segmentID))
-}
-
-// Append adds a LogRecord to the in-memory buffer and assigns it an LSN.
-// It returns the assigned LSN. The record is not guaranteed to be on disk immediately.
-func (lm *LogManager) Append(record *LogRecord) (LSN, error) {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-
-	// Assign LSN and update current LSN
-	record.LSN = lm.currentLSN
-
-	// Serialize the log record
-	serializedRecord, err := record.Serialize()
+	// Verify file size and potentially roll over if it's already too large (e.g. due to crash mid-write)
+	stat, err := lm.currentSegmentFile.Stat()
 	if err != nil {
-		return InvalidLSN, fmt.Errorf("failed to serialize log record: %w", err)
+		lm.logger.Error("Failed to stat current WAL segment after opening", zap.Error(err))
+		// Potentially close and try new segment
+		lm.currentSegmentFile.Close()
+		lm.currentSegmentID++
+		lm.currentLSN = 0
+		return lm.openNewSegment(lm.currentSegmentID)
 	}
-
-	recordSize := int64(len(serializedRecord))
-
-	// Check if record fits in buffer, if not, flush first
-	if lm.buffer.Len()+int(recordSize) > lm.bufferSize {
-		log.Printf("DEBUG: Log buffer full (%d bytes). Flushing before appending Global LSN %d.", lm.buffer.Len(), record.LSN)
-		if err := lm.flushInternal(); err != nil {
-			return InvalidLSN, fmt.Errorf("failed to flush log buffer before append: %w", err)
+	if stat.Size() >= lm.maxSegmentSize {
+		if err := lm.rollOverSegment(); err != nil {
+			return fmt.Errorf("failed to roll over segment during recovery: %w", err)
 		}
-	}
-
-	// Check if appending this record would exceed the segment size limit
-	// This check should happen *after* flushInternal to ensure the buffer is as empty as possible.
-	// lm.currentSegmentFileOffset reflects bytes written to the *file* plus bytes in the *buffer*.
-	if lm.currentSegmentFileOffset+recordSize > lm.segmentSizeLimit {
-		log.Printf("INFO: Log segment %d reaching limit (%d bytes). Rolling to new segment.", lm.currentSegmentID, lm.segmentSizeLimit)
-		if err := lm.rollLogSegment(); err != nil {
-			return InvalidLSN, fmt.Errorf("failed to roll log segment before append: %w", err)
-		}
-		// After rolling, currentSegmentFileOffset is reset to 0 for the new segment.
-	}
-
-	// Append to buffer
-	if _, err := lm.buffer.Write(serializedRecord); err != nil {
-		return InvalidLSN, fmt.Errorf("failed to write record to log buffer: %w", err)
-	}
-
-	// Update global LSN and current segment file offset after successful append to buffer
-	lm.currentLSN += LSN(recordSize)
-	lm.currentSegmentFileOffset += recordSize
-
-	// Signal the flusher goroutine if the buffer is now full or close to full
-	if lm.buffer.Len() >= lm.bufferSize/2 { // Signal at half full to trigger proactive flushing
-		lm.flushCond.Signal()
-	}
-	if err := lm.flushInternal(); err != nil {
-		return InvalidLSN, fmt.Errorf("failed to flush log buffer before append: %w", err)
-	}
-
-	// Signal log stream readers that new log is ready
-	select {
-	case lm.newLogReady <- struct{}{}:
-		// Signal sent
-	default:
-		// Channel is full, reader is not ready, skip signal
-	}
-
-	log.Printf("DEBUG: Appended log record Global LSN %d (Type: %v, PageID: %d, Size: %d) to segment %d, new segment offset %d",
-		record.LSN, record.Type, record.PageID, recordSize, lm.currentSegmentID, lm.currentSegmentFileOffset)
-	return record.LSN, nil
-}
-
-// Recover performs the recovery process (Redo Pass + basic Analysis/Undo) on database startup.
-// It scans log records from archived and active log segments and reapplies
-// committed changes to data pages, and resolves prepared transactions.
-// dm: The DiskManager to interact with data pages.
-// bpm: The BufferPoolManager to fetch/flush pages (not used for recovery reads/writes directly, but for context).
-// lastLSN: The last LSN recorded in the DBFileHeader, indicating the state of the data file.
-func (lm *LogManager) Recover(dm *flushmanager.DiskManager, lastLSN LSN) error {
-	log.Println("INFO: Starting LogManager recovery process (Redo Pass + basic Analysis/Undo)...")
-
-	// --- Analysis Pass (V1: Identify committed/aborted transactions) ---
-	// Clear previous recovery state
-	lm.recoveryTxnStates = make(map[uint64]transaction.TransactionState)
-
-	// Collect all log segments (archived and active) in order.
-	lm.mu.Lock()
-	segmentInfos, err := lm.getOrderedLogSegments()
-	lm.mu.Unlock()
-	if err != nil {
-		return fmt.Errorf("failed to get ordered log segments for recovery: %w", err)
-	}
-
-	// --- Redo Pass (V1: Reapply changes from log) ---
-	for _, segInfo := range segmentInfos {
-		log.Printf("INFO: Analyzing and Replaying from log segment: %s (ID: %d, Global LSN Range: %d-%d)", segInfo.path, segInfo.id, segInfo.startGlobalLSN, segInfo.endGlobalLSN)
-		segmentFile, err := os.Open(segInfo.path)
-		if err != nil {
-			return fmt.Errorf("failed to open log segment %s for recovery: %w", segInfo.path, err)
-		}
-		// No defer segmentFile.Close() here, close explicitly at end of loop iteration.
-		// For robustness, seek to where this segment starts if the file was opened for global LSN.
-		// Since we open each segment file individually, we read from its beginning.
-
-		reader := bufio.NewReader(segmentFile) // Use bufio.NewReader for efficient byte-by-byte reading
-		currentLocalOffset := LSN(0)           // Offset within the current segment file
-
-		for {
-			var lr LogRecord
-			// Read and deserialize a single log record
-			err := lm.readLogRecord(reader, &lr)
-			if err == io.EOF {
-				break // End of segment file
-			}
-			if err != nil {
-				log.Printf("ERROR: Failed to read log record from %s at offset %d: %v. Stopping recovery for this segment.", segInfo.path, currentLocalOffset, err)
-				// In a real system, this might indicate a corrupted log or truncated record.
-				// We might try to skip to the next segment or require manual intervention.
-				break
-			}
-
-			// Ensure the LSN in the record matches what we expect from segment order.
-			// This check is mainly for debugging if LSNs are inconsistent.
-			expectedGlobalLSN := segInfo.startGlobalLSN + currentLocalOffset
-			if lr.LSN != expectedGlobalLSN {
-				log.Printf("WARNING: LSN mismatch during recovery! Record LSN: %d, Expected Global LSN: %d. Proceeding but investigate.", lr.LSN, expectedGlobalLSN)
-			}
-
-			// --- Analysis Pass Logic ---
-			// Update transaction states based on log records
-			switch lr.Type {
-			case LogRecordTypePrepare:
-				lm.recoveryTxnStates[lr.TxnID] = transaction.TxnStatePrepared
-				log.Printf("DEBUG: Recovery Analysis: Txn %d is PREPARED (LSN %d)", lr.TxnID, lr.LSN)
-			case LogRecordTypeCommitTxn:
-				lm.recoveryTxnStates[lr.TxnID] = transaction.TxnStateCommitted
-				log.Printf("DEBUG: Recovery Analysis: Txn %d is COMMITTED (LSN %d)", lr.TxnID, lr.LSN)
-			case LogRecordTypeAbortTxn:
-				lm.recoveryTxnStates[lr.TxnID] = transaction.TxnStateAborted
-				log.Printf("DEBUG: Recovery Analysis: Txn %d is ABORTED (LSN %d)", lr.TxnID, lr.LSN)
-			}
-			// For data modification records, track dirty pages if needed for Redo/Undo
-			if lr.Type == LogRecordTypeUpdate || lr.Type == LogRecordTypeNewPage {
-				// We don't track dirty pages in LogManager itself for Redo,
-				// as Redo applies all committed changes regardless.
-				// Dirty page table is typically built by scanning data pages
-				// and comparing their LSNs to the log.
-			}
-
-			// --- Redo Pass Logic ---
-			// Reapply changes for committed transactions, or all if no transaction context.
-			// This is a simplified Redo-all approach for operations that are not part of a 2PC txn.
-			// For 2PC transactions, we only Redo if the transaction is known to be COMMITTED.
-			applyRecord := false
-			if lr.TxnID == 0 { // Non-transactional operation (auto-commit)
-				applyRecord = true
-			} else { // Transactional operation
-				if state, ok := lm.recoveryTxnStates[lr.TxnID]; ok && state == transaction.TxnStateCommitted {
-					applyRecord = true
-				} else {
-					log.Printf("DEBUG: Skipping Redo for Txn %d (LSN %d, Type %v): Not committed or state unknown.", lr.TxnID, lr.LSN, lr.Type)
-				}
-			}
-
-			if applyRecord && lr.LSN >= lastLSN { // Only apply if LSN is newer than last checkpoint
-				log.Printf("DEBUG: Replaying log record LSN %d (Type: %v, PageID: %d) to disk.", lr.LSN, lr.Type, lr.PageID)
-
-				pageData := make([]byte, dm.GetPageSize())
-
-				// Read page from disk (it might not exist if it's a new page log record)
-				readErr := dm.ReadPage(lr.PageID, pageData)
-				if readErr != nil && lr.Type != LogRecordTypeNewPage {
-					log.Fatalf("Critical: Failed to read page %d for recovery replay: %v. Skipping record LSN %d.", lr.PageID, readErr, lr.LSN)
-					// A real system might panic or require manual intervention here.
-					currentLocalOffset += LSN(lr.Size()) // Advance LSN even on error
-					continue
-				} else if readErr != nil && lr.Type == LogRecordTypeNewPage {
-					log.Printf("DEBUG: Page %d not found on disk, but it's a new page record. Will allocate if needed.", lr.PageID)
-				}
-
-				// Apply the change based on log record type
-				switch lr.Type {
-				case LogRecordTypeNewPage, LogTypeRTreeNewRoot:
-					// Ensure the page exists on disk. If it was truncated, re-allocate.
-					if lr.PageID.GetID() >= dm.GetNumPages() {
-						log.Printf("INFO: Re-allocating page %d during recovery (was truncated or never allocated).", lr.PageID)
-						emptyPage := make([]byte, dm.GetPageSize())
-						if writeErr := dm.WritePage(lr.PageID, emptyPage); writeErr != nil {
-							return fmt.Errorf("failed to re-allocate new page %d during recovery: %w", lr.PageID, writeErr)
-						}
-						// // CRITICAL FIX: Invalidate the page in BufferPoolManager after writing it to disk
-						// bpm.InvalidatePage(lr.PageID)
-						// if lr.PageID >= PageID(dm.numPages) {
-						// 	dm.numPages = uint64(lr.PageID) + 1
-						// }
-					}
-					if len(lr.NewData) > 0 { // Apply initial data if logged
-						if writeErr := dm.WritePage(lr.PageID, lr.NewData); writeErr != nil {
-							return fmt.Errorf("failed to write new page data for %d during recovery: %w", lr.PageID, writeErr)
-						}
-						// CRITICAL FIX: Invalidate the page in BufferPoolManager after writing it to disk
-						// bpm.InvalidatePage(lr.PageID)
-					}
-
-				case LogRecordTypeUpdate, LogTypeRTreeUpdate, LogTypeRTreeInsert:
-					copy(pageData, lr.NewData) // Overwrite page data with new data
-					if writeErr := dm.WritePage(lr.PageID, pageData); writeErr != nil {
-						return fmt.Errorf("failed to write updated page %d during recovery: %w", lr.PageID, writeErr)
-					}
-					// TODO: Add cases for other LogRecordTypes (InsertKey, DeleteKey, NodeSplit, NodeMerge)
-					// These would require understanding the byte format within the page.
-					// For now, LogRecordTypeUpdate is a generic page overwrite.
-
-				case LogRecordTypeRootChange, LogTypeRTreeSplit: // NEW: Handle root page ID changes during recovery
-					newRootPageID := pagemanager.PageID(binary.LittleEndian.Uint64(lr.NewData))
-					log.Printf("INFO: Recovery: Applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
-					if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
-						h.RootPageID = newRootPageID
-					}); err != nil {
-						return fmt.Errorf("failed to update root page ID in header during recovery: %w", err)
-					}
-					// Also update the in-memory rootPageID of the BTree if it's directly accessible here.
-					// The BTree instance is passed to Recover, so we can set its rootPageID.
-					// This requires a setter on BTree or direct access.
-					// Assuming `dm` has a reference to the BTree or can update its root.
-					// For now, we'll rely on the BTree re-reading the header after recovery.
-				}
-			}
-			currentLocalOffset += LSN(lr.Size()) // Advance local offset
-		}
-		segmentFile.Close() // Explicitly close after processing
-	}
-
-	// --- Undo Pass (V1: Rollback uncommitted transactions) ---
-	log.Println("INFO: Starting LogManager recovery Undo Pass (V1: aborting prepared/unknown transactions)...")
-	for txnID, state := range lm.recoveryTxnStates {
-		if state == transaction.TxnStatePrepared { // Or any other state that is not Committed/Aborted
-			log.Printf("WARNING: Txn %d was PREPARED but not COMMITTED/ABORTED. Forcing ABORT.", txnID)
-			// In a real system, you would scan the log backwards from the end
-			// to find all operations for this transaction and undo them using OldData.
-			// For V1, we just acknowledge the abort and rely on future writes to fix state.
-			// A simple approach is to write an ABORT_TXN log record and then rely on
-			// application-level consistency checks or manual intervention.
-			// This is a placeholder for actual undo logic.
-		}
-	}
-
-	// 3. After replaying all necessary logs, update the DBFileHeader's LastLSN.
-	// This marks the point up to which recovery has completed.
-	// We use the current LSN of the LogManager as the new LastLSN.
-	lm.mu.Lock() // Acquire lock as we're reading lm.currentLSN
-	finalLSN := lm.currentLSN
-	lm.mu.Unlock()
-
-	if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
-		h.LastLSN = pagemanager.LSN(finalLSN)
-	}); err != nil {
-		return fmt.Errorf("failed to update DBFileHeader LastLSN after recovery: %w", err)
-	}
-
-	log.Println("INFO: LogManager recovery process complete.")
-	return nil
-}
-
-// readLogRecord reads a single log record from the provided io.Reader.
-// It handles variable-length fields by reading lengths first.
-func (lm *LogManager) ReadLogRecord(reader *bufio.Reader, lr *LogRecord) error {
-	return lm.readLogRecord(reader, lr)
-}
-
-// readLogRecord reads a single log record from the provided io.Reader.
-// It handles variable-length fields by reading lengths first.
-func (lm *LogManager) readLogRecord(reader *bufio.Reader, lr *LogRecord) error {
-	// Read fixed-size fields into a buffer first
-	fixedHeaderBuf := make([]byte, 8+8+8+1+8+2) // LSN, PrevLSN, TxnID, Type, PageID, Offset
-	n, err := io.ReadFull(reader, fixedHeaderBuf)
-	if err == io.EOF {
-		return io.EOF // Propagate EOF
-	}
-	if err != nil {
-		return fmt.Errorf("failed to read fixed log record header: %w", err)
-	}
-	if n != len(fixedHeaderBuf) {
-		return fmt.Errorf("short read for fixed log record header: expected %d, got %d", len(fixedHeaderBuf), n)
-	}
-
-	// Deserialize fixed fields
-	tempReader := bytes.NewReader(fixedHeaderBuf)
-	if err := binary.Read(tempReader, binary.LittleEndian, &lr.LSN); err != nil {
-		return fmt.Errorf("failed to deserialize LSN: %w", err)
-	}
-	if err := binary.Read(tempReader, binary.LittleEndian, &lr.PrevLSN); err != nil {
-		return fmt.Errorf("failed to deserialize PrevLSN: %w", err)
-	}
-	if err := binary.Read(tempReader, binary.LittleEndian, &lr.TxnID); err != nil {
-		return fmt.Errorf("failed to deserialize TxnID: %w", err)
-	}
-	if err := binary.Read(tempReader, binary.LittleEndian, &lr.Type); err != nil {
-		return fmt.Errorf("failed to deserialize Type: %w", err)
-	}
-	if err := binary.Read(tempReader, binary.LittleEndian, &lr.PageID); err != nil {
-		return fmt.Errorf("failed to deserialize PageID: %w", err)
-	}
-	if err := binary.Read(tempReader, binary.LittleEndian, &lr.Offset); err != nil {
-		return fmt.Errorf("failed to deserialize Offset: %w", err)
-	}
-
-	// Read variable-length OldData
-	var oldDataLen uint16
-	if err := binary.Read(reader, binary.LittleEndian, &oldDataLen); err != nil {
-		if err == io.EOF {
-			return io.ErrUnexpectedEOF
-		} // Truncated record
-		return fmt.Errorf("failed to deserialize OldData length: %w", err)
-	}
-	lr.OldData = make([]byte, oldDataLen)
-	if _, err := io.ReadFull(reader, lr.OldData); err != nil {
-		if err == io.EOF {
-			return io.ErrUnexpectedEOF
-		} // Truncated record
-		return fmt.Errorf("failed to read OldData: %w", err)
-	}
-
-	// Read variable-length NewData
-	var newDataLen uint16
-	if err := binary.Read(reader, binary.LittleEndian, &newDataLen); err != nil {
-		if err == io.EOF {
-			return io.ErrUnexpectedEOF
-		} // Truncated record
-		return fmt.Errorf("failed to deserialize NewData length: %w", err)
-	}
-	lr.NewData = make([]byte, newDataLen)
-	if _, err := io.ReadFull(reader, lr.NewData); err != nil {
-		if err == io.EOF {
-			return io.ErrUnexpectedEOF
-		} // Truncated record
-		return fmt.Errorf("failed to read NewData: %w", err)
 	}
 
 	return nil
 }
 
-// Flush ensures all log records up to a certain LSN (or all if targetLSN is InvalidLSN) are written to disk.
-// This is a blocking call that ensures durability.
-func (lm *LogManager) Flush(targetLSN LSN) error {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-
-	// Flush any buffered data immediately.
-	if err := lm.flushInternal(); err != nil {
-		return fmt.Errorf("failed to flush log buffer: %w", err)
-	}
-
-	// Ensure data is synced to disk.
-	if lm.logFile != nil {
-		if err := lm.logFile.Sync(); err != nil {
-			return fmt.Errorf("failed to sync log file: %w", err)
-		}
-	}
-
-	log.Printf("DEBUG: LogManager flushed and synced all buffered data up to Global LSN %d (in segment %d).", lm.currentLSN, lm.currentSegmentID)
-	return nil
-}
-
-// getOrderedLogSegments returns a sorted list of all log segments (active and archived)
-// along with their global LSN ranges.
-// This function should be called with lm.mu locked, or consider its own locking.
-func (lm *LogManager) getOrderedLogSegments() ([]struct {
-	path           string
-	id             uint64
-	size           int64
-	startGlobalLSN LSN
-	endGlobalLSN   LSN
-}, error) {
-	var segmentFiles []struct {
-		path string
-		id   uint64
-		size int64
-	}
-
-	dirs := []string{lm.logDir, lm.archiveDir}
-	for _, dir := range dirs {
-		files, err := os.ReadDir(dir)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
-		}
-		for _, file := range files {
-			if !file.IsDir() && strings.HasPrefix(file.Name(), "log_") && strings.HasSuffix(file.Name(), ".log") {
-				parts := strings.Split(strings.TrimSuffix(file.Name(), ".log"), "_")
-				if len(parts) == 2 {
-					id, parseErr := strconv.ParseUint(parts[1], 10, 64)
-					if parseErr == nil {
-						info, _ := file.Info()
-						segmentFiles = append(segmentFiles, struct {
-							path string
-							id   uint64
-							size int64
-						}{filepath.Join(dir, file.Name()), id, info.Size()})
-					}
-				}
-			}
-		}
-	}
-
-	sort.Slice(segmentFiles, func(i, j int) bool {
-		return segmentFiles[i].id < segmentFiles[j].id
-	})
-
-	var orderedSegments []struct {
-		path           string
-		id             uint64
-		size           int64
-		startGlobalLSN LSN
-		endGlobalLSN   LSN
-	}
-	currentGlobalLSN := LSN(0)
-	for _, seg := range segmentFiles {
-		orderedSegments = append(orderedSegments, struct {
-			path           string
-			id             uint64
-			size           int64
-			startGlobalLSN LSN
-			endGlobalLSN   LSN
-		}{
-			path:           seg.path,
-			id:             seg.id,
-			size:           seg.size,
-			startGlobalLSN: currentGlobalLSN,
-			endGlobalLSN:   currentGlobalLSN + LSN(seg.size),
-		})
-		currentGlobalLSN += LSN(seg.size)
-	}
-	return orderedSegments, nil
-}
-
-// StartLogStream provides a channel to stream log records from a given LSN.
-// This is used by replication followers to catch up and stay in sync.
-func (lm *LogManager) StartLogStream(fromLSN LSN) (<-chan LogRecord, error) {
-	logStream := make(chan LogRecord)
-
-	go func() {
-		defer close(logStream)
-
-		currentReaderGlobalLSN := fromLSN
-		var currentSegmentFile *os.File
-		var currentSegmentReader *bufio.Reader
-		var currentSegmentInfo struct { // Tracks the segment currently being read
-			path           string
-			id             uint64
-			size           int64
-			startGlobalLSN LSN
-			endGlobalLSN   LSN
-		}
-		segmentIndex := -1 // Index into the orderedSegments slice
-
-		// Helper to open/re-open and seek the correct log segment
-		openAndSeekCorrectSegment := func() error {
-			if currentSegmentFile != nil {
-				currentSegmentFile.Close()
-				currentSegmentFile = nil
-			}
-
-			lm.mu.Lock()
-			orderedSegments, err := lm.getOrderedLogSegments() // This re-scans. For production, consider caching.
-			lm.mu.Unlock()
-			if err != nil {
-				log.Printf("ERROR: Failed to get ordered log segments for streaming: %v", err)
-				return err
-			}
-
-			// Find the segment that contains currentReaderGlobalLSN
-			found := false
-			for i, seg := range orderedSegments {
-				if currentReaderGlobalLSN >= seg.startGlobalLSN && currentReaderGlobalLSN < seg.endGlobalLSN {
-					currentSegmentInfo = seg
-					segmentIndex = i
-					found = true
-					break
-				}
-				// Handle case where fromLSN is exactly at the end of a segment.
-				// This means we should start at the beginning of the *next* segment.
-				if currentReaderGlobalLSN == seg.endGlobalLSN && i+1 < len(orderedSegments) {
-					currentSegmentInfo = orderedSegments[i+1]
-					segmentIndex = i + 1
-					currentReaderGlobalLSN = currentSegmentInfo.startGlobalLSN // Adjust LSN to start of next segment
-					found = true
-					break
-				}
-			}
-
-			if !found {
-				// This can happen if fromLSN is past the end of all existing logs.
-				// In this case, we start waiting for new logs.
-				log.Printf("INFO: FromLSN %d is beyond current known log segments. Will wait for new logs.", fromLSN)
-				currentSegmentInfo.id = 0 // Mark as 'no active segment'
-				return nil
-			}
-
-			file, err := os.Open(currentSegmentInfo.path)
-			if err != nil {
-				log.Printf("ERROR: Failed to open log segment %s for streaming: %v", currentSegmentInfo.path, err)
-				return err
-			}
-			currentSegmentFile = file
-
-			offsetInSegment := int64(currentReaderGlobalLSN - currentSegmentInfo.startGlobalLSN)
-			_, err = currentSegmentFile.Seek(offsetInSegment, io.SeekStart)
-			if err != nil {
-				log.Printf("ERROR: Failed to seek log file %s to offset %d (Global LSN %d): %v", currentSegmentInfo.path, offsetInSegment, currentReaderGlobalLSN, err)
-				currentSegmentFile.Close()
-				currentSegmentFile = nil
-				return err
-			}
-			currentSegmentReader = bufio.NewReader(currentSegmentFile)
-			log.Printf("DEBUG: Log stream opened segment %d (%s) and sought to offset %d (Global LSN %d).",
-				currentSegmentInfo.id, filepath.Base(currentSegmentInfo.path), offsetInSegment, currentReaderGlobalLSN)
-			return nil
-		}
-
-		// Initial open and seek
-		if err := openAndSeekCorrectSegment(); err != nil {
-			return // Exit goroutine on initial failure
-		}
-
-		for {
-			select {
-			case <-lm.stopChan:
-				log.Println("INFO: Log stream goroutine stopping due to stop signal.")
-				return
-			default:
-				// If no active segment, or already past the end of the last known segment, just wait.
-				if currentSegmentInfo.id == 0 {
-					log.Printf("DEBUG: Log stream waiting for new logs (no active segment or past known logs).")
-					select {
-					case <-lm.newLogReady:
-						// Try to open and seek again, as new logs might have appeared or segments rolled.
-						if err := openAndSeekCorrectSegment(); err != nil {
-							return
-						}
-						continue // Try reading again
-					case <-lm.stopChan:
-						log.Println("INFO: Log stream goroutine stopping due to stop signal while waiting for new logs.")
-						return
-					}
-				}
-
-				var lr LogRecord
-				readErr := lm.readLogRecord(currentSegmentReader, &lr)
-
-				if readErr == io.EOF {
-					log.Printf("DEBUG: Reached EOF for segment %d (Global LSN %d).", currentSegmentInfo.id, currentReaderGlobalLSN)
-
-					lm.mu.Lock()
-					orderedSegments, err := lm.getOrderedLogSegments()
-					lm.mu.Unlock()
-					if err != nil {
-						log.Printf("ERROR: Failed to get ordered log segments during EOF handling: %v", err)
-						return
-					}
-
-					// Check if there's a next segment to transition to
-					if segmentIndex+1 < len(orderedSegments) {
-						// Move to the next segment
-						currentSegmentInfo = orderedSegments[segmentIndex+1]
-						segmentIndex++
-						currentReaderGlobalLSN = currentSegmentInfo.startGlobalLSN // Reset LSN to start of new segment
-						log.Printf("INFO: Transitioning to next log segment %d (Global LSN from %d).", currentSegmentInfo.id, currentReaderGlobalLSN)
-						if err := openAndSeekCorrectSegment(); err != nil {
-							return
-						}
-						continue // Try reading from the new segment
-					} else {
-						// This was the last segment. Now wait for new appends to *this* segment or for a segment roll.
-						// Check if any new data has been written since last read in this segment.
-						lm.mu.Lock()
-						fileInfo, statErr := currentSegmentFile.Stat() // Stat the current segment file
-						lm.mu.Unlock()
-
-						if statErr == nil && LSN(fileInfo.Size()) > (currentReaderGlobalLSN-currentSegmentInfo.startGlobalLSN) {
-							// New data physically written to the *current* segment. Re-open/re-seek.
-							log.Printf("DEBUG: New data detected in current segment %d. Re-opening and re-seeking.", currentSegmentInfo.id)
-							if err := openAndSeekCorrectSegment(); err != nil {
-								return
-							}
-							continue // Try reading again immediately
-						} else if LSN(fileInfo.Size()) < (currentReaderGlobalLSN - currentSegmentInfo.startGlobalLSN) {
-							// This indicates a potential truncation or rollback, or the LSN is somehow invalid.
-							log.Printf("WARNING: Current reader LSN %d is past actual file size %d in segment %d. Re-seeking to end of file.",
-								currentReaderGlobalLSN, fileInfo.Size(), currentSegmentInfo.id)
-							// Reset currentReaderGlobalLSN to end of file and try to read from there.
-							currentReaderGlobalLSN = currentSegmentInfo.startGlobalLSN + LSN(fileInfo.Size())
-							if err := openAndSeekCorrectSegment(); err != nil {
-								return
-							}
-							continue
-						}
-
-						// No new data in current file, wait for signal.
-						log.Printf("DEBUG: Log stream reached end of last segment %d. Waiting for new appends.", currentSegmentInfo.id)
-						select {
-						case <-lm.newLogReady:
-							// New log records are ready, attempt to re-open and re-seek.
-							// It's possible a segment roll happened, so re-evaluate segments.
-							if err := openAndSeekCorrectSegment(); err != nil {
-								return
-							}
-							continue // Try reading again
-						case <-lm.stopChan:
-							log.Println("INFO: Log stream goroutine stopping due to stop signal while waiting for new logs at end of stream.")
-							return
-						}
-					}
-				}
-
-				if readErr != nil {
-					log.Printf("ERROR: Failed to read log record during streaming: %v", readErr)
-					return // Exit goroutine on unrecoverable error
-				}
-
-				// Successfully read a record, send it to the channel and update currentReaderGlobalLSN
-				select {
-				case logStream <- lr:
-					currentReaderGlobalLSN = lr.LSN + LSN(lr.Size())
-				case <-lm.stopChan:
-					log.Println("INFO: Log stream goroutine stopping because logStream send was blocked or stop signal received.")
-					return
-				}
-			}
-		}
-	}()
-
-	return logStream, nil
-}
-
-// flushInternal writes the buffered log records to the log file.
-// This method MUST be called with lm.mu locked. It does NOT call Sync().
-func (lm *LogManager) flushInternal() error {
-	if lm.buffer.Len() == 0 {
-		return nil // Nothing to flush
-	}
-	if lm.logFile == nil {
-		return fmt.Errorf("log file is not open, cannot flush")
-	}
-
-	n, err := lm.logFile.Write(lm.buffer.Bytes())
+// findLastLSNInSegment reads a WAL segment file and returns the LSN of the last valid record.
+func (lm *LogManager) findLastLSNInSegment(segmentPath string) (LSN, error) {
+	file, err := os.Open(segmentPath)
 	if err != nil {
-		return fmt.Errorf("failed to write log buffer to file: %w", err)
+		return 0, fmt.Errorf("failed to open segment %s: %w", segmentPath, err)
 	}
-	if n != lm.buffer.Len() {
-		return fmt.Errorf("short write to log file: expected %d, wrote %d", lm.buffer.Len(), n)
-	}
+	defer file.Close()
 
-	// Clear the buffer after successful write
-	lm.buffer.Reset()
-
-	log.Printf("DEBUG: Log buffer written to OS buffer. %d bytes.", n)
-	lm.flushCond.Broadcast() // Signal any waiting goroutines that buffer has been flushed/reset
-	return nil
-}
-
-// rollLogSegment closes the current log file, archives it, and opens a new log file.
-// This method MUST be called with lm.mu locked.
-func (lm *LogManager) rollLogSegment() error {
-	log.Printf("INFO: Rolling log segment %d...", lm.currentSegmentID)
-
-	// 1. Flush any remaining buffer to the current log file
-	if err := lm.flushInternal(); err != nil {
-		return fmt.Errorf("failed to flush buffer before rolling segment: %w", err)
-	}
-
-	// 2. Sync the current log file to ensure all data is on disk
-	if lm.logFile != nil {
-		if err := lm.logFile.Sync(); err != nil {
-			return fmt.Errorf("failed to sync log file before rolling segment: %w", err)
-		}
-		// 3. Close the current log file
-		if err := lm.logFile.Close(); err != nil {
-			return fmt.Errorf("failed to close log file %s: %w", lm.getLogSegmentPath(lm.currentSegmentID), err)
-		}
-		lm.logFile = nil // Clear file handle
-	}
-
-	// 4. Archive the just-closed log segment
-	oldSegmentPath := lm.getLogSegmentPath(lm.currentSegmentID)
-	archivePath := filepath.Join(lm.archiveDir, filepath.Base(oldSegmentPath))
-
-	if err := os.Rename(oldSegmentPath, archivePath); err != nil {
-		return fmt.Errorf("failed to archive log segment %s to %s: %w", oldSegmentPath, archivePath, err)
-	}
-	log.Printf("INFO: Archived log segment %d from %s to %s", lm.currentSegmentID, oldSegmentPath, archivePath)
-
-	// 5. Increment segment ID and open a new log file
-	lm.currentSegmentID++
-	newSegmentPath := lm.getLogSegmentPath(lm.currentSegmentID)
-	newLogFile, err := os.OpenFile(newSegmentPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		return fmt.Errorf("failed to open new log segment %s: %w", newSegmentPath, err)
-	}
-	lm.logFile = newLogFile
-	lm.currentSegmentFileOffset = 0 // Reset offset for the new segment
-
-	log.Printf("INFO: Rolled to new log segment %d: %s", lm.currentSegmentID, newSegmentPath)
-	return nil
-}
-
-// flusher is a goroutine that periodically flushes the log buffer.
-func (lm *LogManager) flusher() {
-	defer lm.wg.Done()
-	// Create a ticker for periodic flushing (e.g., every 100ms)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	reader := bufio.NewReader(file)
+	var lastReadLSN LSN = 0
+	var record LogRecord
+	var recordSize uint32
 
 	for {
-		select {
-		case <-lm.stopChan:
-			log.Println("INFO: Log flusher goroutine stopping.")
-			lm.mu.Lock()
-			// Final flush and sync before exiting
-			if err := lm.flushInternal(); err != nil {
-				log.Printf("ERROR: Final flushInternal failed on flusher stop: %v", err)
-			}
-			if lm.logFile != nil { // Ensure logFile is not nil before syncing
-				if err := lm.logFile.Sync(); err != nil {
-					log.Printf("ERROR: Final logFile.Sync failed on flusher stop: %v", err)
-				}
-			}
-			lm.mu.Unlock()
-			return
-		case <-ticker.C:
-			// Time to perform a periodic flush
-			lm.mu.Lock()
-			if lm.buffer.Len() > 0 { // Only flush if there's data
-				if err := lm.flushInternal(); err != nil {
-					log.Printf("ERROR: Periodic flushInternal failed: %v", err)
-				}
-				if lm.logFile != nil { // Ensure logFile is not nil before syncing
-					if err := lm.logFile.Sync(); err != nil {
-						log.Printf("ERROR: Periodic logFile.Sync failed: %v", err)
-					}
-				}
-			}
-			lm.mu.Unlock()
+		// Read record size
+		err = binary.Read(reader, binary.LittleEndian, &recordSize)
+		if err == io.EOF {
+			break // End of file, successfully read all records
 		}
+		if err != nil {
+			return lastReadLSN, fmt.Errorf("error reading record size in %s at LSN approx %d: %w", segmentPath, lastReadLSN, err)
+		}
+		if recordSize == 0 { // Should not happen with valid records
+			return lastReadLSN, fmt.Errorf("encountered zero record size in %s", segmentPath)
+		}
+
+		recordData := make([]byte, recordSize)
+		_, err = io.ReadFull(reader, recordData)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// Truncated record, the last valid LSN is the one before this attempt
+			lm.logger.Warn("Found truncated record at end of segment", zap.String("segmentPath", segmentPath), zap.Uint64("approx_lsn", uint64(lastReadLSN)))
+			return lastReadLSN, nil // Return the LSN of the last successfully read record
+		}
+		if err != nil {
+			return lastReadLSN, fmt.Errorf("error reading record data in %s at LSN approx %d: %w", segmentPath, lastReadLSN, err)
+		}
+
+		// Deserialize record (simplified, assuming gob or similar)
+		// For recovery, we only strictly need the LSN if the record is valid.
+		// A full deserialization and CRC check is better.
+		// For now, let's assume we can extract LSN without full gob. Let's refine record structure for this.
+		// For this example, assume LSN is at the beginning of recordData.
+		if len(recordData) < 8 { // Size of LSN (uint64)
+			lm.logger.Warn("Record data too short to contain LSN", zap.String("segmentPath", segmentPath), zap.Uint32("recordSize", recordSize))
+			return lastReadLSN, fmt.Errorf("record data too short")
+		}
+		currentLSN := LSN(binary.LittleEndian.Uint64(recordData[:8]))
+		// TODO: Validate CRC of the recordData here
+		// crcFound := binary.LittleEndian.Uint32(recordData[len(recordData)-4:])
+		// calculatedCRC := crc32.ChecksumIEEE(recordData[:len(recordData)-4])
+		// if crcFound != calculatedCRC {
+		//    lm.logger.Warn("CRC mismatch for record", zap.Uint64("lsn", uint64(currentLSN)))
+		//    return lastReadLSN, fmt.Errorf("CRC mismatch at LSN %d", currentLSN)
+		// }
+		if currentLSN == 0 { // LSNs should be > 0
+			return lastReadLSN, fmt.Errorf("found LSN 0 in segment %s", segmentPath)
+		}
+
+		record.LSN = currentLSN // For this simplified example
+		lastReadLSN = record.LSN
 	}
+	return lastReadLSN, nil
 }
 
-// Close stops the LogManager, flushes any remaining records, and closes the log file.
-func (lm *LogManager) Close() error {
-	log.Println("INFO: Closing LogManager...")
-	close(lm.stopChan) // Signal the flusher goroutine to stop
-	lm.wg.Wait()       // Wait for the flusher to finish its final flush and exit
+func (lm *LogManager) openNewSegment(segmentID uint64) error {
+	segmentPath := filepath.Join(lm.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segmentID, walFileSuffix))
+	f, err := os.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0640) // Use 0640 permissions
+	if err != nil {
+		return fmt.Errorf("failed to create new WAL segment %s: %w", segmentPath, err)
+	}
+	lm.currentSegmentFile = f
+	lm.currentSegmentID = segmentID
+	// Note: currentLSN is NOT reset here. It's carried over from the previous segment's last LSN.
+	// If this is the very first segment (during initial recovery with no files), currentLSN is 0.
+	lm.logger.Info("Opened new WAL segment", zap.String("path", segmentPath), zap.Uint64("segmentID", lm.currentSegmentID))
+	return nil
+}
 
+// AppendRecord appends a log record to the WAL.
+func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	// Perform a final log segment roll to ensure all data is archived.
-	// This also handles the final flush and sync of the current segment.
-	// Only roll if there's data in the buffer or the current segment file is not empty.
-	if lm.buffer.Len() > 0 || (lm.logFile != nil && lm.currentSegmentFileOffset > 0) {
-		if err := lm.rollLogSegment(); err != nil {
-			log.Printf("ERROR: Failed to perform final log segment roll on close: %v", err)
-			// Don't return here, try to close the file handle anyway.
-		}
-	} else if lm.logFile != nil {
-		// If no data was written to the current segment, just close it if it's open.
-		// Avoid archiving an empty segment unless explicitly desired.
-		if err := lm.logFile.Close(); err != nil {
-			log.Printf("ERROR: Failed to close potentially empty log file on close: %v", err)
-		}
-		lm.logFile = nil
+	lm.currentLSN++
+	lsn := lm.currentLSN
+
+	// TODO: Populate PrevLSN if needed by recovery logic for transactions or pages
+	record := LogRecord{
+		LSN:       lsn,
+		Type:      lr.Type,
+		Timestamp: time.Now().UnixNano(),
+		TxnID:     lr.TxnID,
+		PageID:    lr.PageID,
+		Data:      lr.Data,
+		LogType:   logType, // Store the general log type
+		SegmentID: lm.currentSegmentID,
 	}
 
-	// The logFile should be nil after rollLogSegment or direct close.
-	// If it's not nil (e.g., if rollLogSegment failed to close it), try to close it.
-	if lm.logFile != nil {
-		log.Printf("WARNING: Log file %s was not closed by rollLogSegment on close. Attempting to close now.", lm.getLogSegmentPath(lm.currentSegmentID))
-		if err := lm.logFile.Close(); err != nil {
-			return fmt.Errorf("failed to close log file during final cleanup: %w", err)
-		}
-		lm.logFile = nil
+	// Serialize record (e.g., using gob or custom binary format)
+	// For simplicity, let's assume a binary format:
+	// LSN (8B) | Type (1B) | Timestamp (8B) | TxnID (8B) | PageID (4B) | DataLen (4B) | Data (variable) | CRC (4B)
+
+	// Calculate size first
+	// Size = 8(LSN) + 1(Type) + 8(Timestamp) + 8(TxnID) + 4(PageID) + 4(DataLen) + len(Data) + 4(CRC)
+	headerSize := 8 + 1 + 8 + 8 + 4 + 4
+	serializedRecordSize := uint32(headerSize + len(record.Data) + 4)
+	record.RecordSize = serializedRecordSize
+
+	buffer := make([]byte, serializedRecordSize)
+	offset := 0
+	binary.LittleEndian.PutUint64(buffer[offset:], uint64(record.LSN))
+	offset += 8
+	buffer[offset] = byte(record.Type)
+	offset += 1
+	binary.LittleEndian.PutUint64(buffer[offset:], uint64(record.Timestamp))
+	offset += 8
+	binary.LittleEndian.PutUint64(buffer[offset:], record.TxnID)
+	offset += 8
+	binary.LittleEndian.PutUint64(buffer[offset:], uint64(record.PageID))
+	offset += 4
+	binary.LittleEndian.PutUint32(buffer[offset:], uint32(len(record.Data)))
+	offset += 4
+	copy(buffer[offset:], record.Data)
+	offset += len(record.Data)
+
+	// TODO: Calculate CRC on buffer[:offset] and put it at buffer[offset:]
+	// For now, placeholder CRC
+	binary.LittleEndian.PutUint32(buffer[offset:], 0xDEADBEEF) // Placeholder CRC
+
+	// Check if segment needs to be rolled over BEFORE writing the record + its size
+	// The size of the on-disk entry is 4 (for recordSize) + serializedRecordSize itself
+	onDiskEntrySize := int64(4 + serializedRecordSize)
+	currentFileSize, err := lm.currentSegmentFile.Seek(0, io.SeekEnd) // Get current file size by seeking to end
+	if err != nil {
+		return 0, fmt.Errorf("failed to seek current WAL segment: %w", err)
 	}
 
-	log.Println("INFO: LogManager closed successfully.")
+	if currentFileSize+onDiskEntrySize > lm.maxSegmentSize {
+		if err := lm.rollOverSegment(); err != nil {
+			return 0, fmt.Errorf("failed to roll over WAL segment: %w", err)
+		}
+		// After roll-over, currentFileSize is effectively 0 for the new segment.
+	}
+
+	// Write record size, then the record itself
+	if err := binary.Write(lm.currentSegmentFile, binary.LittleEndian, serializedRecordSize); err != nil {
+		return 0, fmt.Errorf("failed to write record size to WAL: %w", err)
+	}
+	if _, err := lm.currentSegmentFile.Write(buffer); err != nil {
+		// This is a critical error. The WAL is now in an inconsistent state if part of the record was written.
+		// A robust system might try to truncate the partial write or mark the segment as corrupt.
+		lm.logger.Fatal("FATAL: Failed to write record data to WAL. WAL may be corrupt.", zap.Error(err))
+		return 0, fmt.Errorf("failed to write record data to WAL: %w", err)
+	}
+
+	// Optionally sync to disk
+	// lm.Sync()
+
+	return lsn, nil
+}
+
+func (lm *LogManager) rollOverSegment() error {
+	if lm.currentSegmentFile != nil {
+		if err := lm.currentSegmentFile.Sync(); err != nil {
+			lm.logger.Error("Failed to sync current WAL segment before roll over", zap.Error(err))
+			// Continue with rollover, but log the error
+		}
+		if err := lm.currentSegmentFile.Close(); err != nil {
+			lm.logger.Error("Failed to close current WAL segment before roll over", zap.Error(err))
+			// Continue, but this is problematic
+		}
+		lm.logger.Info("Closed WAL segment for rollover", zap.Uint64("segmentID", lm.currentSegmentID))
+	}
+	lm.currentSegmentID++
+	return lm.openNewSegment(lm.currentSegmentID)
+}
+
+// Sync forces all buffered data to be written to disk.
+func (lm *LogManager) Sync() error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if lm.currentSegmentFile != nil {
+		return lm.currentSegmentFile.Sync()
+	}
 	return nil
 }
 
-// --- LogRecord Serialization/Deserialization ---
-
-// Serialize converts a LogRecord into a byte slice.
-// This format must be stable for recovery.
-func (lr *LogRecord) Serialize() ([]byte, error) {
-	buf := new(bytes.Buffer)
-
-	// Write fixed-size fields
-	if err := binary.Write(buf, binary.LittleEndian, lr.LSN); err != nil {
-		return nil, fmt.Errorf("failed to serialize LSN: %w", err)
+// Close closes the LogManager and the current WAL file.
+func (lm *LogManager) Close() error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if lm.currentSegmentFile != nil {
+		err := lm.currentSegmentFile.Sync() // Ensure data is flushed before closing
+		if err != nil {
+			lm.logger.Error("Failed to sync WAL on close", zap.Error(err))
+		}
+		closeErr := lm.currentSegmentFile.Close()
+		lm.currentSegmentFile = nil
+		lm.logger.Info("LogManager closed.", zap.Uint64("lastLSN", uint64(lm.currentLSN)))
+		return closeErr
 	}
-	if err := binary.Write(buf, binary.LittleEndian, lr.PrevLSN); err != nil {
-		return nil, fmt.Errorf("failed to serialize PrevLSN: %w", err)
-	}
-	if err := binary.Write(buf, binary.LittleEndian, lr.TxnID); err != nil {
-		return nil, fmt.Errorf("failed to serialize TxnID: %w", err)
-	}
-	if err := binary.Write(buf, binary.LittleEndian, lr.Type); err != nil {
-		return nil, fmt.Errorf("failed to serialize Type: %w", err)
-	}
-	if err := binary.Write(buf, binary.LittleEndian, lr.PageID); err != nil {
-		return nil, fmt.Errorf("failed to serialize PageID: %w", err)
-	}
-	if err := binary.Write(buf, binary.LittleEndian, lr.Offset); err != nil {
-		return nil, fmt.Errorf("failed to serialize Offset: %w", err)
-	}
-
-	// Write variable-length OldData
-	if err := binary.Write(buf, binary.LittleEndian, uint16(len(lr.OldData))); err != nil {
-		return nil, fmt.Errorf("failed to serialize OldData length: %w", err)
-	}
-	if _, err := buf.Write(lr.OldData); err != nil {
-		return nil, fmt.Errorf("failed to write OldData: %w", err)
-	}
-
-	// Write variable-length NewData
-	if err := binary.Write(buf, binary.LittleEndian, uint16(len(lr.NewData))); err != nil {
-		return nil, fmt.Errorf("failed to serialize NewData length: %w", err)
-	}
-	if _, err := buf.Write(lr.NewData); err != nil {
-		return nil, fmt.Errorf("failed to write NewData: %w", err)
-	}
-
-	return buf.Bytes(), nil
+	return nil
 }
 
-// Deserialize reads a byte slice into a LogRecord.
-// This is crucial for recovery.
-func (lr *LogRecord) Deserialize(data []byte) error {
-	buf := bytes.NewReader(data)
+// --- Replication Slot Management ---
 
-	// Read fixed-size fields
-	if err := binary.Read(buf, binary.LittleEndian, &lr.LSN); err != nil {
-		return fmt.Errorf("failed to deserialize LSN: %w", err)
+// CreateReplicationSlot creates a new replication slot.
+// The FSM should persist this information. This LogManager method updates its in-memory view.
+func (lm *LogManager) CreateReplicationSlot(slotName, consumerNodeID, indexType string, startLSN LSN) (*ReplicationSlot, error) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	if _, exists := lm.replicationSlots[slotName]; exists {
+		return nil, fmt.Errorf("replication slot '%s' already exists", slotName)
 	}
-	if err := binary.Read(buf, binary.LittleEndian, &lr.PrevLSN); err != nil {
-		return fmt.Errorf("failed to deserialize PrevLSN: %w", err)
+	slot := &ReplicationSlot{
+		SlotName:       slotName,
+		ConsumerNodeID: consumerNodeID,
+		IndexType:      indexType,
+		RequiredLSN:    startLSN, // Initially, the consumer needs from here
+		SnapshotLSN:    startLSN,
+		IsActive:       true,
+		LastHeartbeat:  time.Now(),
+		CreationTime:   time.Now(),
 	}
-	if err := binary.Read(buf, binary.LittleEndian, &lr.TxnID); err != nil {
-		return fmt.Errorf("failed to deserialize TxnID: %w", err)
+	lm.replicationSlots[slotName] = slot
+	lm.logger.Info("Created replication slot", zap.String("slotName", slotName), zap.String("consumer", consumerNodeID), zap.Uint64("startLSN", uint64(startLSN)))
+	// TODO: Persist this change if LogManager is responsible for slot persistence.
+	// Typically, Controller/FSM manages this state, LogManager just uses it.
+	return slot, nil
+}
+
+// UpdateReplicationSlot advances the RequiredLSN for a slot or updates its heartbeat.
+// Called by a replica when it has successfully processed logs up to a certain LSN.
+func (lm *LogManager) UpdateReplicationSlot(slotName string, newRequiredLSN LSN, isActive bool) error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	slot, exists := lm.replicationSlots[slotName]
+	if !exists {
+		return fmt.Errorf("replication slot '%s' not found", slotName)
 	}
-	if err := binary.Read(buf, binary.LittleEndian, &lr.Type); err != nil {
-		return fmt.Errorf("failed to deserialize Type: %w", err)
+	if newRequiredLSN > lm.currentLSN {
+		lm.logger.Warn("Attempt to update slot with LSN greater than current LSN",
+			zap.String("slotName", slotName),
+			zap.Uint64("newRequiredLSN", uint64(newRequiredLSN)),
+			zap.Uint64("currentLSN", uint64(lm.currentLSN)))
+		// Don't update LSN beyond current, but can update activity/heartbeat
+	} else if newRequiredLSN < slot.RequiredLSN {
+		// This shouldn't happen if LSNs are only advanced.
+		// Could happen if a replica tries to "rewind", which should be handled carefully.
+		lm.logger.Warn("Attempt to rewind RequiredLSN for slot (not allowed)",
+			zap.String("slotName", slotName),
+			zap.Uint64("currentRequiredLSN", uint64(slot.RequiredLSN)),
+			zap.Uint64("attemptedLSN", uint64(newRequiredLSN)))
+	} else {
+		slot.RequiredLSN = newRequiredLSN
 	}
-	if err := binary.Read(buf, binary.LittleEndian, &lr.PageID); err != nil {
-		return fmt.Errorf("failed to deserialize PageID: %w", err)
+	slot.IsActive = isActive
+	slot.LastHeartbeat = time.Now()
+	lm.logger.Debug("Updated replication slot", zap.String("slotName", slotName), zap.Uint64("newRequiredLSN", uint64(slot.RequiredLSN)), zap.Bool("isActive", slot.IsActive))
+	// TODO: Persist change
+	return nil
+}
+
+// DropReplicationSlot removes a replication slot.
+func (lm *LogManager) DropReplicationSlot(slotName string) error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	if _, exists := lm.replicationSlots[slotName]; !exists {
+		return fmt.Errorf("replication slot '%s' not found for dropping", slotName)
 	}
-	if err := binary.Read(buf, binary.LittleEndian, &lr.Offset); err != nil {
-		return fmt.Errorf("failed to deserialize Offset: %w", err)
+	delete(lm.replicationSlots, slotName)
+	lm.logger.Info("Dropped replication slot", zap.String("slotName", slotName))
+	// TODO: Persist change
+	return nil
+}
+
+// GetMinRequiredLSNForAllSlots calculates the minimum LSN required by any active slot.
+// This is used to determine which WAL segments can be safely archived/deleted.
+func (lm *LogManager) GetMinRequiredLSNForAllSlots() LSN {
+	lm.mu.RLock() // Use RLock for read-only access
+	defer lm.mu.RUnlock()
+
+	minLSN := lm.currentLSN // Start with current LSN, no slot can require more than this
+	if len(lm.replicationSlots) == 0 {
+		return defaultMinLSNToKeep // Or a system-wide configured minimum retention LSN
 	}
 
-	// Read variable-length OldData
-	var oldDataLen uint16
-	if err := binary.Read(buf, binary.LittleEndian, &oldDataLen); err != nil {
-		return fmt.Errorf("failed to deserialize OldData length: %w", err)
+	firstActiveSlot := true
+	for _, slot := range lm.replicationSlots {
+		if slot.IsActive {
+			if firstActiveSlot {
+				minLSN = slot.RequiredLSN
+				firstActiveSlot = false
+			} else if slot.RequiredLSN < minLSN {
+				minLSN = slot.RequiredLSN
+			}
+		}
 	}
-	lr.OldData = make([]byte, oldDataLen)
-	if _, err := io.ReadFull(buf, lr.OldData); err != nil {
-		return fmt.Errorf("failed to read OldData: %w", err)
+	// If no active slots, what should be the min LSN?
+	// It should be based on checkpoint LSN or a configured retention period.
+	// For now, if no active slots, it means WALs up to current can potentially be candidates for cleanup
+	// based on other criteria (like checkpointing).
+	// Let's assume if no active slots, the effective min required LSN is high, allowing cleanup.
+	// This needs to be coordinated with checkpointing.
+	if firstActiveSlot && len(lm.replicationSlots) > 0 { // No active slots found, but slots exist
+		return lm.currentLSN // effectively no WAL retention needed by slots
 	}
 
-	// Read variable-length NewData
-	var newDataLen uint16
-	if err := binary.Read(buf, binary.LittleEndian, &newDataLen); err != nil {
-		return fmt.Errorf("failed to deserialize NewData length: %w", err)
+	return minLSN
+}
+
+// PruneWALSegments archives or deletes WAL segments no longer needed by any replication slot
+// or by the checkpointing mechanism.
+func (lm *LogManager) PruneWALSegments(checkpointLSN LSN) error {
+	lm.mu.Lock() // Need full lock as we might be modifying files
+	defer lm.mu.Unlock()
+
+	minSlotLSN := lm.GetMinRequiredLSNForAllSlots() // RLock was inside, so this is fine.
+
+	// The actual LSN to retain up to is the minimum of what slots need and what checkpoints need.
+	// Checkpoints ensure recovery up to checkpointLSN, so WALs before that (that are part of the checkpoint)
+	// might be prunable if no slots need them. This logic is complex.
+	// For simplicity now: retain up to min(minSlotLSN, checkpointLSN if checkpointing is considered)
+	// More simply, retain WALs needed by the OLDEST of (any active slot's required LSN) OR (the last checkpoint's LSN).
+	// If checkpointLSN is 0 or very old, minSlotLSN dominates.
+	// If minSlotLSN is very old (e.g. inactive replica), checkpointLSN might allow pruning some.
+
+	// Simplified: We need WALs at least up to the oldest active slot's RequiredLSN.
+	// And we need WALs since the last successful checkpoint for local crash recovery.
+	// So, effectiveMinLSN = min(oldest_slot_required_LSN, last_checkpoint_start_LSN)
+	// For now, let's use minSlotLSN as the primary driver for slot-based retention.
+	// Checkpointing mechanism would have its own pruning logic which should be coordinated.
+
+	effectiveMinLSNToKeep := minSlotLSN
+	if checkpointLSN > 0 && checkpointLSN < effectiveMinLSNToKeep {
+		// This case is tricky. If a checkpoint is *newer* than what a slot needs,
+		// it implies the slot is lagging significantly. We still honor the slot.
+		// If a checkpoint is *older* than what slots need, slots dictate retention.
+		// If checkpointLSN is what we need for local recovery, and it's newer than minSlotLSN,
+		// then we must keep up to checkpointLSN.
+		// Let's be conservative: keep WALs needed for the older of the two.
+		// Actually, we need WALs from the oldest of (what any slot requires) OR (what local recovery from last checkpoint requires)
+		// So, if minSlotLSN is 100, and checkpoint LSN is 50, we need to keep from 50.
+		// If minSlotLSN is 50, and checkpoint LSN is 100, we need to keep from 50.
+		// So, targetLSNToKeep = min(minSlotLSN, checkpointLSNThatEnsuresRecovery)
+		// This needs more thought with checkpointing. For now, just use minSlotLSN for slot-based pruning.
 	}
-	lr.NewData = make([]byte, newDataLen)
-	if _, err := io.ReadFull(buf, lr.NewData); err != nil {
-		return fmt.Errorf("failed to read NewData: %w", err)
+
+	lm.logger.Info("Attempting to prune WAL segments", zap.Uint64("minSlotRequiredLSN", uint64(effectiveMinLSNToKeep)), zap.Uint64("currentMaxLSN", uint64(lm.currentLSN)))
+
+	files, err := os.ReadDir(lm.walDir)
+	if err != nil {
+		return fmt.Errorf("failed to read WAL directory for pruning: %w", err)
+	}
+
+	// Sort files by segment ID to process them in order
+	var segmentFiles []string
+	for _, file := range files {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), walFilePrefix) && strings.HasSuffix(file.Name(), walFileSuffix) {
+			segmentFiles = append(segmentFiles, file.Name())
+		}
+	}
+	sort.Strings(segmentFiles) // Sorts them lexicographically, which works for zero-padded numbers
+
+	for _, fileName := range segmentFiles {
+		//segmentPath := filepath.Join(lm.walDir, fileName)
+		segmentIDStr := strings.TrimSuffix(strings.TrimPrefix(fileName, walFilePrefix), walFileSuffix)
+		segmentID, _ := strconv.ParseUint(segmentIDStr, 10, 64)
+
+		if segmentID >= lm.currentSegmentID {
+			continue // Never prune the current segment or future ones (should not exist)
+		}
+
+		// To decide if a segment can be pruned, we need to know the LSN range it covers.
+		// This is hard without reading the segment or storing LSN ranges per segment.
+		// Approximation: if the *next* segment's first LSN is > effectiveMinLSNToKeep,
+		// then this current segment *might* be prunable.
+		// Better: The FSM or metadata should store first/last LSN for each segment file.
+
+		// Simplified Pruning Logic (Placeholder):
+		// Assumes segments are pruned if their ID is much lower than the segment ID of effectiveMinLSNToKeep.
+		// This is NOT robust. A robust method needs to know LSNs within segments.
+		// For now, we will not implement actual pruning here, just the framework.
+		// Actual pruning would move files to lm.archiveDir and then potentially delete from archiveDir.
+
+		// To implement robustly:
+		// 1. Iterate through segment files.
+		// 2. For each segment, determine the LSN of its *last* record.
+		// 3. If segment_last_lsn < effectiveMinLSNToKeep, then this segment can be archived/deleted.
+		// This requires reading each segment, which can be slow.
+		// Optimization: Store first/last LSN per segment in a metadata file.
+
+		lm.logger.Debug("Considering segment for pruning (actual pruning logic TBD)", zap.String("segmentFile", fileName), zap.Uint64("segmentID", segmentID))
+		// Example: if segmentID < segmentIDContaining(effectiveMinLSNToKeep)
+		//   archiveSegment(segmentPath)
 	}
 
 	return nil
 }
 
-// Size returns the approximate serialized size of the LogRecord.
-// Useful for LSN calculation and buffer management.
-func (lr *LogRecord) Size() int {
-	// Fixed size fields: LSN, PrevLSN, TxnID (3 * 8 bytes = 24)
-	// Type (1 byte)
-	// PageID (8 bytes)
-	// Offset (2 bytes)
-	// OldDataLen, NewDataLen (2 * 2 bytes = 4)
-	fixedSize := 24 + 1 + 8 + 2 + 4
-	return fixedSize + len(lr.OldData) + len(lr.NewData)
+// archiveSegment moves a WAL segment to the archive directory.
+func (lm *LogManager) archiveSegment(segmentPath string) error {
+	if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
+		lm.logger.Warn("WAL segment to archive does not exist", zap.String("path", segmentPath))
+		return nil // Already gone
+	}
+
+	fileName := filepath.Base(segmentPath)
+	archivePath := filepath.Join(lm.archiveDir, fileName)
+
+	err := os.Rename(segmentPath, archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to move WAL segment %s to archive: %w", fileName, err)
+	}
+	lm.logger.Info("Archived WAL segment", zap.String("segment", fileName), zap.String("archivePath", archivePath))
+	return nil
 }
+
+// GetWALReaderForStreaming returns an io.ReadCloser for streaming WAL records starting from a given LSN.
+// The caller is responsible for closing the reader.
+// This implementation needs to be ables to read across multiple segment files.
+func (lm *LogManager) GetWALReaderForStreaming(startLSN LSN, forSlotName string) (io.ReadCloser, error) {
+	lm.mu.RLock() // RLock as we are reading segments
+	defer lm.mu.RUnlock()
+
+	slot, exists := lm.replicationSlots[forSlotName]
+	if !exists {
+		return nil, fmt.Errorf("replication slot %s not found for streaming", forSlotName)
+	}
+	if !slot.IsActive {
+		return nil, fmt.Errorf("replication slot %s is not active", forSlotName)
+	}
+	// Ensure startLSN is not older than what the slot itself requires (or its snapshot LSN)
+	// This check might be refined based on slot semantics.
+	if startLSN < slot.SnapshotLSN {
+		lm.logger.Warn("Requested stream LSN is older than slot's snapshot LSN",
+			zap.String("slot", forSlotName),
+			zap.Uint64("request_lsn", uint64(startLSN)),
+			zap.Uint64("slot_snapshot_lsn", uint64(slot.SnapshotLSN)))
+		// Depending on policy, either error out or start from slot.SnapshotLSN
+		// For now, let's allow it but log, assuming the caller knows what they're doing
+		// (e.g. a full resync after a problem).
+	}
+
+	// Find the segment containing startLSN.
+	// This requires metadata about LSN ranges per segment or iterating.
+	// For now, placeholder. A real implementation needs to locate the correct starting segment and offset.
+	lm.logger.Info("WAL streaming request", zap.Uint64("startLSN", uint64(startLSN)), zap.String("slot", forSlotName))
+	// This would return a custom reader that can seamlessly transition across WAL segment files.
+	// return NewWALStreamReader(lm.walDir, startLSN, lm.logger) // Hypothetical constructor
+	return nil, fmt.Errorf("GetWALReaderForStreaming not fully implemented - requires multi-segment reading logic")
+}
+
+// Placeholder for ApplyLogRecord if LogManager itself is involved in applying replicated logs (unlikely)
+// Typically, consumers of WAL (like index managers) have their own ApplyLogRecord methods.
+// type LogType string // Already defined in your existing code, ensure it's used
+// const (
+// 	LogTypeBTree        LogType = "btree"
+// 	LogTypeInvertedIndex LogType = "inverted_index"
+// 	LogTypeSpatialIndex LogType = "spatial_index"
+// 	// ... other log types
+// )
+// func (lm *LogManager) ApplyLogRecord(lr LogRecord, logType LogType) error {
+//    return fmt.Errorf("ApplyLogRecord should be handled by specific index managers based on logType %s", logType)
+// }
+
+// TODO:
+// - Persist replication slot information.
+// - Implement robust WAL segment LSN tracking for efficient pruning and streaming.
+// - Implement WALStreamReader for multi-segment reading.
+// - Coordinate pruning with checkpointing mechanism (e.g., FSM tells LogManager about checkpoint LSNs).
+// - Add methods to query slot status for monitoring.
+// - Consider security if WAL files are directly exposed for streaming (encryption, access control).

@@ -101,3 +101,5 @@ func (p *Page) Unlock() {
 }
 
 // --- END NEW ---
+type PageManager struct {
+}

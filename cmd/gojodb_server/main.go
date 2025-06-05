@@ -1,988 +1,755 @@
 package main
 
 import (
-	"bufio" // Added for bytes.SplitN
+	"bytes"
 	"context"
-	"encoding/json" // Needed for (de)serializing TransactionOperations
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
+	"log" // Standard log, consider replacing all with zap eventually
 	"net"
 	"net/http"
 	"os"
-	"strconv"
+	"os/signal"
+	"path/filepath" // Added for filepath.Join
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	btree_core "github.com/sushant-115/gojodb/core/indexing/btree"               // B-tree core package
-	"github.com/sushant-115/gojodb/core/indexing/inverted_index"                 // Inverted Index package
-	"github.com/sushant-115/gojodb/core/indexing/spatial"                        // NEW: Spatial Index package
-	replication "github.com/sushant-115/gojodb/core/replication/log_replication" // B-tree core package
-	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"          // FSM package for sharding info
+	// GojoDB core packages
+	"github.com/sushant-115/gojodb/core/indexing/btree"
+	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
+	"github.com/sushant-115/gojodb/core/indexing/spatial"
+	logreplication "github.com/sushant-115/gojodb/core/replication/log_replication"
+	"github.com/sushant-115/gojodb/core/replication/raft_consensus/fsm"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+
+	// GojoDB API services
+	basic_api "github.com/sushant-115/gojodb/api/basic"
+	gqlserver "github.com/sushant-115/gojodb/api/graphql_service/graph" // Alias for GraphQL server
+	"github.com/sushant-115/gojodb/api/graphql_service/graph/generated"
+	indread_api "github.com/sushant-115/gojodb/api/indexed_reads_service"
+	indwrite_api "github.com/sushant-115/gojodb/api/indexed_writes_service"
+
+	// External libraries
+	"github.com/99designs/gqlgen/graphql/handler"
+	"github.com/99designs/gqlgen/graphql/playground"
+	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+
+	// Protobufs (ensure these paths are correct for your project structure)
+	pb "github.com/sushant-115/gojodb/api/proto" // Assuming a common proto package
+)
+
+var (
+	dbInstance            *btree.BTree[string, string]
+	logManager            *wal.LogManager
+	invertedIndexInstance *inverted_index.InvertedIndex
+	spatialIdx            *spatial.IndexManager
+	tieredStorageManager  *tiered_storage.TieredStorageManager // Corrected type name
+
+	// OLD: replicationManager    *logreplication.ReplicationManager
+	// NEW: Map of index type to its replication manager
+	indexReplicationManagers map[logreplication.IndexType]logreplication.ReplicationManagerInterface
+
+	raftNode   *raft.Raft
+	raftFSM    *fsm.FSM
+	grpcServer *grpc.Server
+	httpServer *http.Server
+	zlogger    *zap.Logger // Changed from logger to zlogger to avoid conflict with standard log package
+
+	// Command-line flags
+	nodeID            = flag.String("node_id", "node1", "Unique ID for the node")
+	raftAddr          = flag.String("raft_addr", "127.0.0.1:7000", "Raft bind address")
+	raftDir           = flag.String("raft_dir", "/tmp/gojodb_raft_data", "Raft data directory for logs and snapshots") // More descriptive name
+	grpcAddr          = flag.String("grpc_addr", "127.0.0.1:8000", "gRPC bind address")
+	httpAddr          = flag.String("http_addr", "127.0.0.1:8080", "HTTP bind address for GraphQL and health checks")
+	bootstrap         = flag.Bool("bootstrap", false, "Bootstrap the Raft cluster (only for the first node)")
+	controllerAddr    = flag.String("controller_addr", "127.0.0.1:9000", "Controller address for joining Raft cluster and fetching shard map")
+	replicationPort   = flag.String("repl_port", "6000", "Port for replication data exchange between storage nodes") // Clarified purpose
+	myStorageNodeID   string                                                                                         // Set from nodeID flag
+	myStorageNodeAddr string                                                                                         // Address this node is reachable at by other storage nodes (e.g. for replication)
+
+	// Global wait group to manage graceful shutdown of goroutines
+	globalWG sync.WaitGroup
 )
 
 const (
-	// Database configuration
-	dbFilePath     = "data/gojodb_shard.db" // Each storage node will have its own DB file
-	logDir         = "data/logs"
-	archiveDir     = "data/archives"
-	logBufferSize  = 4096
-	logSegmentSize = 16 * 1024
-	bTreeDegree    = 3
-	bufferPoolSize = 10
-	dbPageSize     = 4096
-
-	// Controller interaction configuration
-	controllerHeartbeatTargetPort = 8086             // Default UDP port on Controller for heartbeats
-	heartbeatInterval             = 5 * time.Second  // How often to send heartbeats
-	shardMapFetchInterval         = 10 * time.Second // How often to fetch shard map
-	storageNodeDialTimeout        = 2 * time.Second  // Timeout for connecting to a storage node
-
-	// GOJODB.TEXT() wrapper prefix
-	gojoDBTextPrefix = "GOJODB.TEXT("
-	gojoDBTextSuffix = ")"
+	DefaultPageSize       = 4096
+	DefaultBufferPoolSize = 100
+	RaftSnapShotRetain    = 2 // Number of snapshots to retain
+	RaftTransportTimeout  = 10 * time.Second
+	RaftTransportMaxPool  = 3 // Max number of connections in transport pool
+	ControllerRetryDelay  = 5 * time.Second
+	GrpcServerStopTimeout = 5 * time.Second
+	HttpServerStopTimeout = 5 * time.Second
+	HandshakeTimeout      = 5 * time.Second // Timeout for replication handshake
 )
 
-// Global database instance and its lock for simple concurrency control
-var (
-	dbInstance            *btree_core.BTree[string, string] // Using string keys
-	dbLock                sync.RWMutex                      // Global lock for the entire B-Tree operations
-	logManager            *wal.LogManager
-	invertedIndexInstance *inverted_index.InvertedIndex // Global inverted index instance
-	spatialIndexManager   *spatial.SpatialIndexManager  // NEW: Global spatial index instance
+func main() {
+	flag.Parse()
+	myStorageNodeID = *nodeID
+	// Construct the replication address (host from grpcAddr, port from replicationPort)
+	host := strings.Split(*grpcAddr, ":")[0]
+	myStorageNodeAddr = fmt.Sprintf("%s:%s", host, *replicationPort)
 
-	// Storage Node identity
-	myStorageNodeID   string
-	myStorageNodeAddr string // e.g., "localhost:9000"
-
-	// Sharding awareness
-	myAssignedSlotsMu sync.RWMutex
-	myAssignedSlots   map[string]fsm.SlotRangeInfo // Cache of slot ranges assigned to THIS node
-	// Replication Manager instance
-	replicationManager      *replication.ReplicationManager
-	controllerHeartbeatAddr = os.Getenv("RAFT_HEARTBEAT_ADDRESS")
-	raftControllerAddress   = os.Getenv("RAFT_HTTP_ADDRESS")
-)
-
-// Request represents a parsed client request for single operations.
-type Request struct {
-	Command  string
-	Key      string // Key is now string
-	Value    string // Only for PUT
-	TxnID    uint64 // NEW: Transaction ID for 2PC operations (0 for auto-commit)
-	StartKey string // For range query
-	EndKey   string // For range query
-	Query    string // For text search queries
-	// NEW: Spatial query parameters
-	MinX float64
-	MinY float64
-	MaxX float64
-	MaxY float64
-}
-
-// Response represents a server's reply to a client request.
-type Response struct {
-	Status  string // OK, ERROR, NOT_FOUND, REDIRECT, VOTE_COMMIT, VOTE_ABORT, COMMITTED, ABORTED
-	Message string // Details or value for GET, or target node for REDIRECT
-}
-
-type Entry struct {
-	Key   string
-	Value string
-}
-
-type HeartbeatMessage struct {
-	NodeID    string `json:"node_id"`
-	Address   string `json:"address"`
-	Timestamp int64  `json:"timestamp"` // Unix timestamp
-}
-
-type TransactionOperations struct {
-	Operations []btree_core.TransactionOperation `json:"operations"`
-}
-
-// initStorageNode initializes the Storage Node's database, identity, and background tasks.
-func initStorageNode() error {
 	var err error
+	// Initialize logger
+	zlogger, err = zap.NewDevelopment() // Or zap.NewProduction() for structured logging
+	if err != nil {
+		log.Fatalf("CRITICAL: Can't initialize zap logger: %v", err)
+	}
+	defer func() {
+		if cerr := zlogger.Sync(); cerr != nil {
+			log.Printf("WARN: Failed to sync logger: %v\n", cerr)
+		}
+	}() // flushes buffer, if any
 
-	// 1. Get Storage Node Identity from environment variables
-	myStorageNodeID = os.Getenv("STORAGE_NODE_ID")
-	myStorageNodeAddr = os.Getenv("STORAGE_NODE_ADDR")
-	if myStorageNodeID == "" || myStorageNodeAddr == "" {
-		return fmt.Errorf("STORAGE_NODE_ID and STORAGE_NODE_ADDR environment variables must be set")
+	zlogger.Info("Starting GojoDB storage node",
+		zap.String("nodeID", myStorageNodeID),
+		zap.String("raftAddr", *raftAddr),
+		zap.String("grpcAddr", *grpcAddr),
+		zap.String("httpAddr", *httpAddr),
+		zap.String("replicationListenAddr", ":"+*replicationPort),
+		zap.String("myStorageNodeAddrForReplication", myStorageNodeAddr),
+		zap.Bool("bootstrap", *bootstrap),
+		zap.String("controllerAddr", *controllerAddr),
+	)
+
+	// Initialize database components
+	if err := initStorageNode(); err != nil {
+		zlogger.Fatal("CRITICAL: Failed to initialize storage node", zap.Error(err))
 	}
 
-	// Ensure the base data directory exists
-	baseDataDir := "data" // Assuming all data files/logs go here
-	if err := os.MkdirAll(baseDataDir, 0755); err != nil {
+	// Initialize and start Raft
+	if err := initAndStartRaft(); err != nil {
+		zlogger.Fatal("CRITICAL: Failed to initialize Raft", zap.Error(err))
+	}
+
+	// Start API servers
+	globalWG.Add(2) // For gRPC and HTTP servers
+	go startGRPCServer()
+	go startHTTPServer()
+
+	// Start replication listener (for primaries to connect to this replica)
+	globalWG.Add(1)
+	go listenForReplicationRequests()
+
+	// Initial attempt to fetch shard map. FSM will handle subsequent updates via Raft.
+	globalWG.Add(1)
+	go initialFetchShardMapFromController()
+
+	// Graceful shutdown
+	setupSignalHandling()
+
+	globalWG.Wait() // Wait for all essential goroutines to finish
+	zlogger.Info("GojoDB storage node shut down gracefully.")
+}
+
+func initStorageNode() error {
+	zlogger.Info("Initializing storage components...")
+	var err error
+
+	// Create base data directory if it doesn't exist
+	baseDataDir := filepath.Join(*raftDir, myStorageNodeID) // Node-specific data directory
+	if err := os.MkdirAll(baseDataDir, 0750); err != nil {
 		return fmt.Errorf("failed to create base data directory %s: %w", baseDataDir, err)
 	}
 
-	// Adjust dbFilePath to be unique per storage node
-	uniqueDbFilePath := fmt.Sprintf("data/%s_gojodb_shard.db", myStorageNodeID)
-	uniqueLogDir := fmt.Sprintf("data/%s_logs", myStorageNodeID)
-	uniqueArchiveDir := fmt.Sprintf("data/%s_archives", myStorageNodeID)
-	// Use a unique file path for the inverted index data file (changed from .json to .db)
-	uniqueInvertedIndexFilePath := fmt.Sprintf("data/%s_inverted_index.db", myStorageNodeID)
-	uniqueInvertedIndexLogDir := fmt.Sprintf("data/%s_inverted_index_logs", myStorageNodeID)
-	uniqueInvertedIndexArchiveDir := fmt.Sprintf("data/%s_inverted_index_archives", myStorageNodeID)
-
-	// Use a unique file path for the inverted index data file (changed from .json to .db)
-	uniqueSpatialIndexFilePath := fmt.Sprintf("data/%s_spatial_index.db", myStorageNodeID)
-	uniqueSpatialIndexLogDir := fmt.Sprintf("data/%s_spatial_index_logs", myStorageNodeID)
-	uniqueSpatialIndexArchiveDir := fmt.Sprintf("data/%s_spatial_index_archives", myStorageNodeID)
-
-	// 2. Initialize LogManager for this Storage Node
-	logManager, err = wal.NewLogManager(uniqueLogDir, uniqueArchiveDir, logBufferSize, logSegmentSize)
-	if err != nil {
-		return fmt.Errorf("failed to create LogManager for storage node %s: %w", myStorageNodeID, err)
+	// Initialize Log Manager (WAL)
+	walPath := filepath.Join(baseDataDir, "wal")
+	if err := os.MkdirAll(walPath, 0750); err != nil {
+		return fmt.Errorf("failed to create WAL directory %s: %w", walPath, err)
 	}
-
-	// 3. Initialize or open the B-tree database for this Storage Node
-	dbInstance, err = btree_core.OpenBTreeFile[string, string]( // Use string keys
-		uniqueDbFilePath,
-		btree_core.DefaultKeyOrder[string], // Default order for strings
-		btree_core.KeyValueSerializer[string, string]{
-			SerializeKey:     btree_core.SerializeString,
-			DeserializeKey:   btree_core.DeserializeString,
-			SerializeValue:   btree_core.SerializeString,
-			DeserializeValue: btree_core.DeserializeString,
-		},
-		bufferPoolSize,
-		dbPageSize,
-		logManager,
-	)
-
+	logManager, err = wal.NewLogManager(walPath)
 	if err != nil {
-		// If file not found, create a new one
-		if os.IsNotExist(err) || strings.Contains(err.Error(), "database file not found") {
-			log.Printf("INFO: Database file %s for Storage Node %s not found. Creating new database.", uniqueDbFilePath, myStorageNodeID)
-			dbInstance, err = btree_core.NewBTreeFile[string, string]( // Use string keys
-				uniqueDbFilePath,
-				bTreeDegree,
-				btree_core.DefaultKeyOrder[string],
-				btree_core.KeyValueSerializer[string, string]{
-					SerializeKey:     btree_core.SerializeString,
-					DeserializeKey:   btree_core.DeserializeString,
-					SerializeValue:   btree_core.SerializeString,
-					DeserializeValue: btree_core.DeserializeString,
-				},
-				bufferPoolSize,
-				dbPageSize,
-				logManager,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to create new BTree file for storage node %s: %w", myStorageNodeID, err)
-			}
+		return fmt.Errorf("failed to create main log manager: %w", err)
+	}
+	zlogger.Info("Main Log Manager initialized", zap.String("path", walPath))
+
+	// Initialize B-tree Index
+	dbPath := filepath.Join(baseDataDir, "btree.db")
+	dbInstance, err = btree.NewBTree(DefaultPageSize, DefaultBufferPoolSize, dbPath, logManager)
+	if err != nil {
+		return fmt.Errorf("failed to create B-tree instance: %w", err)
+	}
+	zlogger.Info("B-tree instance initialized", zap.String("path", dbPath))
+
+	// Initialize Inverted Index
+	invertedIndexPath := filepath.Join(baseDataDir, "inverted_index")
+	if err := os.MkdirAll(invertedIndexPath, 0750); err != nil {
+		return fmt.Errorf("failed to create inverted index directory %s: %w", invertedIndexPath, err)
+	}
+	// Inverted Index's LogManager: The original NewInvertedIndex took a path AND a LogManager.
+	// This suggests it might write to its own files but use the passed LogManager for actual log sequence numbers or coordination.
+	// For replication, it should ideally manage its own WAL file stream or use distinct log types in a shared WAL.
+	// Assuming it uses the main logManager for now for its WAL records relevant to replication.
+	// If it has its OWN WAL that needs replicating, its GetLogManager() should return that.
+	invertedIndexInstance, err = inverted_index.NewInvertedIndex(invertedIndexPath, logManager) // Pass main logManager
+	if err != nil {
+		return fmt.Errorf("failed to create inverted index instance: %w", err)
+	}
+	zlogger.Info("Inverted Index instance initialized", zap.String("path", invertedIndexPath))
+
+	// Initialize Spatial Index
+	spatialIndexPath := filepath.Join(baseDataDir, "spatial_index")
+	if err := os.MkdirAll(spatialIndexPath, 0750); err != nil {
+		return fmt.Errorf("failed to create spatial index directory %s: %w", spatialIndexPath, err)
+	}
+	// Spatial Index LogManager: Similar to Inverted Index, clarify its WAL strategy.
+	// The original NewIndexManager for spatial took a path and its own LogManager.
+	spatialLogManagerPath := filepath.Join(baseDataDir, "spatial_wal")
+	if err := os.MkdirAll(spatialLogManagerPath, 0750); err != nil {
+		return fmt.Errorf("failed to create spatial WAL directory %s: %w", spatialLogManagerPath, err)
+	}
+	spatialLm, err := wal.NewLogManager(spatialLogManagerPath) // Spatial index gets its own WAL
+	if err != nil {
+		return fmt.Errorf("failed to create spatial log manager: %w", err)
+	}
+	spatialIdx, err = spatial.NewIndexManager(spatialIndexPath, spatialLm) // Pass path and its own LM
+	if err != nil {
+		return fmt.Errorf("failed to create spatial index instance: %w", err)
+	}
+	zlogger.Info("Spatial Index instance initialized", zap.String("path", spatialIndexPath), zap.String("wal_path", spatialLogManagerPath))
+
+	// Initialize Tiered Storage Manager
+	// Placeholder for actual storage adapter initialization (e.g., EFS, S3)
+	// For now, using file-based hot storage and no-op cold storage
+	hotStoragePath := filepath.Join(baseDataDir, "hot_storage")
+	if err := os.MkdirAll(hotStoragePath, 0750); err != nil {
+		return fmt.Errorf("failed to create hot storage directory %s: %w", hotStoragePath, err)
+	}
+	hotAdapter := hot_storage.NewFileStoreAdapter(hotStoragePath)
+	coldAdapter := cold_storage.NewNoOpColdStorageAdapter() // Replace with actual (e.g., S3Adapter)
+	tieredStorageManager = tiered_storage.NewTieredStorageManager(hotAdapter, coldAdapter, logManager, zlogger)
+	zlogger.Info("Tiered Storage Manager initialized")
+
+	// --- Initialize Index Replication Managers ---
+	indexReplicationManagers = make(map[logreplication.IndexType]logreplication.ReplicationManagerInterface)
+
+	// B-tree Replication Manager (uses the main logManager)
+	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger)
+	indexReplicationManagers[logreplication.BTreeIndexType] = bTreeRepMgr
+	zlogger.Info("B-tree Replication Manager initialized")
+
+	// Inverted Index Replication Manager
+	// It should use the log stream relevant to its data. If it writes to the main WAL via the passed logManager, use that.
+	// If InvertedIndex.GetLogManager() returns a specific WAL instance for its data, use that.
+	iiLogManager := invertedIndexInstance.GetLogManager() // This needs to exist and return the correct WAL.
+	if iiLogManager == nil {
+		zlogger.Warn("InvertedIndex GetLogManager returned nil, using main logManager for its replication. Review InvertedIndex WAL strategy.")
+		iiLogManager = logManager // Fallback, ensure this is correct for how Inverted Index logs its changes.
+	}
+	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger)
+	indexReplicationManagers[logreplication.InvertedIndexType] = invertedIndexRepMgr
+	zlogger.Info("Inverted Index Replication Manager initialized")
+
+	// Spatial Index Replication Manager (uses its own `spatialLm`)
+	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger)
+	indexReplicationManagers[logreplication.SpatialIndexType] = spatialRepMgr
+	zlogger.Info("Spatial Index Replication Manager initialized")
+
+	// Start all replication managers
+	for idxType, repMgr := range indexReplicationManagers {
+		if err := repMgr.Start(); err != nil {
+			// Log error but don't necessarily fail fast, node might still function for other indexes
+			zlogger.Error("Failed to start replication manager", zap.String("indexType", string(idxType)), zap.Error(err))
 		} else {
-			// Other errors during open are fatal
-			return fmt.Errorf("failed to open existing BTree file for storage node %s: %w", myStorageNodeID, err)
+			zlogger.Info("Successfully started replication manager", zap.String("indexType", string(idxType)))
 		}
 	}
-	log.Printf("INFO: Storage Node %s database initialized successfully. Root PageID: %d", myStorageNodeID, dbInstance.GetRootPageID())
+	// --- End of Replication Manager Init ---
 
-	// 4. Initialize Inverted Index for this Storage Node
-	// Pass unique log and archive directories for the inverted index
-	invertedIndexInstance, err = inverted_index.NewInvertedIndex(uniqueInvertedIndexFilePath, uniqueInvertedIndexLogDir, uniqueInvertedIndexArchiveDir)
-	if err != nil {
-		return fmt.Errorf("failed to create InvertedIndex for storage node %s: %w", myStorageNodeID, err)
-	}
-	log.Printf("INFO: Storage Node %s inverted index initialized successfully.", myStorageNodeID)
-
-	// NEW: 5. Initialize Spatial Index for this Storage Node
-	spatialIndexManager, err = spatial.NewSpatialIndexManager(uniqueSpatialIndexArchiveDir, uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath, logBufferSize, logSegmentSize, dbPageSize, 6, 2)
-	if err != nil {
-		return fmt.Errorf("failed to create SpatialIndex for storage node %s: %w", myStorageNodeID, err)
-	}
-	log.Printf("INFO: Storage Node %s spatial index initialized successfully.", myStorageNodeID)
-
-	// 6. Initialize local shard map cache
-	myAssignedSlots = make(map[string]fsm.SlotRangeInfo)
-
-	// 7. Initialize Replication Manager
-	// Pass the invertedIndexInstance to the ReplicationManager
-	replicationManager = replication.NewReplicationManager(myStorageNodeID, logManager, dbInstance, &dbLock, invertedIndexInstance, spatialIndexManager)
-	replicationManager.Start() // Start replication background tasks
-
-	// 8. Start background tasks
-	// go sendHeartbeatsToController()
-	for _, controllerAddress := range strings.Split(controllerHeartbeatAddr, ",") {
-		log.Println("Setup heartbeat for :", controllerAddress)
-		go SendHeartbeatsTCP(context.Background(), myStorageNodeID, myStorageNodeAddr, controllerAddress, heartbeatInterval)
-	}
-	log.Println("Calling fetch shard map")
-	go fetchShardMapFromController(replicationManager)
+	// Initialize FSM, passing the map of replication managers.
+	// The FSM uses these managers to react to shard assignment changes from Raft log.
+	raftFSM = fsm.NewFSM(
+		dbInstance,
+		logManager, // Main log manager for FSM state itself
+		invertedIndexInstance,
+		spatialIdx,
+		myStorageNodeID,
+		myStorageNodeAddr, // Pass this node's replication address to FSM
+		indexReplicationManagers,
+		zlogger,
+	)
+	zlogger.Info("Raft FSM initialized")
 
 	return nil
 }
 
-// closeStorageNode closes the B-tree, LogManager, InvertedIndex, and SpatialIndex cleanly.
-func closeStorageNode() {
-	log.Println("INFO: Shutting down Storage Node database...")
-	if dbInstance != nil {
-		if err := dbInstance.Close(); err != nil {
-			log.Printf("ERROR: Failed to close BTree for Storage Node %s: %v", myStorageNodeID, err)
-		}
-	}
-	if logManager != nil {
-		if err := logManager.Close(); err != nil {
-			log.Printf("ERROR: Failed to close LogManager for Storage Node %s: %v", myStorageNodeID, err)
-		}
-	}
-	// Close Inverted Index
-	if invertedIndexInstance != nil {
-		if err := invertedIndexInstance.Close(); err != nil {
-			log.Printf("ERROR: Failed to close InvertedIndex for Storage Node %s: %v", myStorageNodeID, err)
-		}
-	}
-	// Spatial Index does not have a Close method in the provided code, but if it did, call it here.
-	// if spatialIndexManager != nil {
-	// 	if err := spatialIndexManager.Close(); err != nil {
-	// 		log.Printf("ERROR: Failed to close SpatialIndex for Storage Node %s: %v", myStorageNodeID, err)
-	// 	}
-	// }
+func initAndStartRaft() error {
+	zlogger.Info("Initializing Raft...")
+	config := raft.DefaultConfig()
+	config.LocalID = raft.ServerID(myStorageNodeID) // Use myStorageNodeID directly
+	config.Logger = NewRaftLoggerAdapter(zlogger.Named("raft-library"))
+	// Adjust Raft timings if needed, defaults are generally okay for testing
+	// config.HeartbeatTimeout = 1000 * time.Millisecond
+	// config.ElectionTimeout = 1000 * time.Millisecond
 
-	// Stop Replication Manager
-	if replicationManager != nil {
-		replicationManager.Stop()
-	}
-	log.Println("INFO: Storage Node shutdown complete.")
-}
-
-// SendHeartbeatsTCP sends periodic heartbeat messages to a target address over TCP.
-// It runs in a goroutine and sends heartbeats every `interval`.
-// The context allows for graceful shutdown.
-func SendHeartbeatsTCP(ctx context.Context, nodeID string, localAddr string, targetAddr string, interval time.Duration) {
-	log.Printf("Starting TCP heartbeat sender for NodeID: %s, LocalAddr: %s, TargetAddr: %s", nodeID, localAddr, targetAddr)
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Heartbeat sender for NodeID %s stopped due to context cancellation.", nodeID)
-			return
-		case <-ticker.C:
-			// Create a new connection for each heartbeat.
-			// For a more robust system, consider maintaining a persistent connection
-			// or using connection pooling.
-			conn, err := net.Dial("tcp", targetAddr)
-			if err != nil {
-				log.Printf("Failed to connect to %s for heartbeat (NodeID: %s): %v", targetAddr, nodeID, err)
-				continue
-			}
-
-			// Create the heartbeat message
-			msg := HeartbeatMessage{
-				NodeID:    nodeID,
-				Address:   localAddr,
-				Timestamp: time.Now().UnixNano(),
-			}
-
-			// Encode the message to JSON
-			jsonData, err := json.Marshal(msg)
-			if err != nil {
-				log.Printf("Failed to marshal heartbeat message for NodeID %s: %v", nodeID, err)
-				conn.Close()
-				continue
-			}
-
-			// Send the message followed by a newline delimiter
-			_, err = conn.Write(append(jsonData, '\n'))
-			if err != nil {
-				log.Printf("Failed to send heartbeat to %s (NodeID: %s): %v", targetAddr, nodeID, err)
-			} else {
-				// log.Printf("Sent heartbeat from NodeID: %s to %s", nodeID, targetAddr)
-			}
-			conn.Close() // Close the connection after sending
-		}
-	}
-}
-
-// sendHeartbeatsToController periodically sends heartbeats to all known Controller addresses.
-func sendHeartbeatsToController() {
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-
-	controllerAddrs := strings.Split(controllerHeartbeatAddr, ",")
-	heartbeatMessage := fmt.Sprintf("%s:%s", myStorageNodeID, myStorageNodeAddr)
-
-	for range ticker.C {
-		// Try sending heartbeat to all known controllers
-		for _, addr := range controllerAddrs {
-			// Extract port from controller HTTP address and add 1 for heartbeat UDP port
-			parts := strings.Split(addr, ":")
-			if len(parts) != 2 {
-				log.Printf("WARNING: Invalid controller HTTP address format: %s", addr)
-				continue
-			}
-			_, err := strconv.Atoi(parts[1])
-			if err != nil {
-				log.Printf("WARNING: Invalid port in controller HTTP address %s: %v", addr, err)
-				continue
-			}
-			heartbeatTargetPort := controllerHeartbeatTargetPort // Assuming heartbeat listener is HTTP port + 1
-			heartbeatTargetPort, _ = strconv.Atoi(parts[1])
-			// conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP(parts[0]), Port: heartbeatTargetPort})
-			// if err != nil {
-			// 	log.Printf("ERROR: Failed to dial UDP for heartbeat to %s (port %d): %v", addr, heartbeatTargetPort, err)
-			// 	continue
-			// }
-			// _, err = conn.Write([]byte(heartbeatMessage))
-			// if err != nil {
-			// 	log.Printf("ERROR: Failed to send heartbeat to Controller %s (port %d): %v", addr, heartbeatTargetPort, err)
-			// } else {
-			// 	//log.Printf("DEBUG: Storage Node %s sent heartbeat to Controller %s (port %d).", myStorageNodeID, addr, heartbeatTargetPort)
-			// }
-			tcpConn, err := net.Dial("tcp", addr)
-			if err != nil {
-				log.Printf("Failed to send heartbeat to connect: %v", err)
-				continue
-			}
-			_, err = fmt.Fprintln(tcpConn, heartbeatMessage) // Sends message with newline
-			if err != nil {
-				log.Printf("Heartbeat error: %v", err)
-			}
-			log.Println("Sent heartbeat to: ", parts[0], heartbeatTargetPort, heartbeatMessage)
-			// conn.Close() // Close connection after sending
-			tcpConn.Close()
-		}
-	}
-}
-
-// fetchShardMapFromController periodically fetches the latest slot assignments from the Controller leader.
-func fetchShardMapFromController(rm *replication.ReplicationManager) {
-	log.Println("Called shard map")
-	ticker := time.NewTicker(shardMapFetchInterval)
-	defer ticker.Stop()
-
-	controllerAddrs := strings.Split(raftControllerAddress, ",")
-
-	for {
-		select {
-		case <-ticker.C:
-			leaderAddr := ""
-			// 1. Find the current Controller leader
-			for _, addr := range controllerAddrs {
-				resp, err := http.Get(fmt.Sprintf("http://%s/status", addr))
-				if err != nil {
-					// log.Printf("DEBUG: Failed to reach Controller %s for status: %v", addr, err) // Too noisy
-					continue
-				}
-				defer resp.Body.Close()
-
-				if resp.StatusCode == http.StatusOK {
-					bodyBytes, _ := io.ReadAll(resp.Body)
-					bodyString := string(bodyBytes)
-					if strings.Contains(bodyString, "State: Leader") {
-						// Extract leader address from status response (assuming it's in "Leader: <addr>")
-						leaderLine := ""
-						for _, line := range strings.Split(bodyString, "\n") {
-							if strings.HasPrefix(line, "Leader:") {
-								leaderLine = strings.TrimSpace(strings.TrimPrefix(line, "Leader:"))
-								break
-							}
-						}
-						if leaderLine != "" && leaderLine != "unknown" && leaderLine != "none" {
-							leaderAddr = addr
-							break // Found leader, stop searching
-						}
-					}
-				}
-			}
-
-			if leaderAddr == "" {
-				log.Println("No leader found")
-				//log.Printf("WARNING: No Controller leader found. Cannot fetch shard map.")
-				continue
-			}
-			//log.Printf("DEBUG: Controller leader found at: %s", leaderAddr)
-
-			// 2. Fetch all slot assignments from the leader
-			resp, err := http.Get(fmt.Sprintf("http://%s/admin/get_all_slot_assignments", leaderAddr)) // New endpoint needed
-			if err != nil {
-				log.Printf("ERROR: Failed to fetch slot assignments from Controller leader %s: %v", leaderAddr, err)
-				continue
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				log.Printf("ERROR: Failed to fetch slot assignments: HTTP Status %s", resp.Status)
-				continue
-			}
-			// bodyBytes, _ := io.ReadAll(resp.Body)
-			// bodyString := string(bodyBytes)
-			// log.Println("Controller Address 418:  ", bodyString)
-			var allSlotAssignments map[string]fsm.SlotRangeInfo
-			if err := json.NewDecoder(resp.Body).Decode(&allSlotAssignments); err != nil {
-				log.Printf("ERROR: Failed to decode slot assignments from Controller: %v", err)
-				continue
-			}
-
-			// 3. Update local cache with assignments relevant to this node
-			newAssignedSlots := make(map[string]fsm.SlotRangeInfo)
-			for rangeID, slotInfo := range allSlotAssignments {
-				if slotInfo.AssignedNodeID == myStorageNodeID {
-					newAssignedSlots[rangeID] = slotInfo
-				}
-				// 2. Fetch all slot assignments from the leader
-				for _, nodeID := range slotInfo.ReplicaNodeIDs {
-					resp, err = http.Get(fmt.Sprintf("http://%s/admin/get_storage_node_address?nodeID=%s", leaderAddr, nodeID)) // New endpoint needed
-					if err != nil {
-						log.Printf("ERROR: Failed to fetch slot assignments from Controller leader %s: %v", leaderAddr, err)
-						continue
-					}
-					body, _ := ioutil.ReadAll(resp.Body)
-					rm.SetStorageNodeAddress(nodeID, string(body))
-				}
-			}
-
-			myAssignedSlotsMu.Lock()
-			myAssignedSlots = newAssignedSlots
-			log.Println("Fetched slot assignments: ", newAssignedSlots)
-			rm.SetAssignedNodeAddress(myAssignedSlots)
-			myAssignedSlotsMu.Unlock()
-
-			//rm.primaryForSlots = newAssignedSlots
-			//log.Printf("INFO: Storage Node %s fetched and cached %d assigned slot ranges.", myStorageNodeID, len(myAssignedSlots))
-		}
-	}
-}
-
-// parseRequest parses a raw string command into a Request struct.
-// It's updated to handle 2PC commands, TEXT_SEARCH, and new SPATIAL commands.
-func parseRequest(raw string) (Request, error) {
-	parts := strings.Fields(raw)
-	if len(parts) == 0 {
-		return Request{}, fmt.Errorf("empty command")
+	// Ensure Raft data directory (base for logs and snapshots) exists
+	// Raft library itself might create subdirs, but good to ensure the main one.
+	raftDataPath := filepath.Join(*raftDir, myStorageNodeID, "raft_meta") // Specific subdir for raft's own db/snapshots
+	if err := os.MkdirAll(raftDataPath, 0700); err != nil {
+		return fmt.Errorf("failed to create Raft data directory %s: %w", raftDataPath, err)
 	}
 
-	command := strings.ToUpper(parts[0])
-	req := Request{Command: command, TxnID: 0} // Default TxnID to 0 for auto-commit
-
-	switch command {
-	case "PUT", "PUT_TEXT": // Handle PUT_TEXT
-		if len(parts) < 3 {
-			return Request{}, fmt.Errorf("%s requires key and value", command)
-		}
-		req.Key = parts[1]
-		req.Value = strings.Join(parts[2:], " ")
-	case "GET", "DELETE":
-		if len(parts) < 2 {
-			return Request{}, fmt.Errorf("%s requires a key", command)
-		}
-		req.Key = parts[1]
-	case "SHOW":
-		if len(parts) < 3 {
-			return Request{}, fmt.Errorf("%s requires a key and value", command)
-		}
-		req.Key = parts[1]
-		req.Value = parts[2]
-	case "SIZE":
-		// No additional arguments needed
-
-	case "GET_RANGE":
-		log.Println("RANGE QUERY: ", raw, parts)
-		if len(parts) < 2 {
-			return Request{}, fmt.Errorf("invalid range query, %s", req.Command)
-		}
-		req.StartKey = parts[0]
-		req.EndKey = parts[1]
-
-	case "TEXT_SEARCH": // Handle TEXT_SEARCH
-		if len(parts) < 2 {
-			return Request{}, fmt.Errorf("TEXT_SEARCH requires a query string")
-		}
-		req.Query = strings.Join(parts[1:], " ") // The rest is the query
-	case "PUT_SPATIAL": // NEW: Handle PUT_SPATIAL
-		if len(parts) < 6 {
-			return Request{}, fmt.Errorf("PUT_SPATIAL requires key, minX, minY, maxX, maxY")
-		}
-		req.Key = parts[1]
-		var err error
-		req.MinX, err = strconv.ParseFloat(parts[2], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid minX: %w", err)
-		}
-		req.MinY, err = strconv.ParseFloat(parts[3], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid minY: %w", err)
-		}
-		req.MaxX, err = strconv.ParseFloat(parts[4], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid maxX: %w", err)
-		}
-		req.MaxY, err = strconv.ParseFloat(parts[5], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid maxY: %w", err)
-		}
-	case "DELETE_SPATIAL": // NEW: Handle DELETE_SPATIAL
-		if len(parts) < 6 {
-			return Request{}, fmt.Errorf("DELETE_SPATIAL requires key, minX, minY, maxX, maxY")
-		}
-		req.Key = parts[1]
-		var err error
-		req.MinX, err = strconv.ParseFloat(parts[2], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid minX: %w", err)
-		}
-		req.MinY, err = strconv.ParseFloat(parts[3], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid minY: %w", err)
-		}
-		req.MaxX, err = strconv.ParseFloat(parts[4], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid maxX: %w", err)
-		}
-		req.MaxY, err = strconv.ParseFloat(parts[5], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid maxY: %w", err)
-		}
-	case "QUERY_SPATIAL": // NEW: Handle QUERY_SPATIAL
-		if len(parts) < 5 {
-			return Request{}, fmt.Errorf("QUERY_SPATIAL requires minX, minY, maxX, maxY")
-		}
-		var err error
-		req.MinX, err = strconv.ParseFloat(parts[1], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid minX: %w", err)
-		}
-		req.MinY, err = strconv.ParseFloat(parts[2], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid minY: %w", err)
-		}
-		req.MaxX, err = strconv.ParseFloat(parts[3], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid maxX: %w", err)
-		}
-		req.MaxY, err = strconv.ParseFloat(parts[4], 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid maxY: %w", err)
-		}
-	case "PREPARE":
-		if len(parts) < 3 {
-			return Request{}, fmt.Errorf("PREPARE requires TxnID and operations JSON")
-		}
-		txnID, err := strconv.ParseUint(parts[1], 10, 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid TxnID format: %w", err)
-		}
-		req.TxnID = txnID
-		req.Value = strings.Join(parts[2:], " ") // Operations JSON string
-	case "COMMIT", "ABORT":
-		if len(parts) < 2 {
-			return Request{}, fmt.Errorf("%s requires TxnID", command)
-		}
-		txnID, err := strconv.ParseUint(parts[1], 10, 64)
-		if err != nil {
-			return Request{}, fmt.Errorf("invalid TxnID format: %w", err)
-		}
-		req.TxnID = txnID
-	default:
-		return Request{}, fmt.Errorf("unknown command: %s", command)
-	}
-	return req, nil
-}
-
-// handleRequest processes a parsed Request and returns a Response.
-// It now includes 2PC command handling, TEXT_SEARCH, and SPATIAL commands.
-func handleRequest(req Request) Response {
-	var resp Response
-	var err error
-
-	// --- Sharding Awareness: Check if key belongs to this node (for data ops) ---
-	// 2PC commands (PREPARE, COMMIT, ABORT) are sent directly to the participant,
-	// so they don't need shard routing check here.
-	// TEXT_SEARCH and SPATIAL_QUERY are handled by any node (for V1), so they don't need shard routing check.
-	isDataOperation := req.Command == "PUT" || req.Command == "PUT_TEXT" || req.Command == "GET" || req.Command == "DELETE" ||
-		req.Command == "PUT_SPATIAL" || req.Command == "DELETE_SPATIAL" // Spatial operations also need sharding check for their key
-	if isDataOperation {
-		targetSlot := fsm.GetSlotForHashKey(req.Key)
-
-		myAssignedSlotsMu.RLock()
-		assignedToMe := false
-		for _, slotInfo := range myAssignedSlots {
-			if targetSlot >= slotInfo.StartSlot && targetSlot <= slotInfo.EndSlot {
-				if slotInfo.AssignedNodeID == myStorageNodeID {
-					assignedToMe = true
-					break
-				}
-				// If assigned to another node, we could return a REDIRECT message here
-				resp = Response{Status: "REDIRECT", Message: fmt.Sprintf("Key '%s' (slot %d) belongs to node %s.", req.Key, targetSlot, slotInfo.AssignedNodeID)}
-				myAssignedSlotsMu.RUnlock()
-				return resp
-			}
-		}
-		myAssignedSlotsMu.RUnlock()
-		log.Println("DEBUG: assignedToMe: ", assignedToMe)
-		// if !assignedToMe {
-		// 	resp = Response{Status: "ERROR", Message: fmt.Sprintf("Key '%s' (slot %d) does not belong to this node. No assignment found or assigned to unknown node.", req.Key, targetSlot)}
-		// 	return resp
-		// }
-	}
-	// --- End Sharding Awareness ---
-
-	switch req.Command {
-	case "PUT":
-		dbLock.Lock()                                          // Acquire write lock for PUT
-		err = dbInstance.Insert(req.Key, req.Value, req.TxnID) // Pass TxnID
-		dbLock.Unlock()                                        // Release write lock
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT failed: %v", err)}
-		} else {
-			resp = Response{Status: "OK", Message: "Key-value pair inserted/updated."}
-		}
-	case "PUT_TEXT": // Handle PUT_TEXT command
-		// Extract raw text from GOJODB.TEXT() wrapper
-		pureText := ""
-		if strings.HasPrefix(req.Value, gojoDBTextPrefix) && strings.HasSuffix(req.Value, gojoDBTextSuffix) {
-			pureText = req.Value[len(gojoDBTextPrefix) : len(req.Value)-len(gojoDBTextSuffix)]
-		} else {
-			resp = Response{Status: "ERROR", Message: "PUT_TEXT command requires value wrapped in GOJODB.TEXT()."}
-			return resp
-		}
-
-		// Insert into Inverted Index (non-transactional for V1)
-		if err := invertedIndexInstance.Insert(pureText, req.Key); err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_TEXT (inverted index part) failed: %v", err)}
-			return resp
-		}
-		log.Printf("INFO: Inverted Index: Indexed key '%s' with text '%s'", req.Key, pureText)
-
-		// Then, insert the original value (including wrapper) into the B-tree
-		dbLock.Lock()
-		err = dbInstance.Insert(req.Key, req.Value, req.TxnID)
-		dbLock.Unlock()
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_TEXT (B-tree part) failed: %v", err)}
-		} else {
-			resp = Response{Status: "OK", Message: "Key-value pair and text indexed."}
-		}
-	case "PUT_SPATIAL": // NEW: Handle PUT_SPATIAL command
-		rect := spatial.Rect{req.MinX, req.MinY, req.MaxX, req.MaxY}
-		sd := spatial.SpatialData{req.Key}
-		log.Println("Info: spatial request: ", req, sd)
-		if err := spatialIndexManager.Insert(rect, sd); err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_SPATIAL (spatial index part) failed: %v", err)}
-			return resp
-		}
-		log.Printf("INFO: Spatial Index: Indexed key '%s' with rect %v", req.Key, rect)
-
-		// Also store the spatial data as a JSON string in the B-tree
-		rectJSON, marshalErr := json.Marshal(rect)
-		if marshalErr != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_SPATIAL failed to marshal rect to JSON: %v", marshalErr)}
-			return resp
-		}
-		dbLock.Lock()
-		err = dbInstance.Insert(req.Key, string(rectJSON), req.TxnID)
-		dbLock.Unlock()
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("PUT_SPATIAL (B-tree part) failed: %v", err)}
-		} else {
-			resp = Response{Status: "OK", Message: "Spatial data indexed and stored."}
-		}
-	case "GET":
-		dbLock.RLock() // Acquire read lock for GET
-		val, found, searchErr := dbInstance.Search(req.Key)
-		dbLock.RUnlock() // Release read lock
-		if searchErr != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("GET failed: %v", searchErr)}
-		} else if found {
-			resp = Response{Status: "OK", Message: val}
-		} else {
-			resp = Response{Status: "NOT_FOUND", Message: fmt.Sprintf("Key '%s' not found.", req.Key)}
-		}
-	case "GET_RANGE":
-		if strings.TrimSpace(req.StartKey) == "" || strings.TrimSpace(req.EndKey) == "" {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Invalid startKey = '%s'and endKey = '%s'", req.StartKey, req.EndKey)}
-		}
-		dbLock.RLock() // Abort releases locks, not acquires DB lock
-		var iterator btree_core.BTreeIterator[string, string]
-		var err error
-		if req.StartKey == "*" || req.EndKey == "*" {
-			iterator, err = dbInstance.FullScan()
-		} else {
-			iterator, err = dbInstance.Iterator(req.StartKey, req.EndKey)
-		}
-		dbLock.RUnlock()
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Failed to create iterator: %v", err)}
-		} else {
-			var result []Entry
-			for {
-				key, val, isNext, iterErr := iterator.Next()
-				if iterErr != nil || !isNext {
-					log.Println("ITERATOR NEXT: ", isNext, iterErr)
-					break
-				}
-				result = append(result, Entry{Key: key, Value: val})
-				log.Println("RESPONSE: ", result)
-			}
-			b, _ := json.Marshal(result)
-			resp = Response{Status: "OK", Message: string(b)}
-			iterator.Close()
-		}
-	case "TEXT_SEARCH": // Handle TEXT_SEARCH command
-		// Perform search on the inverted index
-		resultKeys, searchErr := invertedIndexInstance.Search(req.Query) // Capture error from InvertedIndex.Search
-		if searchErr != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Text search failed: %v", searchErr)}
-			return resp
-		}
-		log.Printf("INFO: Inverted Index: Search for '%s' returned %d keys.", req.Query, len(resultKeys))
-
-		var foundEntries []Entry
-		// For each key found in the inverted index, retrieve the full entry from the B-tree
-		for _, key := range resultKeys {
-			dbLock.RLock() // Acquire read lock for B-tree GET
-			val, found, searchErr := dbInstance.Search(key)
-			dbLock.RUnlock() // Release read lock
-			if searchErr != nil {
-				log.Printf("ERROR: TEXT_SEARCH: Failed to retrieve key '%s' from B-tree: %v", key, searchErr)
-				continue // Continue to next key
-			}
-			if found {
-				foundEntries = append(foundEntries, Entry{Key: key, Value: val})
-			}
-		}
-
-		// Marshal the list of found entries into JSON
-		entriesJSON, marshalErr := json.Marshal(foundEntries)
-		if marshalErr != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Failed to marshal search results: %v", marshalErr)}
-		} else {
-			resp = Response{Status: "OK", Message: string(entriesJSON)}
-		}
-	case "QUERY_SPATIAL": // NEW: Handle QUERY_SPATIAL command
-		queryRect := spatial.Rect{
-			req.MinX, req.MinY, req.MaxX, req.MaxY,
-		}
-		results, queryErr := spatialIndexManager.Query(queryRect)
-		if queryErr != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("QUERY_SPATIAL failed: %v", queryErr)}
-			return resp
-		}
-		log.Printf("INFO: Spatial Index: Query for %v returned %d results.", queryRect, len(results))
-
-		// Marshal the spatial data results (SpatialData contains ID and Rect)
-		resultsJSON, marshalErr := json.Marshal(results)
-		if marshalErr != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Failed to marshal spatial query results: %v", marshalErr)}
-		} else {
-			resp = Response{Status: "OK", Message: string(resultsJSON)}
-		}
-	case "DELETE":
-		dbLock.Lock()                               // Acquire write lock for DELETE
-		err = dbInstance.Delete(req.Key, req.TxnID) // Pass TxnID
-		dbLock.Unlock()                             // Release write lock
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE failed: %v", err)}
-		} else {
-			resp = Response{Status: "OK", Message: "Key deleted."}
-		}
-	case "DELETE_SPATIAL": // NEW: Handle DELETE_SPATIAL command
-		rect := spatial.Rect{req.MinX, req.MinY, req.MaxX, req.MaxY}
-		// if err := spatialIndexManager.DeleteSpatialData(req.Key, rect); err != nil {
-		// 	resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE_SPATIAL (spatial index part) failed: %v", err)}
-		// 	return resp
-		// }
-		log.Printf("INFO: Spatial Index: Deleted key '%s' with rect %v", req.Key, rect)
-
-		// Also delete from the B-tree
-		dbLock.Lock()
-		err = dbInstance.Delete(req.Key, req.TxnID)
-		dbLock.Unlock()
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("DELETE_SPATIAL (B-tree part) failed: %v", err)}
-		} else {
-			resp = Response{Status: "OK", Message: "Spatial data deleted."}
-		}
-	case "SIZE":
-		// SIZE command is global to this node's local B-tree, not sharded.
-		dbLock.RLock() // Acquire read lock for SIZE
-		size, sizeErr := dbInstance.GetSize()
-		dbLock.RUnlock() // Release read lock
-		if sizeErr != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("SIZE failed: %v", sizeErr)}
-		} else {
-			resp = Response{Status: "OK", Message: fmt.Sprintf("%d", size)}
-		}
-	// --- 2PC Command Handlers ---
-	case "PREPARE":
-		// Operations are passed as a JSON string in req.Value
-		log.Println("Server Operations: ", req.Value)
-		ops, jsonErr := deserializeOperations(req.Value)
-		if jsonErr != nil {
-			resp = Response{Status: "VOTE_ABORT", Message: fmt.Sprintf("Invalid operations JSON for PREPARE: %v", jsonErr)}
-			return resp
-		}
-		log.Println("DEBUG: deserialize: ", ops, jsonErr)
-		dbLock.Lock() // Prepare needs to acquire locks on keys, not the whole DB
-		// The B-tree's Prepare method will handle key-level locking.
-		err = dbInstance.Prepare(req.TxnID, ops)
-		dbLock.Unlock()
-		if err != nil {
-			resp = Response{Status: "VOTE_ABORT", Message: fmt.Sprintf("PREPARE failed for Txn %d: %v", req.TxnID, err)}
-		} else {
-			resp = Response{Status: "VOTE_COMMIT", Message: fmt.Sprintf("Txn %d prepared.", req.TxnID)}
-		}
-	case "COMMIT":
-		// dbLock.Lock() // Commit releases locks, not acquires DB lock
-		err = dbInstance.Commit(req.TxnID)
-		// dbLock.Unlock()
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("COMMIT failed for Txn %d: %v", req.TxnID, err)}
-		} else {
-
-			resp = Response{Status: "COMMITTED", Message: fmt.Sprintf("Txn %d committed.", req.TxnID)}
-
-		}
-	case "ABORT":
-		// dbLock.Lock() // Abort releases locks, not acquires DB lock
-		err = dbInstance.Abort(req.TxnID)
-		// dbLock.Unlock()
-		if err != nil {
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("ABORT failed for Txn %d: %v", req.TxnID, err)}
-		} else {
-			resp = Response{Status: "ABORTED", Message: fmt.Sprintf("Txn %d aborted.", req.TxnID)}
-		}
-
-	case "SHOW":
-		switch req.Key {
-		case "CONFIG":
-			switch req.Value {
-			case "REPLICA_PORT":
-				parts := strings.Split(myStorageNodeAddr, ":")
-				response := fmt.Sprintf("%s:%s %s:%s", parts[0], os.Getenv("BTREE_REPLICATION_LISTEN_PORT"), parts[0], os.Getenv("INVERTED_IDX_REPLICATION_LISTEN_PORT"))
-				resp = Response{Status: "OK", Message: response}
-				// log.Println("SHOW CONFIG REPLICA_PORT: ", resp)
-			default:
-				resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Value)}
-			}
-		default:
-			resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Key)}
-		}
-	default:
-		resp = Response{Status: "ERROR", Message: fmt.Sprintf("Unsupported command: %s", req.Command)}
-	}
-	return resp
-}
-
-// handleConnection manages a single client connection.
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
-	// log.Printf("INFO: Client connected to Storage Node %s: %s", myStorageNodeID, conn.RemoteAddr().String())
-
-	reader := bufio.NewReader(conn)
-	for {
-		// Read client command, delimited by newline
-		netData, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				// log.Printf("INFO: Client disconnected from Storage Node %s: %s", myStorageNodeID, conn.RemoteAddr().String())
-			} else {
-				log.Printf("ERROR: Error reading from client %s: %v", conn.RemoteAddr().String(), err)
-			}
-			return
-		}
-
-		rawCommand := strings.TrimSpace(netData)
-		if rawCommand == "" {
-			continue // Ignore empty lines
-		}
-		// log.Printf("DEBUG: Received command from %s: '%s'", conn.RemoteAddr().String(), rawCommand)
-
-		// Parse request
-		req, err := parseRequest(rawCommand)
-		if err != nil {
-			resp := Response{Status: "ERROR", Message: fmt.Sprintf("Invalid request: %v", err)}
-			_, writeErr := conn.Write([]byte(fmt.Sprintf("%s %s\n", resp.Status, resp.Message)))
-			if writeErr != nil {
-				log.Printf("ERROR: Error writing response to client: %v", writeErr)
-			}
-			continue
-		}
-
-		// Process request
-		resp := handleRequest(req)
-
-		// Send response back to client
-		responseString := fmt.Sprintf("%s %s\n", resp.Status, resp.Message)
-		_, writeErr := conn.Write([]byte(responseString))
-		if writeErr != nil {
-			log.Printf("ERROR: Error writing response to client: %v", writeErr)
-		}
-	}
-}
-
-// serializeOperations is a helper to serialize a list of operations for sending to Storage Nodes.
-// This is used by the API Service (Coordinator) to send operations to participants.
-func serializeOperations(ops []btree_core.TransactionOperation) string {
-	var builder strings.Builder
-	for i, op := range ops {
-		opJSON, _ := json.Marshal(op) // Should handle errors in production
-		builder.WriteString(string(opJSON))
-		if i < len(ops)-1 {
-			builder.WriteString("|") // Delimiter between operations
-		}
-	}
-	return builder.String()
-}
-
-// deserializeOperations is a helper to deserialize a list of operations from a string.
-// This is used by the Storage Node (Participant) to receive operations from the Coordinator.
-func deserializeOperations(s string) ([]btree_core.TransactionOperation, error) {
-	var ops TransactionOperations
-	if err := json.Unmarshal([]byte(s), &ops); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal operation part '%s': %w", s, err)
-	}
-
-	return ops.Operations, nil
-}
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
-
-	// --- Initialize Storage Node ---
-	if err := initStorageNode(); err != nil {
-		log.Fatalf("FATAL: Storage Node initialization failed: %v", err)
-	}
-	defer closeStorageNode() // Ensure database is closed on program exit
-
-	// Start TCP listener for client requests
-	listener, err := net.Listen("tcp", myStorageNodeAddr)
+	// Setup Raft communication transport
+	addr, err := net.ResolveTCPAddr("tcp", *raftAddr)
 	if err != nil {
-		log.Fatalf("FATAL: Error listening on %s: %v", myStorageNodeAddr, err)
+		return fmt.Errorf("failed to resolve raft address %s: %w", *raftAddr, err)
+	}
+	transport, err := raft.NewTCPTransport(*raftAddr, addr, RaftTransportMaxPool, RaftTransportTimeout, zlogger.Named("raft-transport").Sugar()) // Pass a logger to transport
+	if err != nil {
+		return fmt.Errorf("failed to create raft TCP transport: %w", err)
+	}
+
+	// Create snapshot store
+	snapshots, err := raft.NewFileSnapshotStore(raftDataPath, RaftSnapShotRetain, zlogger.Named("raft-snapshot").Sugar())
+	if err != nil {
+		return fmt.Errorf("failed to create snapshot store at %s: %w", raftDataPath, err)
+	}
+
+	// Create log store and stable store (BoltDB)
+	boltDBPath := filepath.Join(raftDataPath, "raft.db")
+	boltDB, err := raftboltdb.NewBoltStore(boltDBPath)
+	if err != nil {
+		return fmt.Errorf("failed to create bolt store at %s: %w", boltDBPath, err)
+	}
+
+	// Instantiate Raft
+	raftNode, err = raft.NewRaft(config, raftFSM, boltDB, boltDB, snapshots, transport)
+	if err != nil {
+		return fmt.Errorf("failed to create raft node: %w", err)
+	}
+
+	if *bootstrap {
+		zlogger.Info("Bootstrapping Raft cluster as the first node...")
+		configuration := raft.Configuration{
+			Servers: []raft.Server{
+				{
+					ID:      config.LocalID,
+					Address: transport.LocalAddr(), // Use the address the transport is actually listening on
+				},
+			},
+		}
+		bootstrapFuture := raftNode.BootstrapCluster(configuration)
+		if err := bootstrapFuture.Error(); err != nil {
+			return fmt.Errorf("failed to bootstrap raft cluster: %w", err)
+		}
+		zlogger.Info("Raft cluster bootstrapped successfully.")
+	} else if *controllerAddr != "" {
+		// Attempt to join an existing cluster via the controller.
+		// This is a non-blocking attempt; FSM might also handle joining later.
+		// This call to joinRaftCluster should not block startup indefinitely.
+		go func() { // Run in a goroutine to avoid blocking main startup
+			if err := joinRaftClusterViaController(); err != nil {
+				zlogger.Warn("Failed to join Raft cluster via controller on initial attempt", zap.Error(err), zap.String("controllerAddr", *controllerAddr))
+			}
+		}()
+	} else {
+		zlogger.Warn("Node is not bootstrapping and no controller address provided. It might remain isolated unless manually joined.")
+	}
+	return nil
+}
+
+// listenForReplicationRequests handles incoming connections from primaries that want to stream logs.
+func listenForReplicationRequests() {
+	defer globalWG.Done()
+	listenAddress := ":" + *replicationPort // Listen on all interfaces on the replication port
+	listener, err := net.Listen("tcp", listenAddress)
+	if err != nil {
+		zlogger.Error("CRITICAL: Failed to start replication listener, node cannot receive replicated data", zap.Error(err), zap.String("address", listenAddress))
+		return // Cannot proceed if listener fails
 	}
 	defer listener.Close()
-
-	log.Printf("INFO: GojoDB Storage Node %s listening for client traffic on %s", myStorageNodeID, myStorageNodeAddr)
-	log.Println("INFO: Commands:")
-	log.Println("  - PUT <key> <value>")
-	log.Println("  - PUT_TEXT <key> GOJODB.TEXT(<value>)")
-	log.Println("  - PUT_SPATIAL <key> <minX> <minY> <maxX> <maxY>")
-	log.Println("  - GET <key>")
-	log.Println("  - GET_RANGE <start_key> <end_key>")
-	log.Println("  - DELETE <key>")
-	log.Println("  - DELETE_SPATIAL <key> <minX> <minY> <maxX> <maxY>")
-	log.Println("  - SIZE")
-	log.Println("  - TEXT_SEARCH <query>")
-	log.Println("  - QUERY_SPATIAL <minX> <minY> <maxX> <maxY>")
-	log.Println("  - 2PC Commands (from Coordinator only): PREPARE <TxnID> <ops_json>, COMMIT <TxnID>, ABORT <TxnID>")
+	zlogger.Info("Replication listener started, waiting for connections from primaries.", zap.String("address", listenAddress))
 
 	for {
-		// Accept incoming connections
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("ERROR: Error accepting connection: %v", err)
+			// Check if the listener was closed, e.g., during shutdown
+			select {
+			case <-raftFSM.ShutdownChan(): // Assuming FSM has a shutdown channel or similar signal
+				zlogger.Info("Replication listener shutting down.")
+				return
+			default:
+				zlogger.Error("Failed to accept replication connection", zap.Error(err))
+				// Avoid busy-looping on non-temporary errors
+				if ne, ok := err.(net.Error); ok && !ne.Temporary() {
+					zlogger.Error("Non-temporary error accepting replication connection, listener might be broken.", zap.Error(err))
+					return
+				}
+				time.Sleep(100 * time.Millisecond) // Brief pause before retrying accept
+				continue
+			}
+		}
+		zlogger.Info("Accepted new replication connection", zap.String("from", conn.RemoteAddr().String()))
+		globalWG.Add(1) // Increment for the connection handler goroutine
+		go handleReplicationConnection(conn)
+	}
+}
+
+// handleReplicationConnection demultiplexes the connection based on an initial handshake message (IndexType).
+func handleReplicationConnection(conn net.Conn) {
+	defer globalWG.Done() // Decrement when handler finishes
+	defer conn.Close()    // Ensure connection is closed
+
+	// Read the first message to determine the IndexType for handshake
+	if err := conn.SetReadDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+		zlogger.Warn("Failed to set read deadline for handshake", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
+		// Continue, but handshake might fail due to other reasons
+	}
+
+	buffer := make([]byte, 128) // Buffer for IndexType string
+	n, err := conn.Read(buffer)
+	if err != nil {
+		if err == io.EOF {
+			zlogger.Info("Replication connection closed by remote before handshake", zap.String("remoteAddr", conn.RemoteAddr().String()))
+		} else {
+			zlogger.Error("Failed to read handshake from replication connection", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
+		}
+		return
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil { // Clear the deadline
+		zlogger.Warn("Failed to clear read deadline after handshake", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
+	}
+
+	indexTypeStr := string(buffer[:n])
+	indexType := logreplication.IndexType(indexTypeStr)
+	zlogger.Info("Received replication handshake", zap.String("indexType", indexTypeStr), zap.String("from", conn.RemoteAddr().String()))
+
+	// Find the appropriate replication manager
+	repMgr, ok := indexReplicationManagers[indexType]
+	if !ok {
+		zlogger.Error("No replication manager found for index type from remote", zap.String("indexType", indexTypeStr), zap.String("from", conn.RemoteAddr().String()))
+		errMsg := fmt.Sprintf("ERROR: unsupported index type %s\n", indexTypeStr)
+		_, writeErr := conn.Write([]byte(errMsg))
+		if writeErr != nil {
+			zlogger.Error("Failed to send error message to remote for unsupported index type", zap.Error(writeErr), zap.String("remoteAddr", conn.RemoteAddr().String()))
+		}
+		return
+	}
+
+	zlogger.Info("Passing connection to specific replication manager", zap.String("indexType", indexTypeStr), zap.String("managerType", fmt.Sprintf("%T", repMgr)))
+	// HandleInboundStream is expected to be a blocking call or manage its own goroutines
+	// for the lifetime of the stream. The connection is owned by it now.
+	if err := repMgr.HandleInboundStream(conn); err != nil {
+		zlogger.Error("Error from HandleInboundStream of manager", zap.Error(err), zap.String("indexType", indexTypeStr), zap.String("remoteAddr", conn.RemoteAddr().String()))
+	} else {
+		zlogger.Info("HandleInboundStream finished for manager", zap.String("indexType", indexTypeStr), zap.String("remoteAddr", conn.RemoteAddr().String()))
+	}
+}
+
+func joinRaftClusterViaController() error {
+	zlogger.Info("Attempting to join Raft cluster via controller", zap.String("controllerAddr", *controllerAddr))
+	joinReq := struct {
+		NodeID   string `json:"node_id"`
+		RaftAddr string `json:"raft_addr"`
+	}{
+		NodeID:   myStorageNodeID,
+		RaftAddr: *raftAddr,
+	}
+	reqBody, err := json.Marshal(joinReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal join request: %w", err)
+	}
+
+	// TODO: Make controller URL path configurable if necessary
+	resp, err := http.Post(fmt.Sprintf("http://%s/raft/join", *controllerAddr), "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to send join request to controller at %s: %w", *controllerAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("controller returned non-OK status for join request: %s - %s", resp.Status, string(bodyBytes))
+	}
+
+	zlogger.Info("Successfully requested to join Raft cluster via controller. Leader will attempt to add this node.")
+	return nil
+}
+
+// initialFetchShardMapFromController tries to get the shard map once at startup.
+// Subsequent updates should come via Raft FSM.
+func initialFetchShardMapFromController() {
+	defer globalWG.Done()
+	zlogger.Info("Attempting initial fetch of shard map from controller", zap.String("controllerAddr", *controllerAddr))
+
+	// Wait for Raft to potentially elect a leader, or for this node to join.
+	// A short delay might be useful, or check raftNode.Leader().
+	time.Sleep(10 * time.Second) // Initial delay before first fetch attempt
+
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if raftNode.State() == raft.Shutdown {
+			zlogger.Info("Raft is shut down, aborting initial shard map fetch.")
+			return
+		}
+
+		// The FSM's Apply method is the one that should call BecomePrimary/Replica on managers.
+		// This function just triggers the FSM to potentially update its state if the controller provides new info.
+		// The actual shard map application must go through Raft log for consistency.
+		// The FSM itself could expose a method to trigger a re-fetch/re-evaluation based on controller data,
+		// which then proposes a Raft command.
+		// For now, let's assume the controller provides the shard map and the FSM on the LEADER
+		// processes this and disseminates it via Raft log.
+		// This node, upon applying that log entry, will update its roles.
+
+		// This is a simplified view. In a robust system, the controller might push updates,
+		// or the leader periodically queries the controller and proposes changes to the FSM.
+		// For now, this function will just log the intent. The FSM handles the actual role changes.
+
+		// Example: Make a GET request to the controller for the shard map.
+		// The response would then be proposed as a command to the Raft cluster.
+		// This proposal should ideally be done by the leader.
+		// If this node is the leader, it can propose. Otherwise, it might need to route to leader.
+
+		resp, err := http.Get(fmt.Sprintf("http://%s/shardmap", *controllerAddr))
+		if err != nil {
+			zlogger.Warn("Failed to fetch shard map from controller", zap.Error(err), zap.Int("attempt", i+1))
+			time.Sleep(ControllerRetryDelay)
 			continue
 		}
-		// Handle connections in a new goroutine
-		go handleConnection(conn)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			zlogger.Warn("Controller returned non-OK for shard map", zap.String("status", resp.Status), zap.ByteString("body", bodyBytes), zap.Int("attempt", i+1))
+			time.Sleep(ControllerRetryDelay)
+			continue
+		}
+		// var shardMap fsm.ClusterShardMap // Assuming fsm.ClusterShardMap is the structure
+		// if err := json.NewDecoder(resp.Body).Decode(&shardMap); err != nil {
+		//  zlogger.Error("Failed to decode shard map from controller", zap.Error(err))
+		//  time.Sleep(ControllerRetryDelay)
+		//  continue
+		// }
+		// zlogger.Info("Successfully fetched initial shard map from controller (data not applied here, FSM handles via Raft log)", zap.Any("shardMapPreview", shardMap.Version)) // Log a preview
+		//
+		// // Now, the leader should propose this shardMap as a Raft command.
+		// // if raftNode.State() == raft.Leader {
+		// //  cmd := fsm.Command{Type: fsm.CommandUpdateShardMap, ShardMap: shardMap}
+		// //  cmdBytes, _ := json.Marshal(cmd)
+		// //  applyFuture := raftNode.Apply(cmdBytes, 5*time.Second)
+		// //  if err := applyFuture.Error(); err != nil {
+		// //      zlogger.Error("Failed to apply initial shard map update via Raft", zap.Error(err))
+		// //  } else {
+		// //      zlogger.Info("Initial shard map update proposed to Raft cluster.")
+		// //  }
+		// // }
+		// return // Success or handled by leader.
+		zlogger.Info("Initial shard map fetch logic placeholder: FSM is responsible for updates via Raft log based on controller state or leader actions.")
+		return // Placeholder for now.
 	}
+	zlogger.Warn("Failed to fetch initial shard map from controller after multiple retries.")
+}
+
+func closeStorageNode() {
+	zlogger.Info("Initiating shutdown of GojoDB storage node components...")
+
+	// 1. Stop Raft node first to prevent new FSM applications
+	if raftNode != nil {
+		zlogger.Info("Shutting down Raft node...")
+		shutdownFuture := raftNode.Shutdown() // This is async
+		if err := shutdownFuture.Error(); err != nil {
+			zlogger.Error("Error during Raft node shutdown", zap.Error(err))
+		} else {
+			zlogger.Info("Raft node shut down successfully.")
+		}
+	}
+
+	// 2. Stop all index replication managers
+	if indexReplicationManagers != nil {
+		for idxType, repMgr := range indexReplicationManagers {
+			zlogger.Info("Stopping replication manager", zap.String("indexType", string(idxType)))
+			if err := repMgr.Stop(); err != nil {
+				zlogger.Error("Error stopping replication manager", zap.String("indexType", string(idxType)), zap.Error(err))
+			}
+		}
+		zlogger.Info("All replication managers stopped.")
+	}
+
+	// 3. Close FSM (if it has resources to release)
+	if raftFSM != nil {
+		zlogger.Info("Closing FSM...")
+		// raftFSM.Close() // Assuming FSM has a Close method
+		// For now, FSM's resources are tied to index instances and log managers.
+	}
+
+	// 4. Close index instances
+	if dbInstance != nil {
+		zlogger.Info("Closing B-tree instance...")
+		if err := dbInstance.Close(); err != nil {
+			zlogger.Error("Error closing B-tree instance", zap.Error(err))
+		}
+	}
+	if invertedIndexInstance != nil {
+		zlogger.Info("Closing Inverted Index instance...")
+		if err := invertedIndexInstance.Close(); err != nil { // Assuming Close method exists
+			zlogger.Error("Error closing Inverted Index instance", zap.Error(err))
+		}
+	}
+	if spatialIdx != nil {
+		zlogger.Info("Closing Spatial Index instance...")
+		if err := spatialIdx.Close(); err != nil { // Assuming Close method exists
+			zlogger.Error("Error closing Spatial Index instance", zap.Error(err))
+		}
+	}
+
+	// 5. Close Tiered Storage Manager
+	if tieredStorageManager != nil {
+		zlogger.Info("Closing Tiered Storage Manager...")
+		if err := tieredStorageManager.Close(); err != nil {
+			zlogger.Error("Error closing Tiered Storage Manager", zap.Error(err))
+		}
+	}
+
+	// 6. Close Log Managers (main, and any specific ones like spatialLm)
+	if logManager != nil {
+		zlogger.Info("Closing Main Log Manager...")
+		if err := logManager.Close(); err != nil {
+			zlogger.Error("Error closing Main Log Manager", zap.Error(err))
+		}
+	}
+	// spatialLm was used for spatialIdx. If spatialIdx.Close() handles its LM, this might be redundant.
+	// Assuming specific log managers are closed by their users or need explicit closing if shared.
+	// For spatialLm, if spatial.NewIndexManager took ownership, its Close should handle it.
+	// If not, spatialLm needs to be closed here. (Let's assume spatialIdx.Close handles its own LM)
+
+	// 7. Stop gRPC and HTTP servers (these are stopped via their goroutines upon signal)
+	// The main function waits on globalWG for these to complete.
+	// Initiating graceful stop here if not already handled by signal handler's context.
+	if grpcServer != nil {
+		zlogger.Info("Attempting graceful stop of gRPC server...")
+		grpcServer.GracefulStop() // This will signal the gRPC server goroutine to exit
+	}
+	if httpServer != nil {
+		zlogger.Info("Attempting graceful shutdown of HTTP server...")
+		ctx, cancel := context.WithTimeout(context.Background(), HttpServerStopTimeout)
+		defer cancel()
+		if err := httpServer.Shutdown(ctx); err != nil {
+			zlogger.Error("Error during HTTP server shutdown", zap.Error(err))
+		}
+	}
+
+	zlogger.Info("Storage node components closed/stopped.")
+}
+
+// RaftLoggerAdapter adapts zap.Logger to raft.Logger interface
+type RaftLoggerAdapter struct {
+	logger *zap.SugaredLogger
+}
+
+func NewRaftLoggerAdapter(logger *zap.Logger) *RaftLoggerAdapter {
+	return &RaftLoggerAdapter{logger: logger.Sugar()}
+}
+func (l *RaftLoggerAdapter) Debug(msg string, args ...interface{}) { l.logger.Debugf(msg, args...) }
+func (l *RaftLoggerAdapter) Info(msg string, args ...interface{})  { l.logger.Infof(msg, args...) }
+func (l *RaftLoggerAdapter) Warn(msg string, args ...interface{})  { l.logger.Warnf(msg, args...) }
+func (l *RaftLoggerAdapter) Error(msg string, args ...interface{}) { l.logger.Errorf(msg, args...) }
+
+func startGRPCServer() {
+	defer globalWG.Done()
+	lis, err := net.Listen("tcp", *grpcAddr)
+	if err != nil {
+		zlogger.Fatal("Failed to listen for gRPC", zap.Error(err), zap.String("address", *grpcAddr))
+	}
+
+	// Create gRPC server with interceptors for logging and recovery
+	grpcServer = grpc.NewServer(
+	// grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+	//  grpc_zap.UnaryServerInterceptor(zlogger),
+	//  // Add other interceptors like recovery, auth, etc.
+	// )),
+	)
+
+	// Register services
+	pb.RegisterBasicServiceServer(grpcServer, basic_api.NewBasicServer(dbInstance, zlogger))
+	pb.RegisterIndexedWriteServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
+	pb.RegisterIndexedReadServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
+	// pb.RegisterAggregationServiceServer(grpcServer, &aggregationServiceServerImpl{})
+	// pb.RegisterBulkWriteServiceServer(grpcServer, &bulkWriteServiceServerImpl{})
+
+	zlogger.Info("gRPC server starting", zap.String("address", *grpcAddr))
+	if err := grpcServer.Serve(lis); err != nil {
+		// Log error unless it's the common "server closed" error during graceful shutdown
+		if !strings.Contains(err.Error(), "Server closed") {
+			zlogger.Error("gRPC server failed to serve", zap.Error(err))
+		} else {
+			zlogger.Info("gRPC server stopped gracefully.")
+		}
+	}
+}
+
+func startHTTPServer() {
+	defer globalWG.Done()
+	mux := http.NewServeMux()
+
+	// GraphQL endpoint
+	gqlResolver := gqlserver.NewResolver(dbInstance, invertedIndexInstance, spatialIdx, zlogger)
+	srv := handler.NewDefaultServer(generated.NewExecutableSchema(generated.Config{Resolvers: gqlResolver}))
+	mux.Handle("/query", srv)                                                     // GraphQL queries
+	mux.Handle("/playground", playground.Handler("GraphQL playground", "/query")) // Interactive playground
+
+	// Health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	// Raft status (example, might need more secure access)
+	mux.HandleFunc("/raft/stats", func(w http.ResponseWriter, r *http.Request) {
+		if raftNode == nil {
+			http.Error(w, "Raft not initialized", http.StatusInternalServerError)
+			return
+		}
+		stats := raftNode.Stats()
+		json.NewEncoder(w).Encode(stats)
+	})
+	mux.HandleFunc("/raft/leader", func(w http.ResponseWriter, r *http.Request) {
+		if raftNode == nil {
+			http.Error(w, "Raft not initialized", http.StatusInternalServerError)
+			return
+		}
+		leaderAddr, leaderID := raftNode.LeaderWithID()
+		json.NewEncoder(w).Encode(map[string]interface{}{"leader_addr": leaderAddr, "leader_id": leaderID})
+	})
+
+	httpServer = &http.Server{
+		Addr:    *httpAddr,
+		Handler: mux,
+	}
+
+	zlogger.Info("HTTP server (GraphQL, Health) starting", zap.String("address", *httpAddr))
+	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		zlogger.Error("HTTP server failed to serve or closed unexpectedly", zap.Error(err))
+	} else {
+		zlogger.Info("HTTP server stopped gracefully.")
+	}
+}
+
+func setupSignalHandling() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-signals
+		zlogger.Info("Received signal, initiating graceful shutdown", zap.String("signal", sig.String()))
+
+		// Start shutdown sequence
+		closeStorageNode()
+
+		// If there are other goroutines managed by globalWG that closeStorageNode doesn't explicitly stop,
+		// they should also check a global shutdown channel or context.
+		// For now, closeStorageNode is assumed to handle stopping most things directly or indirectly.
+
+		// Give some time for graceful shutdown before forceful exit (optional)
+		// time.AfterFunc(30*time.Second, func() {
+		//  zlogger.Fatal("Graceful shutdown timed out, forcing exit.")
+		// })
+	}()
 }

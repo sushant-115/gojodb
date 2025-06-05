@@ -3,323 +3,880 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
-	"hash/crc32" // For CRC32 hashing
+	"hash/crc32"
 	"io"
-	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
+	logreplication "github.com/sushant-115/gojodb/core/replication/log_replication"
+	"github.com/sushant-115/gojodb/core/storage_engine/tiered_storage" // For TieredDataMetadata
+	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"go.uber.org/zap"
 )
 
-// LogCommand defines the structure of commands applied to the FSM via Raft.
-// This is what gets replicated.
-type LogCommand struct {
-	Op    string `json:"op"`    // Operation type (e.g., "set_metadata", "add_node", "assign_slot_range")
-	Key   string `json:"key"`   // Key for the operation (e.g., metadata key, node ID, slot range string "start-end")
-	Value string `json:"value"` // Value for the operation (e.g., metadata value, node address, JSON-marshaled SlotRangeInfo)
-}
+// CommandType defines the type of command to be applied to the FSM.
+type CommandType uint8
 
-// Operation types for the FSM
 const (
-	OpSetMetadata       = "set_metadata"
-	OpDeleteMetadata    = "delete_metadata"
-	OpAddStorageNode    = "add_storage_node"
-	OpRemoveStorageNode = "remove_node"
-	OpUpdateNodeStatus  = "update_node_status"
+	CommandNoOp                  CommandType = iota // Ensure NoOp is 0 for safety
+	CommandRegisterNode                             // Storage node registers with controller/FSM
+	CommandUpdateNodeStatus                         // Storage node sends heartbeat/status
+	CommandAssignSlot                               // Assign a shard/slot to a node (making it primary)
+	CommandAddReplicaToSlot                         // Add a replica to a shard/slot
+	CommandRemoveReplicaFromSlot                    // Remove a replica
+	CommandSetSlotPrimary                           // Explicitly set a new primary for a slot (for failover)
 
-	// --- Hash Sharding Operations ---
-	OpAssignSlotRange = "assign_slot_range" // Assigns a range of slots to a storage node
-	OpSplitSlotRange  = "split_slot_range"  // Splits an existing slot range into new ones
-	OpRemoveSlotRange = "remove_slot_range" // Removes a slot range (e.g., after merge or rebalance)
+	// Tiered Storage Commands
+	CommandUpdateTieringMetadata // Create or update metadata for a tiered data unit
+	CommandDeleteTieringMetadata // Delete metadata for a tiered data unit
+	CommandUpdateDLMPolicy       // Add or update a DLM policy
+	CommandDeleteDLMPolicy       // Delete a DLM policy
 
-	// Replication Operations ---
-	OpSetPrimaryReplica = "set_primary_replica" // Assigns primary and replica(s) for a slot range
-	OpPromoteReplica    = "promote_replica"     // Promotes a replica to primary
-	OpRemoveReplica     = "remove_replica"      // Removes a replica from a slot range
+	// Replica Onboarding Commands (tracking states from Blueprint Table 2)
+	CommandInitiateReplicaOnboarding    // Starts the process
+	CommandUpdateReplicaOnboardingState // Source/Target nodes report progress
+
+	// Shard Rebalancing Commands (tracking states from Blueprint Table 3)
+	CommandInitiateShardMigration    // Starts shard migration
+	CommandUpdateShardMigrationState // Source/Target/Controller updates migration progress
+	CommandCommitShardMigration      // Atomically changes shard ownership in SlotAssignments
+
+	// TODO: Add other command types as needed (e.g., for cluster config changes)
 )
 
-// TotalHashSlots defines the fixed number of hash slots for sharding.
-const TotalHashSlots = 1024 // A common number in distributed systems (e.g., Redis uses 16384)
+var TotalHashSlots uint32 = 1024
 
-// SlotRangeInfo defines the metadata for a contiguous range of hash slots.
-// It is designed to be JSON serializable for storage in Raft logs.
-type SlotRangeInfo struct {
-	RangeID        string    `json:"range_id"`         // Unique ID for this slot range (e.g., "0-1023", "512-767")
-	StartSlot      int       `json:"start_slot"`       // Inclusive start slot
-	EndSlot        int       `json:"end_slot"`         // Inclusive end slot
-	AssignedNodeID string    `json:"assigned_node_id"` // ID of the Storage Node currently hosting this slot range
-	Status         string    `json:"status"`           // e.g., "active", "migrating_in", "migrating_out", "offline"
-	LastUpdated    time.Time `json:"last_updated"`     // Timestamp of last update
-	// Replication Fields
-	PrimaryNodeID  string   `json:"primary_node_id"`  // ID of the Storage Node acting as primary for this slot range
-	ReplicaNodeIDs []string `json:"replica_node_ids"` // IDs of Storage Nodes acting as replicas for this slot range
+// Command represents a command to be applied to the FSM.
+type Command struct {
+	Type          CommandType       `json:"type"`
+	NodeID        string            `json:"node_id,omitempty"`
+	NodeAddr      string            `json:"node_addr,omitempty"` // For registration, replication endpoint
+	SlotID        uint64            `json:"slot_id,omitempty"`
+	TargetNodeID  string            `json:"target_node_id,omitempty"`  // For replica add/remove, migration target
+	ShardID       string            `json:"shard_id,omitempty"`        // For more granular shard ID if different from SlotID
+	Replicas      map[string]string `json:"replicas,omitempty"`        // map[NodeID]NodeAddr for a slot's replicas
+	PrimaryNodeID string            `json:"primary_node_id,omitempty"` // For setting primary
+
+	// Tiered Storage Fields
+	TieringMetadata *tiered_storage.TieredDataMetadata `json:"tiering_metadata,omitempty"`
+	DLMPolicy       *tiered_storage.DLMPolicy          `json:"dlm_policy,omitempty"`
+	PolicyID        string                             `json:"policy_id,omitempty"` // For deleting DLM policy
+
+	// Replica Onboarding & Shard Migration Fields
+	OperationID      string                           `json:"operation_id,omitempty"` // Unique ID for onboarding or migration op
+	OnboardingState  *ReplicaOnboardingState          `json:"onboarding_state,omitempty"`
+	MigrationState   *ShardMigrationState             `json:"migration_state,omitempty"`
+	SnapshotManifest *logreplication.SnapshotManifest `json:"snapshot_manifest,omitempty"` // For certain onboarding states
+
+	// Generic payload for flexible commands
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
-// GojoDBFSM implements the raft.FSM interface.
-// It holds the replicated state of the Control Plane.
-type GojoDBFSM struct {
-	mu               sync.RWMutex
-	metadata         map[string]string        // Replicated general metadata (e.g., table schema, config)
-	storageNodes     map[string]string        // Replicated active Storage Node IDs -> Address (or more complex status)
-	slotAssignments  map[string]SlotRangeInfo // Replicated slot range ID -> SlotRangeInfo mapping
-	lastAppliedIndex uint64                   // The last Raft log index applied to this FSM
+// StorageNodeInfo holds information about a registered storage node.
+type StorageNodeInfo struct {
+	NodeID            string            `json:"node_id"`
+	RaftAddr          string            `json:"raft_addr"`        // Raft address of the node
+	APIAddr           string            `json:"api_addr"`         // gRPC/HTTP API address
+	ReplicationAddr   string            `json:"replication_addr"` // Address for replication data exchange
+	Status            string            `json:"status"`           // e.g., "healthy", "unhealthy", "decommissioning"
+	LastHeartbeat     time.Time         `json:"last_heartbeat"`
+	ShardsOwned       map[uint64]bool   `json:"shards_owned"`       // Slots for which this node is primary
+	ShardsReplicating map[uint64]string `json:"shards_replicating"` // Slots this node replicates, value is primaryNodeID
+	Capacity          NodeCapacityInfo  `json:"capacity"`           // Disk space, CPU, etc.
+	RegisteredAt      time.Time         `json:"registered_at"`
+}
+type NodeCapacityInfo struct { /* ... */
 }
 
-// NewGojoDBFSM creates a new instance of GojoDBFSM.
-func NewGojoDBFSM() *GojoDBFSM {
-	return &GojoDBFSM{
-		metadata:        make(map[string]string),
-		storageNodes:    make(map[string]string),
-		slotAssignments: make(map[string]SlotRangeInfo), // Initialize slot assignments map
+// SlotAssignment defines the primary and replicas for a given slot.
+type SlotAssignment struct {
+	SlotID        uint64            `json:"slot_id"`
+	PrimaryNodeID string            `json:"primary_node_id"`
+	ReplicaNodes  map[string]string `json:"replica_nodes"` // map[ReplicaNodeID]ReplicaNodeAddr
+	Version       uint64            `json:"version"`       // For optimistic locking or version tracking
+}
+
+// ReplicaOnboardingState tracks the progress of a new replica joining a shard. (Ref: Blueprint Table 2)
+type ReplicaOnboardingState struct {
+	OperationID       string    `json:"operation_id"` // Links to the command that initiated it
+	ShardID           string    `json:"shard_id"`
+	TargetNodeID      string    `json:"target_node_id"` // The new replica node
+	SourceNodeID      string    `json:"source_node_id"` // Node providing the snapshot
+	CurrentStage      string    `json:"current_stage"`  // e.g., "SNAPSHOT_TRANSFER_REQUESTED", "LOG_REPLAY_IN_PROGRESS"
+	SnapshotLSN       wal.LSN   `json:"snapshot_lsn"`
+	CurrentAppliedLSN wal.LSN   `json:"current_applied_lsn"` // Reported by target node during WAL replay
+	StatusMessage     string    `json:"status_message"`
+	StartedAt         time.Time `json:"started_at"`
+	LastUpdatedAt     time.Time `json:"last_updated_at"`
+}
+
+// ShardMigrationState tracks the progress of a shard rebalancing (migration) operation. (Ref: Blueprint Table 3)
+type ShardMigrationState struct {
+	OperationID         string    `json:"operation_id"`
+	ShardID             string    `json:"shard_id"`
+	SourceNodeID        string    `json:"source_node_id"`
+	TargetNodeID        string    `json:"target_node_id"`
+	CurrentPhase        string    `json:"current_phase"` // e.g., "PREPARING", "DATA_COPYING", "FINAL_SYNC"
+	StatusMessage       string    `json:"status_message"`
+	SnapshotLSN         wal.LSN   `json:"snapshot_lsn_on_target"`  // LSN of snapshot applied on target
+	TargetCaughtUpToLSN wal.LSN   `json:"target_caught_up_to_lsn"` // LSN target has replayed up to
+	WritePauseInitiated bool      `json:"write_pause_initiated"`   // If source has paused writes for cutover
+	StartedAt           time.Time `json:"started_at"`
+	LastUpdatedAt       time.Time `json:"last_updated_at"`
+}
+
+// FSM (Finite State Machine) stores the cluster's metadata.
+type FSM struct {
+	mu sync.RWMutex // Protects all state within the FSM
+
+	// Cluster State
+	storageNodes    map[string]*StorageNodeInfo                   // Key: NodeID
+	slotAssignments map[uint64]*SlotAssignment                    // Key: SlotID (or ShardID if 1:1)
+	dlmPolicies     map[string]*tiered_storage.DLMPolicy          // Key: PolicyID
+	tieringMetadata map[string]*tiered_storage.TieredDataMetadata // Key: LogicalUnitID (e.g., PageID, WALSegmentName)
+
+	// Ongoing Operations Tracking
+	activeReplicaOnboardings map[string]*ReplicaOnboardingState // Key: OperationID
+	activeShardMigrations    map[string]*ShardMigrationState    // Key: OperationID
+
+	// Local (non-Raft replicated) state/dependencies for this FSM instance
+	logger               *zap.Logger
+	localNodeID          string                                                                  // ID of the node this FSM instance is running on
+	localNodeReplAddr    string                                                                  // Replication address of the local node
+	indexReplicationMgrs map[logreplication.IndexType]logreplication.ReplicationManagerInterface // For triggering replication changes on this node
+
+	// DB instances (if FSM needs direct access for some reason, typically not for pure state)
+	// dbInstance            *btree.BTree[string, string]
+	// logManager            *wal.LogManager
+	// invertedIndexInstance *inverted_index.InvertedIndex
+	// spatialIdx            *spatial.IndexManager
+	shutdownCh chan struct{} // Added shutdown channel
+}
+
+func NewFSM(
+	// db *btree.BTree[string, string], lm *wal.LogManager, ii *inverted_index.InvertedIndex, si *spatial.IndexManager, // Pass if needed
+	localNodeID string,
+	localNodeReplAddr string,
+	replMgrs map[logreplication.IndexType]logreplication.ReplicationManagerInterface,
+	logger *zap.Logger,
+) *FSM {
+	return &FSM{
+		storageNodes:             make(map[string]*StorageNodeInfo),
+		slotAssignments:          make(map[uint64]*SlotAssignment),
+		dlmPolicies:              make(map[string]*tiered_storage.DLMPolicy),
+		tieringMetadata:          make(map[string]*tiered_storage.TieredDataMetadata),
+		activeReplicaOnboardings: make(map[string]*ReplicaOnboardingState),
+		activeShardMigrations:    make(map[string]*ShardMigrationState),
+		logger:                   logger.Named("fsm"),
+		localNodeID:              localNodeID,
+		localNodeReplAddr:        localNodeReplAddr,
+		indexReplicationMgrs:     replMgrs,
+		// dbInstance:            db,
+		// logManager:            lm,
+		// invertedIndexInstance: ii,
+		// spatialIdx:            si,
+		shutdownCh: make(chan struct{}),
 	}
 }
 
-// Apply applies a Raft log entry to the FSM.
-// This method is called by Raft on the leader and followers to update the state machine.
-func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
-	var cmd LogCommand
-	if err := json.Unmarshal(logEntry.Data, &cmd); err != nil {
-		log.Printf("ERROR: Failed to unmarshal Raft log entry: %v", err)
-		return nil // Should not happen with valid commands
-	}
-
+// Apply applies a command to the FSM. This is the core of Raft consensus.
+// It MUST be deterministic.
+func (f *FSM) Apply(log *raft.Log) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.lastAppliedIndex = logEntry.Index // Update the last applied index
+	var cmd Command
+	if err := json.Unmarshal(log.Data, &cmd); err != nil {
+		f.logger.Error("Failed to unmarshal FSM command", zap.Error(err), zap.ByteString("data", log.Data))
+		// This is a critical error, as it means a Raft log entry cannot be processed.
+		// Depending on policy, might panic or return an error that Raft handles.
+		// Returning an error here might cause Raft to retry or halt.
+		return fmt.Errorf("unmarshal command failed: %w", err)
+	}
 
-	switch cmd.Op {
-	case OpSetMetadata:
-		f.metadata[cmd.Key] = cmd.Value
-		// log.Printf("DEBUG: FSM applied: Set metadata '%s' = '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
-		return nil
-	case OpDeleteMetadata:
-		delete(f.metadata, cmd.Key)
-		// log.Printf("DEBUG: FSM applied: Deleted metadata '%s' (Index: %d)", cmd.Key, logEntry.Index)
-		return nil
-	case OpAddStorageNode:
-		f.storageNodes[cmd.Key] = cmd.Value // Key is NodeID, Value is Address
-		// log.Printf("DEBUG: FSM applied: Added Storage Node '%s' at '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
-		return nil
-	case OpRemoveStorageNode:
-		delete(f.storageNodes, cmd.Key)
-		// log.Printf("DEBUG: FSM applied: Removed Storage Node '%s' (Index: %d)", cmd.Key, logEntry.Index)
-		return nil
-	case OpUpdateNodeStatus:
-		f.storageNodes[cmd.Key] = cmd.Value // Update status/address
-		// log.Printf("DEBUG: FSM applied: Updated Storage Node '%s' status to '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
-		return nil
+	f.logger.Debug("Applying FSM command", zap.Uint8("type", uint8(cmd.Type)), zap.Any("command", cmd)) // Be careful logging full command if it contains sensitive data
 
-	// --- Hash Sharding Operations Apply Logic ---
-	case OpAssignSlotRange:
-		var slotRangeInfo SlotRangeInfo
-		if err := json.Unmarshal([]byte(cmd.Value), &slotRangeInfo); err != nil {
-			log.Printf("ERROR: FSM failed to unmarshal SlotRangeInfo for OpAssignSlotRange: %v", err)
-			return fmt.Errorf("invalid SlotRangeInfo format for OpAssignSlotRange: %w", err)
+	switch cmd.Type {
+	case CommandRegisterNode:
+		return f.applyRegisterNode(cmd)
+	case CommandUpdateNodeStatus:
+		return f.applyUpdateNodeStatus(cmd)
+	case CommandAssignSlot: // Make a node primary for a slot, also informs replicas
+		return f.applyAssignSlot(cmd)
+	case CommandAddReplicaToSlot: // Typically part of AssignSlot or an explicit update
+		return f.applyAddReplicaToSlot(cmd)
+	case CommandRemoveReplicaFromSlot:
+		return f.applyRemoveReplicaFromSlot(cmd)
+	case CommandSetSlotPrimary: // For failover / planned primary change
+		return f.applySetSlotPrimary(cmd)
+
+	// Tiered Storage
+	case CommandUpdateTieringMetadata:
+		if cmd.TieringMetadata == nil {
+			return fmt.Errorf("UpdateTieringMetadata command missing TieringMetadata")
 		}
-		// Use RangeID as the map key
-		f.slotAssignments[slotRangeInfo.RangeID] = slotRangeInfo
-		// log.Printf("DEBUG: FSM applied: Assigned Slot Range '%s' (%d-%d) to Node '%s' (Index: %d)",
-		// slotRangeInfo.RangeID, slotRangeInfo.StartSlot, slotRangeInfo.EndSlot, slotRangeInfo.AssignedNodeID, logEntry.Index)
+		f.tieringMetadata[cmd.TieringMetadata.LogicalUnitID] = cmd.TieringMetadata
+		f.logger.Info("Applied UpdateTieringMetadata", zap.String("unitID", cmd.TieringMetadata.LogicalUnitID))
 		return nil
-	case OpSplitSlotRange:
-		// cmd.Key: original RangeID to split
-		// cmd.Value: JSON array of new SlotRangeInfo structs for the split parts
-		var newSlotRanges []SlotRangeInfo
-		if err := json.Unmarshal([]byte(cmd.Value), &newSlotRanges); err != nil {
-			log.Printf("ERROR: FSM failed to unmarshal new SlotRangeInfo array for OpSplitSlotRange: %v", err)
-			return fmt.Errorf("invalid new slot ranges format for OpSplitSlotRange: %w", err)
+	case CommandDeleteTieringMetadata:
+		if cmd.TieringMetadata == nil || cmd.TieringMetadata.LogicalUnitID == "" {
+			return fmt.Errorf("DeleteTieringMetadata command missing LogicalUnitID")
+		}
+		delete(f.tieringMetadata, cmd.TieringMetadata.LogicalUnitID)
+		f.logger.Info("Applied DeleteTieringMetadata", zap.String("unitID", cmd.TieringMetadata.LogicalUnitID))
+		return nil
+	case CommandUpdateDLMPolicy:
+		if cmd.DLMPolicy == nil {
+			return fmt.Errorf("UpdateDLMPolicy command missing DLMPolicy")
+		}
+		f.dlmPolicies[cmd.DLMPolicy.PolicyID] = cmd.DLMPolicy
+		f.logger.Info("Applied UpdateDLMPolicy", zap.String("policyID", cmd.DLMPolicy.PolicyID))
+		return nil
+	case CommandDeleteDLMPolicy:
+		if cmd.PolicyID == "" {
+			return fmt.Errorf("DeleteDLMPolicy command missing PolicyID")
+		}
+		delete(f.dlmPolicies, cmd.PolicyID)
+		f.logger.Info("Applied DeleteDLMPolicy", zap.String("policyID", cmd.PolicyID))
+		return nil
+
+	// Replica Onboarding
+	case CommandInitiateReplicaOnboarding:
+		if cmd.OnboardingState == nil || cmd.OnboardingState.OperationID == "" {
+			return fmt.Errorf("InitiateReplicaOnboarding missing OnboardingState or OperationID")
+		}
+		cmd.OnboardingState.LastUpdatedAt = time.Now()
+		f.activeReplicaOnboardings[cmd.OnboardingState.OperationID] = cmd.OnboardingState
+		f.logger.Info("Applied InitiateReplicaOnboarding", zap.String("opID", cmd.OnboardingState.OperationID), zap.String("shard", cmd.OnboardingState.ShardID))
+		// Controller logic (outside FSM Apply) would then RPC the source node to start snapshot.
+		return nil
+	case CommandUpdateReplicaOnboardingState:
+		if cmd.OnboardingState == nil || cmd.OnboardingState.OperationID == "" {
+			return fmt.Errorf("UpdateReplicaOnboardingState missing OnboardingState or OperationID")
+		}
+		existing, ok := f.activeReplicaOnboardings[cmd.OnboardingState.OperationID]
+		if !ok {
+			return fmt.Errorf("cannot update non-existent replica onboarding operation %s", cmd.OnboardingState.OperationID)
+		}
+		// Merge updates carefully
+		existing.CurrentStage = cmd.OnboardingState.CurrentStage
+		existing.StatusMessage = cmd.OnboardingState.StatusMessage
+		if cmd.OnboardingState.SnapshotLSN > 0 {
+			existing.SnapshotLSN = cmd.OnboardingState.SnapshotLSN
+		}
+		if cmd.OnboardingState.CurrentAppliedLSN > 0 {
+			existing.CurrentAppliedLSN = cmd.OnboardingState.CurrentAppliedLSN
+		}
+		existing.LastUpdatedAt = time.Now()
+
+		f.logger.Info("Applied UpdateReplicaOnboardingState", zap.String("opID", existing.OperationID), zap.String("stage", existing.CurrentStage))
+		// If stage is REPLICA_SYNCED or REPLICA_ACTIVE, controller logic might clean up this entry.
+		if existing.CurrentStage == "REPLICA_ACTIVE" || strings.HasPrefix(existing.CurrentStage, "REPLICA_FAILED") {
+			// delete(f.activeReplicaOnboardings, existing.OperationID) // Or mark as completed/failed
+			f.logger.Info("Replica onboarding operation concluded", zap.String("opID", existing.OperationID), zap.String("final_stage", existing.CurrentStage))
+		}
+		return nil
+
+	// Shard Migration
+	case CommandInitiateShardMigration:
+		if cmd.MigrationState == nil || cmd.MigrationState.OperationID == "" {
+			return fmt.Errorf("InitiateShardMigration missing MigrationState or OperationID")
+		}
+		cmd.MigrationState.LastUpdatedAt = time.Now()
+		f.activeShardMigrations[cmd.MigrationState.OperationID] = cmd.MigrationState
+		f.logger.Info("Applied InitiateShardMigration", zap.String("opID", cmd.MigrationState.OperationID), zap.String("shard", cmd.MigrationState.ShardID))
+		// Controller logic (outside FSM Apply) would then RPC source/target to begin.
+		return nil
+	case CommandUpdateShardMigrationState:
+		if cmd.MigrationState == nil || cmd.MigrationState.OperationID == "" {
+			return fmt.Errorf("UpdateShardMigrationState missing MigrationState or OperationID")
+		}
+		existing, ok := f.activeShardMigrations[cmd.MigrationState.OperationID]
+		if !ok {
+			return fmt.Errorf("cannot update non-existent shard migration operation %s", cmd.MigrationState.OperationID)
+		}
+		// Merge updates
+		existing.CurrentPhase = cmd.MigrationState.CurrentPhase
+		existing.StatusMessage = cmd.MigrationState.StatusMessage
+		if cmd.MigrationState.SnapshotLSN > 0 {
+			existing.SnapshotLSN = cmd.MigrationState.SnapshotLSN
+		}
+		if cmd.MigrationState.TargetCaughtUpToLSN > 0 {
+			existing.TargetCaughtUpToLSN = cmd.MigrationState.TargetCaughtUpToLSN
+		}
+		if cmd.MigrationState.WritePauseInitiated {
+			existing.WritePauseInitiated = true
+		}
+		existing.LastUpdatedAt = time.Now()
+
+		f.logger.Info("Applied UpdateShardMigrationState", zap.String("opID", existing.OperationID), zap.String("phase", existing.CurrentPhase))
+		return nil
+	case CommandCommitShardMigration: // This is the atomic handoff
+		// Payload for CommitShardMigration should contain ShardID, NewPrimaryNodeID (TargetNodeID)
+		// And optionally, the OperationID to finalize the migration tracking state.
+		if cmd.ShardID == "" || cmd.TargetNodeID == "" { // TargetNodeID is the new primary
+			return fmt.Errorf("CommitShardMigration missing ShardID or TargetNodeID (new primary)")
+		}
+		slotID, err := f.getSlotIDFromShardID(cmd.ShardID) // Helper to map shard to slot if necessary
+		if err != nil {
+			return fmt.Errorf("could not map shardID %s to slotID for commit: %w", cmd.ShardID, err)
 		}
 
-		// Remove the original slot range
-		delete(f.slotAssignments, cmd.Key)
-		// log.Printf("DEBUG: FSM applied: Removed original slot range '%s' for split (Index: %d)", cmd.Key, logEntry.Index)
-
-		// Add the new split slot ranges
-		for _, newRange := range newSlotRanges {
-			f.slotAssignments[newRange.RangeID] = newRange
-			// log.Printf("DEBUG: FSM applied: Added new split slot range '%s' (%d-%d) to Node '%s' (Index: %d)",
-			// newRange.RangeID, newRange.StartSlot, newRange.EndSlot, newRange.AssignedNodeID, logEntry.Index)
+		assignment, ok := f.slotAssignments[slotID]
+		if !ok {
+			return fmt.Errorf("slot %d (for shard %s) not found for committing migration", slotID, cmd.ShardID)
 		}
-		return nil
-	case OpRemoveSlotRange:
-		delete(f.slotAssignments, cmd.Key)
-		// log.Printf("DEBUG: FSM applied: Removed Slot Range '%s' (Index: %d)", cmd.Key, logEntry.Index)
-		return nil
-		// --- End Hash Sharding Operations Apply Logic ---
-
-		// --- NEW: Replication Operations Apply Logic ---
-	case OpSetPrimaryReplica:
-		var slotInfo SlotRangeInfo // Expecting a full SlotRangeInfo with Primary/Replicas
-		if err := json.Unmarshal([]byte(cmd.Value), &slotInfo); err != nil {
-			log.Printf("ERROR: FSM failed to unmarshal SlotRangeInfo for OpSetPrimaryReplica: %v", err)
-			return fmt.Errorf("invalid SlotRangeInfo format for OpSetPrimaryReplica: %w", err)
-		}
-		if existing, ok := f.slotAssignments[slotInfo.RangeID]; ok {
-			existing.PrimaryNodeID = slotInfo.PrimaryNodeID
-			existing.ReplicaNodeIDs = slotInfo.ReplicaNodeIDs
-			existing.Status = slotInfo.Status // Update status if provided (e.g., "active")
-			existing.LastUpdated = time.Now()
-			f.slotAssignments[slotInfo.RangeID] = existing
-			// log.Printf("DEBUG: FSM applied: Set Primary '%s' and Replicas %v for slot range '%s' (Index: %d)",
-			// slotInfo.PrimaryNodeID, slotInfo.ReplicaNodeIDs, slotInfo.RangeID, logEntry.Index)
+		oldPrimary := assignment.PrimaryNodeID
+		assignment.PrimaryNodeID = cmd.TargetNodeID // New primary
+		// Replicas might also need updating if the target was a new node not previously a replica.
+		// For a simple move, replicas might remain the same or target becomes primary and old primary might become replica or be removed.
+		// This command should ideally specify the full new replica set for the slot.
+		// For now, just update primary.
+		if cmd.Replicas != nil { // If new replica set is provided
+			assignment.ReplicaNodes = cmd.Replicas
 		} else {
-			log.Printf("WARNING: FSM tried to set primary/replica for non-existent slot range '%s' (Index: %d)", slotInfo.RangeID, logEntry.Index)
-			return fmt.Errorf("slot range %s not found for primary/replica assignment", slotInfo.RangeID)
+			// If target was a replica, remove it from replica list
+			delete(assignment.ReplicaNodes, cmd.TargetNodeID)
+			// What happens to the old primary? Does it become a replica? Is it decommissioned from this slot?
+			// This needs to be part of the command's payload or a defined rebalancing strategy.
+			// For now, assume it's just removed or becomes a replica if specified in cmd.Replicas
 		}
-		return nil
-	case OpPromoteReplica:
-		// cmd.Key: RangeID
-		// cmd.Value: New PrimaryNodeID
-		newPrimaryNodeID := cmd.Value
-		if existing, ok := f.slotAssignments[cmd.Key]; ok {
-			// Remove old primary if it exists in replicas
-			newReplicas := []string{}
-			if existing.PrimaryNodeID != "" {
-				newReplicas = append(newReplicas, existing.PrimaryNodeID)
-			}
-			// Add existing replicas, excluding the new primary
-			for _, replicaID := range existing.ReplicaNodeIDs {
-				if replicaID != newPrimaryNodeID {
-					newReplicas = append(newReplicas, replicaID)
-				}
-			}
 
-			existing.PrimaryNodeID = newPrimaryNodeID
-			existing.ReplicaNodeIDs = newReplicas
-			existing.Status = "active" // Or "recovering"
-			existing.LastUpdated = time.Now()
-			f.slotAssignments[cmd.Key] = existing
-			// log.Printf("DEBUG: FSM applied: Promoted Node '%s' to Primary for slot range '%s' (Index: %d)",
-			// newPrimaryNodeID, cmd.Key, logEntry.Index)
-		} else {
-			log.Printf("WARNING: FSM tried to promote replica for non-existent slot range '%s' (Index: %d)", cmd.Key, logEntry.Index)
-			return fmt.Errorf("slot range %s not found for replica promotion", cmd.Key)
-		}
-		return nil
-	case OpRemoveReplica:
-		// cmd.Key: RangeID
-		// cmd.Value: ReplicaNodeID to remove
-		replicaToRemoveID := cmd.Value
-		if existing, ok := f.slotAssignments[cmd.Key]; ok {
-			newReplicas := []string{}
-			for _, replicaID := range existing.ReplicaNodeIDs {
-				if replicaID != replicaToRemoveID {
-					newReplicas = append(newReplicas, replicaID)
-				}
-			}
-			existing.ReplicaNodeIDs = newReplicas
-			existing.LastUpdated = time.Now()
-			f.slotAssignments[cmd.Key] = existing
-			// log.Printf("DEBUG: FSM applied: Removed Replica '%s' from slot range '%s' (Index: %d)",
-			// replicaToRemoveID, cmd.Key, logEntry.Index)
-		} else {
-			log.Printf("WARNING: FSM tried to remove replica for non-existent slot range '%s' (Index: %d)", cmd.Key, logEntry.Index)
-			return fmt.Errorf("slot range %s not found for replica removal", cmd.Key)
-		}
-		return nil
-		// --- END NEW ---
+		assignment.Version++
+		f.logger.Info("Applied CommitShardMigration: atomically changed primary",
+			zap.String("shardID", cmd.ShardID),
+			zap.Uint64("slotID", slotID),
+			zap.String("oldPrimary", oldPrimary),
+			zap.String("newPrimary", cmd.TargetNodeID))
 
+		// Update and potentially remove the active migration tracking state
+		if cmd.OperationID != "" {
+			if migState, exists := f.activeShardMigrations[cmd.OperationID]; exists {
+				migState.CurrentPhase = "COMPLETED_HANDOFF"
+				migState.LastUpdatedAt = time.Now()
+				// delete(f.activeShardMigrations, cmd.OperationID) // Or keep for history with "COMPLETED" status
+			}
+		}
+		// Trigger actions on the local node if its role for this slot changed.
+		f.handleSlotAssignmentChange(slotID, assignment, oldPrimary)
+		return nil
+
+	case CommandNoOp:
+		f.logger.Debug("Applied NoOp command")
+		return nil
 	default:
-		log.Printf("WARNING: Unknown FSM command operation: %s (Index: %d)", cmd.Op, logEntry.Index)
-		return fmt.Errorf("unknown FSM command operation: %s", cmd.Op)
+		f.logger.Error("Unknown FSM command type", zap.Uint8("type", uint8(cmd.Type)))
+		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
 }
 
-// Snapshot returns a snapshot of the FSM's state.
-// This is used by Raft to truncate the log and recover faster.
-func (f *GojoDBFSM) Snapshot() (raft.FSMSnapshot, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	// Create a deep copy of the current state
-	metadataCopy := make(map[string]string)
-	for k, v := range f.metadata {
-		metadataCopy[k] = v
+func (f *FSM) applyRegisterNode(cmd Command) error {
+	if cmd.NodeID == "" || cmd.NodeAddr == "" { // NodeAddr here is Raft Addr
+		return fmt.Errorf("RegisterNode command missing NodeID or RaftAddr")
 	}
-	storageNodesCopy := make(map[string]string)
-	for k, v := range f.storageNodes {
-		storageNodesCopy[k] = v
+	if _, exists := f.storageNodes[cmd.NodeID]; exists {
+		f.logger.Warn("Node already registered, updating info", zap.String("nodeID", cmd.NodeID))
+		// Update existing node info (e.g. if address changed or for re-registration)
+		f.storageNodes[cmd.NodeID].RaftAddr = cmd.NodeAddr
+		f.storageNodes[cmd.NodeID].APIAddr = cmd.PayloadGet("api_addr")                 // Assuming API addr is in payload
+		f.storageNodes[cmd.NodeID].ReplicationAddr = cmd.PayloadGet("replication_addr") // Assuming Replication addr is in payload
+		f.storageNodes[cmd.NodeID].LastHeartbeat = time.Now()
+		f.storageNodes[cmd.NodeID].Status = "healthy" // Or from payload
+		return nil
 	}
-	slotAssignmentsCopy := make(map[string]SlotRangeInfo) // Copy slot assignments
-	for k, v := range f.slotAssignments {
-		slotAssignmentsCopy[k] = v
+	f.storageNodes[cmd.NodeID] = &StorageNodeInfo{
+		NodeID:            cmd.NodeID,
+		RaftAddr:          cmd.NodeAddr,
+		APIAddr:           cmd.PayloadGet("api_addr"),
+		ReplicationAddr:   cmd.PayloadGet("replication_addr"),
+		Status:            "healthy",
+		LastHeartbeat:     time.Now(),
+		RegisteredAt:      time.Now(),
+		ShardsOwned:       make(map[uint64]bool),
+		ShardsReplicating: make(map[uint64]string),
 	}
-
-	log.Printf("DEBUG: FSM Snapshot created at index %d", f.lastAppliedIndex)
-	return &gojoDBFSMSnapshot{
-		metadata:        metadataCopy,
-		storageNodes:    storageNodesCopy,
-		slotAssignments: slotAssignmentsCopy, // Include slot assignments in snapshot
-	}, nil
-}
-
-// Restore restores the FSM's state from a snapshot.
-// This is used by Raft when a node joins a cluster or recovers from a crash.
-func (f *GojoDBFSM) Restore(rc io.ReadCloser) error {
-	defer rc.Close()
-
-	var snapshotData struct {
-		Metadata        map[string]string        `json:"metadata"`
-		StorageNodes    map[string]string        `json:"storage_nodes"`
-		SlotAssignments map[string]SlotRangeInfo `json:"slot_assignments"` // Include slot assignments in snapshot data
-	}
-
-	if err := json.NewDecoder(rc).Decode(&snapshotData); err != nil {
-		return fmt.Errorf("failed to decode FSM snapshot: %w", err)
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.metadata = snapshotData.Metadata
-	f.storageNodes = snapshotData.StorageNodes
-	f.slotAssignments = snapshotData.SlotAssignments // Restore slot assignments
-	// Note: lastAppliedIndex is typically restored by Raft itself, not the FSM.
-	// The FSM's Apply method will continue from the next log entry.
-
-	log.Println("INFO: FSM state restored from snapshot.")
+	f.logger.Info("Registered new storage node", zap.String("nodeID", cmd.NodeID), zap.String("raftAddr", cmd.NodeAddr))
 	return nil
 }
 
-// --- FSM Query Methods (Read-only access to the state) ---
-
-// GetMetadata retrieves a metadata value.
-func (f *GojoDBFSM) GetMetadata(key string) (string, bool) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	val, ok := f.metadata[key]
-	return val, ok
-}
-
-// GetStorageNodes returns a copy of the current storage node map.
-func (f *GojoDBFSM) GetStorageNodes() map[string]string {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	copyMap := make(map[string]string)
-	for k, v := range f.storageNodes {
-		copyMap[k] = v
+func (f *FSM) applyUpdateNodeStatus(cmd Command) error {
+	if cmd.NodeID == "" {
+		return fmt.Errorf("UpdateNodeStatus command missing NodeID")
 	}
-	return copyMap
+	node, ok := f.storageNodes[cmd.NodeID]
+	if !ok {
+		return fmt.Errorf("cannot update status for unknown node %s", cmd.NodeID)
+	}
+	node.LastHeartbeat = time.Now()
+	newStatus := cmd.PayloadGet("status")
+	if newStatus != "" {
+		node.Status = newStatus
+	}
+	// Update capacity, etc. from payload if provided
+	f.logger.Debug("Updated node status", zap.String("nodeID", cmd.NodeID), zap.String("status", node.Status))
+	return nil
 }
 
-// GetStorageNodeCount returns the number of active storage nodes.
-func (f *GojoDBFSM) GetStorageNodeCount() int {
+func (f *FSM) applyAssignSlot(cmd Command) error {
+	if cmd.SlotID == 0 || cmd.NodeID == "" { // NodeID is the new primary
+		return fmt.Errorf("AssignSlot command missing SlotID or NodeID (primary)")
+	}
+	if _, nodeExists := f.storageNodes[cmd.NodeID]; !nodeExists {
+		return fmt.Errorf("cannot assign slot to unknown node %s", cmd.NodeID)
+	}
+
+	var oldPrimaryNodeID string
+	assignment, exists := f.slotAssignments[cmd.SlotID]
+	if exists {
+		oldPrimaryNodeID = assignment.PrimaryNodeID
+		if oldPrimaryNodeID == cmd.NodeID && mapsAreEqual(assignment.ReplicaNodes, cmd.Replicas) {
+			f.logger.Info("Slot assignment unchanged", zap.Uint64("slotID", cmd.SlotID))
+			assignment.Version++ // Still bump version for idempotency if needed, or just return
+			return nil
+		}
+		// If primary changes, update old primary's owned shards
+		if oldPrimaryNodeID != "" && oldPrimaryNodeID != cmd.NodeID {
+			if oldNode, ok := f.storageNodes[oldPrimaryNodeID]; ok {
+				delete(oldNode.ShardsOwned, cmd.SlotID)
+			}
+		}
+	} else {
+		assignment = &SlotAssignment{SlotID: cmd.SlotID}
+		f.slotAssignments[cmd.SlotID] = assignment
+	}
+
+	assignment.PrimaryNodeID = cmd.NodeID
+	assignment.ReplicaNodes = cmd.Replicas // cmd.Replicas should be map[ReplicaNodeID]ReplicaNodeAddr
+	if assignment.ReplicaNodes == nil {
+		assignment.ReplicaNodes = make(map[string]string)
+	}
+	assignment.Version++
+
+	// Update new primary's owned shards
+	f.storageNodes[cmd.NodeID].ShardsOwned[cmd.SlotID] = true
+	// Ensure new primary is not also listed as its own replica for this slot
+	delete(f.storageNodes[cmd.NodeID].ShardsReplicating, cmd.SlotID)
+
+	f.logger.Info("Assigned slot to node (primary)",
+		zap.Uint64("slotID", cmd.SlotID),
+		zap.String("primaryNodeID", cmd.NodeID),
+		zap.Any("replicas", cmd.Replicas),
+		zap.String("oldPrimary", oldPrimaryNodeID))
+
+	// This function will notify local replication managers if this FSM instance's node
+	// had its role changed for this slot.
+	f.handleSlotAssignmentChange(cmd.SlotID, assignment, oldPrimaryNodeID)
+	return nil
+}
+
+func (f *FSM) applySetSlotPrimary(cmd Command) error {
+	if cmd.SlotID == 0 || cmd.PrimaryNodeID == "" {
+		return fmt.Errorf("SetSlotPrimary command missing SlotID or PrimaryNodeID")
+	}
+	assignment, ok := f.slotAssignments[cmd.SlotID]
+	if !ok {
+		return fmt.Errorf("slot %d not found for setting new primary", cmd.SlotID)
+	}
+	if _, nodeExists := f.storageNodes[cmd.PrimaryNodeID]; !nodeExists {
+		return fmt.Errorf("cannot set primary for slot %d to unknown node %s", cmd.SlotID, cmd.PrimaryNodeID)
+	}
+
+	oldPrimaryNodeID := assignment.PrimaryNodeID
+	if oldPrimaryNodeID == cmd.PrimaryNodeID {
+		f.logger.Info("Primary for slot already set to this node", zap.Uint64("slotID", cmd.SlotID), zap.String("nodeID", cmd.PrimaryNodeID))
+		return nil // No change
+	}
+
+	assignment.PrimaryNodeID = cmd.PrimaryNodeID
+	assignment.Version++
+
+	// Update shard ownership maps
+	if oldNode, exists := f.storageNodes[oldPrimaryNodeID]; exists {
+		delete(oldNode.ShardsOwned, cmd.SlotID)
+	}
+	if newNode, exists := f.storageNodes[cmd.PrimaryNodeID]; exists {
+		newNode.ShardsOwned[cmd.SlotID] = true
+		// If the new primary was previously a replica for this slot, remove it from replicating list
+		delete(newNode.ShardsReplicating, cmd.SlotID)
+	}
+
+	// Ensure new primary is not in its own replica list for this slot
+	if assignment.ReplicaNodes != nil {
+		delete(assignment.ReplicaNodes, cmd.PrimaryNodeID)
+	}
+
+	f.logger.Info("Set new primary for slot",
+		zap.Uint64("slotID", cmd.SlotID),
+		zap.String("oldPrimary", oldPrimaryNodeID),
+		zap.String("newPrimary", cmd.PrimaryNodeID))
+
+	f.handleSlotAssignmentChange(cmd.SlotID, assignment, oldPrimaryNodeID)
+	return nil
+}
+
+func (f *FSM) applyAddReplicaToSlot(cmd Command) error {
+	// Similar to AssignSlot but focuses on just adding/updating replicas for an existing primary.
+	// Or, this logic can be part of ApplyAssignSlot if it always provides the full replica set.
+	// This is crucial for shard rebalancing (e.g. new node added to cluster, starts replicating).
+	if cmd.SlotID == 0 || cmd.TargetNodeID == "" { // TargetNodeID is the replica to add
+		return fmt.Errorf("AddReplicaToSlot command missing SlotID or TargetNodeID (replica)")
+	}
+	assignment, ok := f.slotAssignments[cmd.SlotID]
+	if !ok {
+		return fmt.Errorf("cannot add replica to non-existent slot %d", cmd.SlotID)
+	}
+	if assignment.PrimaryNodeID == "" {
+		return fmt.Errorf("cannot add replica to slot %d with no primary assigned", cmd.SlotID)
+	}
+	if assignment.PrimaryNodeID == cmd.TargetNodeID {
+		return fmt.Errorf("cannot add primary node %s as its own replica for slot %d", cmd.TargetNodeID, cmd.SlotID)
+	}
+
+	replicaAddr := cmd.PayloadGet("replica_addr") // Address of the replica node for replication
+	if replicaAddr == "" {
+		// Try to get from registered nodes if not provided
+		if nodeInfo, exists := f.storageNodes[cmd.TargetNodeID]; exists {
+			replicaAddr = nodeInfo.ReplicationAddr
+		} else {
+			return fmt.Errorf("replica address not provided and target node %s not registered", cmd.TargetNodeID)
+		}
+	}
+
+	if assignment.ReplicaNodes == nil {
+		assignment.ReplicaNodes = make(map[string]string)
+	}
+	assignment.ReplicaNodes[cmd.TargetNodeID] = replicaAddr
+	assignment.Version++
+
+	if replicaNode, ok := f.storageNodes[cmd.TargetNodeID]; ok {
+		replicaNode.ShardsReplicating[cmd.SlotID] = assignment.PrimaryNodeID
+		delete(replicaNode.ShardsOwned, cmd.SlotID) // Ensure it's not marked as owner
+	}
+
+	f.logger.Info("Added/Updated replica for slot",
+		zap.Uint64("slotID", cmd.SlotID),
+		zap.String("primary", assignment.PrimaryNodeID),
+		zap.String("replicaNodeID", cmd.TargetNodeID),
+		zap.String("replicaAddr", replicaAddr))
+
+	// Inform the primary node about the new/updated replica.
+	// Inform the replica node that it should start replicating.
+	// This happens in handleSlotAssignmentChange if PrimaryNodeID is f.localNodeID OR TargetNodeID is f.localNodeID
+	f.handleSlotAssignmentChange(cmd.SlotID, assignment, assignment.PrimaryNodeID) // Pass current primary as "old" because primary itself didn't change
+	return nil
+}
+
+func (f *FSM) applyRemoveReplicaFromSlot(cmd Command) error {
+	if cmd.SlotID == 0 || cmd.TargetNodeID == "" { // TargetNodeID is the replica to remove
+		return fmt.Errorf("RemoveReplicaFromSlot command missing SlotID or TargetNodeID (replica)")
+	}
+	assignment, ok := f.slotAssignments[cmd.SlotID]
+	if !ok {
+		f.logger.Warn("Attempted to remove replica from non-existent slot", zap.Uint64("slotID", cmd.SlotID))
+		return nil // Or error, depending on strictness
+	}
+	if assignment.ReplicaNodes == nil {
+		f.logger.Warn("Attempted to remove replica from slot with no replicas", zap.Uint64("slotID", cmd.SlotID))
+		return nil
+	}
+
+	removedAddr, replicaExisted := assignment.ReplicaNodes[cmd.TargetNodeID]
+	if !replicaExisted {
+		f.logger.Warn("Attempted to remove non-existent replica from slot", zap.Uint64("slotID", cmd.SlotID), zap.String("replicaNodeID", cmd.TargetNodeID))
+		return nil
+	}
+
+	delete(assignment.ReplicaNodes, cmd.TargetNodeID)
+	assignment.Version++
+
+	if replicaNode, ok := f.storageNodes[cmd.TargetNodeID]; ok {
+		delete(replicaNode.ShardsReplicating, cmd.SlotID)
+	}
+
+	f.logger.Info("Removed replica from slot",
+		zap.Uint64("slotID", cmd.SlotID),
+		zap.String("primary", assignment.PrimaryNodeID),
+		zap.String("removedReplicaNodeID", cmd.TargetNodeID),
+		zap.String("removedReplicaAddr", removedAddr))
+
+	f.handleSlotAssignmentChange(cmd.SlotID, assignment, assignment.PrimaryNodeID)
+	return nil
+}
+
+// getSlotIDFromShardID is a helper. In many designs, SlotID and ShardID might be synonymous
+// or have a fixed mapping. If ShardID is more granular (e.g. ranges within a slot), this needs defining.
+func (f *FSM) getSlotIDFromShardID(shardID string) (uint64, error) {
+	// For now, assume shardID is parseable to uint64 as SlotID.
+	// This needs to match your system's sharding strategy.
+	sID, err := strconv.ParseUint(shardID, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid shardID format '%s', cannot parse to uint64 slotID: %w", shardID, err)
+	}
+	return sID, nil
+}
+
+// handleSlotAssignmentChange is called after an FSM Apply modifies slotAssignments.
+// It checks if the local node's role for the given slot has changed and, if so,
+// instructs the local ReplicationManagers.
+func (f *FSM) handleSlotAssignmentChange(slotID uint64, newAssignment *SlotAssignment, oldPrimaryNodeID string) {
+	if newAssignment == nil {
+		f.logger.Warn("handleSlotAssignmentChange called with nil newAssignment", zap.Uint64("slotID", slotID))
+		return
+	}
+
+	// --- Check if this node's role as PRIMARY changed ---
+	isNowPrimary := newAssignment.PrimaryNodeID == f.localNodeID
+	wasPrimary := oldPrimaryNodeID == f.localNodeID
+
+	if isNowPrimary && !wasPrimary {
+		// This node just became primary for slotID
+		f.logger.Info("FSM: This node BECAME PRIMARY for slot", zap.Uint64("slotID", slotID), zap.Any("replicas", newAssignment.ReplicaNodes))
+		for _, repMgr := range f.indexReplicationMgrs {
+			// Pass replica addresses (NodeID -> Addr from f.storageNodes)
+			replicaAddrMap := make(map[string]string)
+			for repNodeID := range newAssignment.ReplicaNodes { // newAssignment.ReplicaNodes should store addresses directly
+				if nodeInfo, ok := f.storageNodes[repNodeID]; ok {
+					replicaAddrMap[repNodeID] = nodeInfo.ReplicationAddr // Ensure StorageNodeInfo has ReplicationAddr
+				} else {
+					f.logger.Warn("Replica node info not found in FSM for primary assignment", zap.String("replicaNodeID", repNodeID), zap.Uint64("slotID", slotID))
+				}
+			}
+			if err := repMgr.BecomePrimaryForSlot(slotID, replicaAddrMap); err != nil {
+				f.logger.Error("Error calling BecomePrimaryForSlot on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
+			}
+		}
+	} else if !isNowPrimary && wasPrimary {
+		// This node CEASED to be primary for slotID
+		f.logger.Info("FSM: This node CEASED TO BE PRIMARY for slot", zap.Uint64("slotID", slotID))
+		for _, repMgr := range f.indexReplicationMgrs {
+			if err := repMgr.CeasePrimaryForSlot(slotID); err != nil {
+				f.logger.Error("Error calling CeasePrimaryForSlot on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
+			}
+		}
+	} else if isNowPrimary && wasPrimary {
+		// Still primary, but replica set might have changed.
+		f.logger.Info("FSM: This node REMAINS PRIMARY for slot, replica set may have changed", zap.Uint64("slotID", slotID), zap.Any("newReplicas", newAssignment.ReplicaNodes))
+		// The BecomePrimaryForSlot on replication managers should be idempotent or handle updates to the replica set.
+		// It might need to start streaming to new replicas and stop streaming to removed ones.
+		// For simplicity, re-calling BecomePrimaryForSlot might refresh its state.
+		for _, repMgr := range f.indexReplicationMgrs {
+			replicaAddrMap := make(map[string]string)
+			for repNodeID := range newAssignment.ReplicaNodes {
+				if nodeInfo, ok := f.storageNodes[repNodeID]; ok {
+					replicaAddrMap[repNodeID] = nodeInfo.ReplicationAddr
+				}
+			}
+			if err := repMgr.BecomePrimaryForSlot(slotID, replicaAddrMap); err != nil { // This should reconcile replicas
+				f.logger.Error("Error calling BecomePrimaryForSlot (for update) on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
+			}
+		}
+	}
+
+	// --- Check if this node's role as REPLICA changed ---
+	_, isNowReplica := newAssignment.ReplicaNodes[f.localNodeID]
+
+	// Determine if this node WAS a replica for this slot under the OLD primary.
+	// This requires knowing the slot's state BEFORE this current change.
+	// For simplicity, assume `oldAssignment` could be passed or reconstructed if complex state transitions needed.
+	// Here, we primarily care if we are *now* a replica and from whom.
+	wasReplica := false
+	if oldPrimaryNodeID != "" { // If there was an old primary for this slot
+		// Check if we were a replica to that old primary OR to the current primary if it hasn't changed.
+		// This logic gets complex if oldAssignment isn't available.
+		// A simpler check: if we were in f.storageNodes[f.localNodeID].ShardsReplicating for this slot.
+		_, wasReplica = f.storageNodes[f.localNodeID].ShardsReplicating[slotID]
+	}
+
+	if isNowReplica {
+		primaryForThisSlot := newAssignment.PrimaryNodeID
+		if primaryInfo, ok := f.storageNodes[primaryForThisSlot]; ok {
+			f.logger.Info("FSM: This node IS/REMAINS A REPLICA for slot", zap.Uint64("slotID", slotID), zap.String("primary", primaryForThisSlot))
+			for _, repMgr := range f.indexReplicationMgrs {
+				if err := repMgr.BecomeReplicaForSlot(slotID, primaryForThisSlot, primaryInfo.ReplicationAddr); err != nil {
+					f.logger.Error("Error calling BecomeReplicaForSlot on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
+				}
+			}
+		} else {
+			f.logger.Error("Primary node info not found for replica assignment", zap.String("primaryNodeID", primaryForThisSlot), zap.Uint64("slotID", slotID))
+		}
+	} else if !isNowReplica && wasReplica {
+		// This node CEASED to be a replica for slotID
+		f.logger.Info("FSM: This node CEASED TO BE REPLICA for slot", zap.Uint64("slotID", slotID))
+		for _, repMgr := range f.indexReplicationMgrs {
+			if err := repMgr.CeaseReplicaForSlot(slotID); err != nil {
+				f.logger.Error("Error calling CeaseReplicaForSlot on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
+			}
+		}
+	}
+}
+
+// Snapshot creates a snapshot of the FSM state.
+// Raft calls this to compact its log.
+func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return len(f.storageNodes)
+
+	f.logger.Info("Creating FSM snapshot...")
+	// Serialize the entire FSM state. Using JSON for simplicity here.
+	// For performance with large state, a more efficient binary format might be needed.
+	state := map[string]interface{}{
+		"storageNodes":             f.storageNodes,
+		"slotAssignments":          f.slotAssignments,
+		"dlmPolicies":              f.dlmPolicies,
+		"tieringMetadata":          f.tieringMetadata,
+		"activeReplicaOnboardings": f.activeReplicaOnboardings,
+		"activeShardMigrations":    f.activeShardMigrations,
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		f.logger.Error("Failed to marshal FSM state for snapshot", zap.Error(err))
+		return nil, fmt.Errorf("marshal FSM state: %w", err)
+	}
+	f.logger.Info("FSM snapshot created successfully", zap.Int("size_bytes", len(data)))
+	return &fsmSnapshot{data: data, logger: f.logger.Named("snapshot")}, nil
 }
 
-// GetSlotRangeInfo retrieves information about a specific slot range.
-func (f *GojoDBFSM) GetSlotRangeInfo(rangeID string) (SlotRangeInfo, bool) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	info, ok := f.slotAssignments[rangeID]
-	return info, ok
+// Restore restores the FSM state from a snapshot.
+// Raft calls this when a node is starting up and needs to catch up.
+func (f *FSM) Restore(snapshotReader io.ReadCloser) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	defer snapshotReader.Close()
+
+	f.logger.Info("Restoring FSM from snapshot...")
+	data, err := io.ReadAll(snapshotReader)
+	if err != nil {
+		f.logger.Error("Failed to read FSM snapshot data", zap.Error(err))
+		return fmt.Errorf("read snapshot: %w", err)
+	}
+
+	var state map[string]json.RawMessage // Use RawMessage for deferred parsing
+	if err := json.Unmarshal(data, &state); err != nil {
+		f.logger.Error("Failed to unmarshal FSM snapshot state (outer map)", zap.Error(err))
+		return fmt.Errorf("unmarshal snapshot state: %w", err)
+	}
+
+	// Explicitly unmarshal each part to handle potential nil maps gracefully.
+	if raw, ok := state["storageNodes"]; ok {
+		if err := json.Unmarshal(raw, &f.storageNodes); err != nil {
+			return fmt.Errorf("unmarshal storageNodes: %w", err)
+		}
+	} else {
+		f.storageNodes = make(map[string]*StorageNodeInfo)
+	}
+
+	if raw, ok := state["slotAssignments"]; ok {
+		if err := json.Unmarshal(raw, &f.slotAssignments); err != nil {
+			return fmt.Errorf("unmarshal slotAssignments: %w", err)
+		}
+	} else {
+		f.slotAssignments = make(map[uint64]*SlotAssignment)
+	}
+
+	if raw, ok := state["dlmPolicies"]; ok {
+		if err := json.Unmarshal(raw, &f.dlmPolicies); err != nil {
+			return fmt.Errorf("unmarshal dlmPolicies: %w", err)
+		}
+	} else {
+		f.dlmPolicies = make(map[string]*tiered_storage.DLMPolicy)
+	}
+
+	if raw, ok := state["tieringMetadata"]; ok {
+		if err := json.Unmarshal(raw, &f.tieringMetadata); err != nil {
+			return fmt.Errorf("unmarshal tieringMetadata: %w", err)
+		}
+	} else {
+		f.tieringMetadata = make(map[string]*tiered_storage.TieredDataMetadata)
+	}
+
+	if raw, ok := state["activeReplicaOnboardings"]; ok {
+		if err := json.Unmarshal(raw, &f.activeReplicaOnboardings); err != nil {
+			return fmt.Errorf("unmarshal activeReplicaOnboardings: %w", err)
+		}
+	} else {
+		f.activeReplicaOnboardings = make(map[string]*ReplicaOnboardingState)
+	}
+
+	if raw, ok := state["activeShardMigrations"]; ok {
+		if err := json.Unmarshal(raw, &f.activeShardMigrations); err != nil {
+			return fmt.Errorf("unmarshal activeShardMigrations: %w", err)
+		}
+	} else {
+		f.activeShardMigrations = make(map[string]*ShardMigrationState)
+	}
+
+	f.logger.Info("FSM restored from snapshot successfully.", zap.Int("size_bytes", len(data)))
+	// After restoring, this node needs to evaluate its roles for all slots based on the new state.
+	f.reEvaluateLocalNodeRolesAfterRestore()
+	return nil
 }
 
-// GetSlotForHashKey hashes a key to a slot.
+// reEvaluateLocalNodeRolesAfterRestore is called after an FSM restore.
+// It iterates through all slot assignments and calls the appropriate methods on local replication managers
+// to ensure this node's replication state matches the restored FSM state.
+func (f *FSM) reEvaluateLocalNodeRolesAfterRestore() {
+	f.logger.Info("Re-evaluating local node roles after FSM restore...")
+	for slotID, assignment := range f.slotAssignments {
+		// For each slot, determine if this local node is primary or replica.
+		// The `oldPrimaryNodeID` is tricky here. For a fresh restore, we might assume no prior state or use a placeholder.
+		// The goal is to ensure the replication managers are correctly started/stopped/configured.
+		// Passing assignment.PrimaryNodeID as oldPrimary effectively triggers a "state reconciliation" call.
+		f.handleSlotAssignmentChange(slotID, assignment, assignment.PrimaryNodeID)
+	}
+	f.logger.Info("Local node roles re-evaluation complete.")
+}
+
+// ShutdownChan returns a channel that is closed when the FSM is shutting down.
+func (f *FSM) ShutdownChan() <-chan struct{} {
+	return f.shutdownCh
+}
+
+// Close is called when the Raft node is shutting down.
+// It signals any FSM background goroutines to stop.
+func (f *FSM) Close() error {
+	f.logger.Info("FSM Close called, signaling shutdown.")
+	close(f.shutdownCh)
+	// Perform any other cleanup if necessary
+	return nil
+}
+
+// Helper for command payload
+func (c Command) PayloadGet(key string) string {
+	if len(c.Payload) == 0 {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(c.Payload, &m); err != nil {
+		return ""
+	}
+	if val, ok := m[key].(string); ok {
+		return val
+	}
+	return ""
+}
+
+// mapsAreEqual checks if two map[string]string are equal.
+func mapsAreEqual(m1, m2 map[string]string) bool {
+	if len(m1) != len(m2) {
+		return false
+	}
+	for k, v1 := range m1 {
+		if v2, ok := m2[k]; !ok || v1 != v2 {
+			return false
+		}
+	}
+	return true
+}
+
+// --- FSMSnapshot ---
+type fsmSnapshot struct {
+	data   []byte
+	logger *zap.Logger
+}
+
 func GetSlotForHashKey(key string) int {
 	// Using CRC32 IEEE polynomial for hashing, similar to Redis Cluster
 	// The result is then modulo TotalHashSlots to get the slot number.
@@ -327,72 +884,19 @@ func GetSlotForHashKey(key string) int {
 	return int(checksum % TotalHashSlots)
 }
 
-// GetNodeForHashKey determines which Storage Node a given key's slot is assigned to.
-// Returns the AssignedNodeID and true if found, otherwise empty string and false.
-func (f *GojoDBFSM) GetNodeForHashKey(key string) (string, bool) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	targetSlot := GetSlotForHashKey(key)
-
-	// Iterate through slot assignments to find the one that covers the target slot
-	for _, assignment := range f.slotAssignments {
-		if targetSlot >= assignment.StartSlot && targetSlot <= assignment.EndSlot {
-			return assignment.AssignedNodeID, true
-		}
+// Persist saves the FSM snapshot to a sink.
+func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
+	s.logger.Debug("Persisting FSM snapshot", zap.Int("size", len(s.data)))
+	if _, err := sink.Write(s.data); err != nil {
+		s.logger.Error("Failed to write FSM snapshot to sink", zap.Error(err))
+		sink.Cancel() // Signal an error to Raft
+		return fmt.Errorf("sink write: %w", err)
 	}
-	return "", false // No matching slot range found
+	return sink.Close() // Close successfully
 }
 
-// GetAllSlotAssignments returns a copy of the entire slot assignments map.
-func (f *GojoDBFSM) GetAllSlotAssignments() map[string]SlotRangeInfo {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	copyMap := make(map[string]SlotRangeInfo)
-	for k, v := range f.slotAssignments {
-		copyMap[k] = v
-	}
-	return copyMap
-}
-
-// --- FSMSnapshot Implementation ---
-
-// gojoDBFSMSnapshot implements the raft.FSMSnapshot interface.
-type gojoDBFSMSnapshot struct {
-	metadata        map[string]string
-	storageNodes    map[string]string
-	slotAssignments map[string]SlotRangeInfo // Include slot assignments in snapshot struct
-}
-
-// Persist writes the snapshot to the given sink.
-func (s *gojoDBFSMSnapshot) Persist(sink raft.SnapshotSink) error {
-	defer sink.Close()
-
-	snapshotData := struct {
-		Metadata        map[string]string        `json:"metadata"`
-		StorageNodes    map[string]string        `json:"storage_nodes"`
-		SlotAssignments map[string]SlotRangeInfo `json:"slot_assignments"` // Include slot assignments in snapshot data
-	}{
-		Metadata:        s.metadata,
-		StorageNodes:    s.storageNodes,
-		SlotAssignments: s.slotAssignments, // Populate slot assignments
-	}
-
-	bytes, err := json.Marshal(snapshotData)
-	if err != nil {
-		return fmt.Errorf("failed to marshal FSM snapshot: %w", err)
-	}
-
-	if _, err := sink.Write(bytes); err != nil {
-		return fmt.Errorf("failed to write FSM snapshot to sink: %w", err)
-	}
-
-	log.Println("DEBUG: FSM Snapshot persisted.")
-	return nil
-}
-
-// Release is called when the snapshot is no longer needed.
-func (s *gojoDBFSMSnapshot) Release() {
-	log.Println("DEBUG: FSM Snapshot released.")
-	// No-op for in-memory snapshot data after it's persisted.
+// Release is called when Raft is done with the snapshot.
+func (s *fsmSnapshot) Release() {
+	s.logger.Debug("Releasing FSM snapshot resources.")
+	s.data = nil // Allow GC
 }
