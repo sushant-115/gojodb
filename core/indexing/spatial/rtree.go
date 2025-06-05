@@ -429,17 +429,6 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 	defer rt.bpm.UnpinPage(leafNode.pageID, false) // Unpin after operations
 	//leafNode.mu.Lock() // Lock leaf node for modification
 	leafNode.AddEntry(entry)
-	// Log the insert operation before serialization
-	logRecord := &wal.LogRecord{
-		Type:    wal.LogTypeRTreeInsert,
-		PageID:  leafNode.pageID,
-		NewData: []byte(fmt.Sprintf(`{"Rect":{"MinX":%f,"MinY":%f,"MaxX":%f,"MaxY":%f},"Data":{"ID":"%s"}}`, rect.MinX, rect.MinY, rect.MaxX, rect.MaxY, data.ID)), // Serialize entry for WAL
-		LSN:     rt.lm.GetCurrentLSN(),
-	}
-	if _, err := rt.lm.Append(logRecord); err != nil {
-		//leafNode.mu.Unlock()
-		return fmt.Errorf("failed to log R-tree insert: %w", err)
-	}
 
 	// If leaf node overflows, split it
 	if len(leafNode.entries) > MaxEntries {
@@ -474,6 +463,18 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 		//leafNode.mu.Unlock()
 		return fmt.Errorf("failed to serialize leaf node %d: %w", leafNode.pageID, err)
 	}
+	// Log the insert operation before serialization
+	logRecord := &wal.LogRecord{
+		Type:    wal.LogTypeRTreeInsert,
+		PageID:  leafNode.pageID,
+		NewData: page.GetData(),
+		LSN:     rt.lm.GetCurrentLSN(),
+	}
+	if _, err := rt.lm.Append(logRecord); err != nil {
+		//leafNode.mu.Unlock()
+		return fmt.Errorf("failed to log R-tree insert: %w", err)
+	}
+
 	rt.bpm.UnpinPage(leafNode.pageID, true) // Mark dirty
 	//leafNode.mu.Unlock()
 	return nil

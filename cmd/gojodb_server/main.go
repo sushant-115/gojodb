@@ -204,7 +204,7 @@ func initStorageNode() error {
 
 	// 7. Initialize Replication Manager
 	// Pass the invertedIndexInstance to the ReplicationManager
-	replicationManager = replication.NewReplicationManager(myStorageNodeID, logManager, dbInstance, &dbLock, invertedIndexInstance)
+	replicationManager = replication.NewReplicationManager(myStorageNodeID, logManager, dbInstance, &dbLock, invertedIndexInstance, spatialIndexManager)
 	replicationManager.Start() // Start replication background tasks
 
 	// 8. Start background tasks

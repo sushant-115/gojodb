@@ -15,6 +15,7 @@ import (
 
 	btree_core "github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
+	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
@@ -24,6 +25,7 @@ import (
 const (
 	LogTypeBTree          = 1
 	LogTypeInvertedIndex  = 2
+	LogTypeSpatial        = 3
 	MaxRetryAttempts      = 5
 	InitialRetryDelay     = 1 * time.Second
 	MaxRetryDelay         = 30 * time.Second
@@ -57,6 +59,7 @@ type ReplicationManager struct {
 	dbInstance                         *btree_core.BTree[string, string]
 	dbLock                             *sync.RWMutex
 	invertedIndex                      *inverted_index.InvertedIndex
+	spatialIdx                         *spatial.SpatialIndexManager
 	replicationBTreeListenPort         string
 	replicationInvertedIndexListenPort string
 
@@ -76,13 +79,14 @@ type ReplicationManager struct {
 }
 
 // NewReplicationManager creates and initializes a ReplicationManager.
-func NewReplicationManager(nodeID string, lm *wal.LogManager, db *btree_core.BTree[string, string], lock *sync.RWMutex, ii *inverted_index.InvertedIndex) *ReplicationManager {
+func NewReplicationManager(nodeID string, lm *wal.LogManager, db *btree_core.BTree[string, string], lock *sync.RWMutex, ii *inverted_index.InvertedIndex, spatialIdx *spatial.SpatialIndexManager) *ReplicationManager {
 	return &ReplicationManager{
 		nodeID:                             nodeID,
 		logManager:                         lm,
 		dbInstance:                         db,
 		dbLock:                             lock,
 		invertedIndex:                      ii,
+		spatialIdx:                         spatialIdx,
 		primaryForSlots:                    make(map[string]fsm.SlotRangeInfo),
 		replicas:                           make(map[string]*ReplicaInfo),
 		stopChan:                           make(chan struct{}),
@@ -253,7 +257,7 @@ func (rm *ReplicationManager) applyLogRecord(lr wal.LogRecord, logType int) erro
 
 		// Apply B-tree log record (simplified logic from your original code)
 		switch lr.Type {
-		case wal.LogRecordTypeNewPage:
+		case wal.LogRecordTypeNewPage, wal.LogRecordTypeInsertKey, wal.LogTypeRTreeInsert, wal.LogTypeRTreeNewRoot:
 			if lr.PageID.GetID() >= rm.dbInstance.GetNumPages() {
 				emptyPage := make([]byte, rm.dbInstance.GetPageSize())
 				if writeErr := rm.dbInstance.WritePage(lr.PageID, emptyPage); writeErr != nil {
@@ -277,7 +281,7 @@ func (rm *ReplicationManager) applyLogRecord(lr wal.LogRecord, logType int) erro
 			if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
 				return fmt.Errorf("failed to flush page %d after NEW_PAGE: %w", page.GetPageID(), errFlush)
 			}
-		case wal.LogRecordTypeUpdate:
+		case wal.LogRecordTypeUpdate, wal.LogTypeRTreeUpdate:
 			page, fetchErr := rm.dbInstance.FetchPage(lr.PageID)
 			if fetchErr != nil {
 				return fmt.Errorf("failed to fetch page %d for UPDATE: %w", lr.PageID, fetchErr)
@@ -292,7 +296,7 @@ func (rm *ReplicationManager) applyLogRecord(lr wal.LogRecord, logType int) erro
 			if errFlush := rm.dbInstance.FlushPage(page.GetPageID()); errFlush != nil {
 				return fmt.Errorf("failed to flush page %d after UPDATE: %w", page.GetPageID(), errFlush)
 			}
-		case wal.LogRecordTypeRootChange:
+		case wal.LogRecordTypeRootChange, wal.LogTypeRTreeSplit:
 			newRootPageID := pagemanager.PageID(binary.LittleEndian.Uint64(lr.NewData))
 			rm.dbInstance.SetRootPageID(newRootPageID, lr.TxnID)
 			if err := rm.dbInstance.GetDiskManager().UpdateHeaderField(func(h *flushmanager.DBFileHeader) {

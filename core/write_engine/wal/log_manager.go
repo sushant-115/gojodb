@@ -408,7 +408,7 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, lastLSN LSN) error {
 				// Read page from disk (it might not exist if it's a new page log record)
 				readErr := dm.ReadPage(lr.PageID, pageData)
 				if readErr != nil && lr.Type != LogRecordTypeNewPage {
-					log.Printf("WARNING: Failed to read page %d for recovery replay: %v. Skipping record LSN %d.", lr.PageID, readErr, lr.LSN)
+					log.Fatalf("Critical: Failed to read page %d for recovery replay: %v. Skipping record LSN %d.", lr.PageID, readErr, lr.LSN)
 					// A real system might panic or require manual intervention here.
 					currentLocalOffset += LSN(lr.Size()) // Advance LSN even on error
 					continue
@@ -418,7 +418,7 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, lastLSN LSN) error {
 
 				// Apply the change based on log record type
 				switch lr.Type {
-				case LogRecordTypeNewPage:
+				case LogRecordTypeNewPage, LogTypeRTreeNewRoot:
 					// Ensure the page exists on disk. If it was truncated, re-allocate.
 					if lr.PageID.GetID() >= dm.GetNumPages() {
 						log.Printf("INFO: Re-allocating page %d during recovery (was truncated or never allocated).", lr.PageID)
@@ -440,7 +440,7 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, lastLSN LSN) error {
 						// bpm.InvalidatePage(lr.PageID)
 					}
 
-				case LogRecordTypeUpdate:
+				case LogRecordTypeUpdate, LogTypeRTreeUpdate, LogTypeRTreeInsert:
 					copy(pageData, lr.NewData) // Overwrite page data with new data
 					if writeErr := dm.WritePage(lr.PageID, pageData); writeErr != nil {
 						return fmt.Errorf("failed to write updated page %d during recovery: %w", lr.PageID, writeErr)
@@ -449,7 +449,7 @@ func (lm *LogManager) Recover(dm *flushmanager.DiskManager, lastLSN LSN) error {
 					// These would require understanding the byte format within the page.
 					// For now, LogRecordTypeUpdate is a generic page overwrite.
 
-				case LogRecordTypeRootChange: // NEW: Handle root page ID changes during recovery
+				case LogRecordTypeRootChange, LogTypeRTreeSplit: // NEW: Handle root page ID changes during recovery
 					newRootPageID := pagemanager.PageID(binary.LittleEndian.Uint64(lr.NewData))
 					log.Printf("INFO: Recovery: Applying root page ID change to %d (from LSN %d).", newRootPageID, lr.LSN)
 					if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
