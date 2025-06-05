@@ -92,23 +92,23 @@ func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
 	switch cmd.Op {
 	case OpSetMetadata:
 		f.metadata[cmd.Key] = cmd.Value
-		log.Printf("DEBUG: FSM applied: Set metadata '%s' = '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Set metadata '%s' = '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
 		return nil
 	case OpDeleteMetadata:
 		delete(f.metadata, cmd.Key)
-		log.Printf("DEBUG: FSM applied: Deleted metadata '%s' (Index: %d)", cmd.Key, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Deleted metadata '%s' (Index: %d)", cmd.Key, logEntry.Index)
 		return nil
 	case OpAddStorageNode:
 		f.storageNodes[cmd.Key] = cmd.Value // Key is NodeID, Value is Address
-		log.Printf("DEBUG: FSM applied: Added Storage Node '%s' at '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Added Storage Node '%s' at '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
 		return nil
 	case OpRemoveStorageNode:
 		delete(f.storageNodes, cmd.Key)
-		log.Printf("DEBUG: FSM applied: Removed Storage Node '%s' (Index: %d)", cmd.Key, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Removed Storage Node '%s' (Index: %d)", cmd.Key, logEntry.Index)
 		return nil
 	case OpUpdateNodeStatus:
 		f.storageNodes[cmd.Key] = cmd.Value // Update status/address
-		log.Printf("DEBUG: FSM applied: Updated Storage Node '%s' status to '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Updated Storage Node '%s' status to '%s' (Index: %d)", cmd.Key, cmd.Value, logEntry.Index)
 		return nil
 
 	// --- Hash Sharding Operations Apply Logic ---
@@ -120,8 +120,8 @@ func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
 		}
 		// Use RangeID as the map key
 		f.slotAssignments[slotRangeInfo.RangeID] = slotRangeInfo
-		log.Printf("DEBUG: FSM applied: Assigned Slot Range '%s' (%d-%d) to Node '%s' (Index: %d)",
-			slotRangeInfo.RangeID, slotRangeInfo.StartSlot, slotRangeInfo.EndSlot, slotRangeInfo.AssignedNodeID, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Assigned Slot Range '%s' (%d-%d) to Node '%s' (Index: %d)",
+		// slotRangeInfo.RangeID, slotRangeInfo.StartSlot, slotRangeInfo.EndSlot, slotRangeInfo.AssignedNodeID, logEntry.Index)
 		return nil
 	case OpSplitSlotRange:
 		// cmd.Key: original RangeID to split
@@ -134,18 +134,18 @@ func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
 
 		// Remove the original slot range
 		delete(f.slotAssignments, cmd.Key)
-		log.Printf("DEBUG: FSM applied: Removed original slot range '%s' for split (Index: %d)", cmd.Key, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Removed original slot range '%s' for split (Index: %d)", cmd.Key, logEntry.Index)
 
 		// Add the new split slot ranges
 		for _, newRange := range newSlotRanges {
 			f.slotAssignments[newRange.RangeID] = newRange
-			log.Printf("DEBUG: FSM applied: Added new split slot range '%s' (%d-%d) to Node '%s' (Index: %d)",
-				newRange.RangeID, newRange.StartSlot, newRange.EndSlot, newRange.AssignedNodeID, logEntry.Index)
+			// log.Printf("DEBUG: FSM applied: Added new split slot range '%s' (%d-%d) to Node '%s' (Index: %d)",
+			// newRange.RangeID, newRange.StartSlot, newRange.EndSlot, newRange.AssignedNodeID, logEntry.Index)
 		}
 		return nil
 	case OpRemoveSlotRange:
 		delete(f.slotAssignments, cmd.Key)
-		log.Printf("DEBUG: FSM applied: Removed Slot Range '%s' (Index: %d)", cmd.Key, logEntry.Index)
+		// log.Printf("DEBUG: FSM applied: Removed Slot Range '%s' (Index: %d)", cmd.Key, logEntry.Index)
 		return nil
 		// --- End Hash Sharding Operations Apply Logic ---
 
@@ -162,8 +162,8 @@ func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
 			existing.Status = slotInfo.Status // Update status if provided (e.g., "active")
 			existing.LastUpdated = time.Now()
 			f.slotAssignments[slotInfo.RangeID] = existing
-			log.Printf("DEBUG: FSM applied: Set Primary '%s' and Replicas %v for slot range '%s' (Index: %d)",
-				slotInfo.PrimaryNodeID, slotInfo.ReplicaNodeIDs, slotInfo.RangeID, logEntry.Index)
+			// log.Printf("DEBUG: FSM applied: Set Primary '%s' and Replicas %v for slot range '%s' (Index: %d)",
+			// slotInfo.PrimaryNodeID, slotInfo.ReplicaNodeIDs, slotInfo.RangeID, logEntry.Index)
 		} else {
 			log.Printf("WARNING: FSM tried to set primary/replica for non-existent slot range '%s' (Index: %d)", slotInfo.RangeID, logEntry.Index)
 			return fmt.Errorf("slot range %s not found for primary/replica assignment", slotInfo.RangeID)
@@ -191,8 +191,8 @@ func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
 			existing.Status = "active" // Or "recovering"
 			existing.LastUpdated = time.Now()
 			f.slotAssignments[cmd.Key] = existing
-			log.Printf("DEBUG: FSM applied: Promoted Node '%s' to Primary for slot range '%s' (Index: %d)",
-				newPrimaryNodeID, cmd.Key, logEntry.Index)
+			// log.Printf("DEBUG: FSM applied: Promoted Node '%s' to Primary for slot range '%s' (Index: %d)",
+			// newPrimaryNodeID, cmd.Key, logEntry.Index)
 		} else {
 			log.Printf("WARNING: FSM tried to promote replica for non-existent slot range '%s' (Index: %d)", cmd.Key, logEntry.Index)
 			return fmt.Errorf("slot range %s not found for replica promotion", cmd.Key)
@@ -212,8 +212,8 @@ func (f *GojoDBFSM) Apply(logEntry *raft.Log) interface{} {
 			existing.ReplicaNodeIDs = newReplicas
 			existing.LastUpdated = time.Now()
 			f.slotAssignments[cmd.Key] = existing
-			log.Printf("DEBUG: FSM applied: Removed Replica '%s' from slot range '%s' (Index: %d)",
-				replicaToRemoveID, cmd.Key, logEntry.Index)
+			// log.Printf("DEBUG: FSM applied: Removed Replica '%s' from slot range '%s' (Index: %d)",
+			// replicaToRemoveID, cmd.Key, logEntry.Index)
 		} else {
 			log.Printf("WARNING: FSM tried to remove replica for non-existent slot range '%s' (Index: %d)", cmd.Key, logEntry.Index)
 			return fmt.Errorf("slot range %s not found for replica removal", cmd.Key)

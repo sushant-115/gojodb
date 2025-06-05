@@ -411,13 +411,13 @@ func (rm *ReplicationManager) initConnectionAndStreamLogs(currentPrimarySlots ma
 			if rm.replicationBTreeListenPort == bTreeReplicaPort || rm.replicationInvertedIndexListenPort == idxReplicaPort {
 				log.Println("Couldn't get the replica port: ", bTreeReplicaPort, idxReplicaPort)
 			}
-			// log.Println("Sending logstreams to: ", "localhost:"+bTreeReplicaPort, " for Btree and to localhost:"+idxReplicaPort, " for InvertedIdx")
+
 			rm.primaryMu.Lock()
 			bTreeConn, connExists := rm.replicaClients[replicaAddr+"_btree_conn"]
 			if !connExists {
 				var err error
 
-				bTreeConn, err = net.DialTimeout("tcp", "localhost:"+bTreeReplicaPort, storageNodeDialTimeout)
+				bTreeConn, err = net.DialTimeout("tcp", bTreeReplicaPort, storageNodeDialTimeout)
 				if err != nil {
 					log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
 					rm.primaryMu.Unlock()
@@ -433,7 +433,7 @@ func (rm *ReplicationManager) initConnectionAndStreamLogs(currentPrimarySlots ma
 			if !connExists {
 				var err error
 
-				idxConn, err = net.DialTimeout("tcp", "localhost:"+idxReplicaPort, storageNodeDialTimeout)
+				idxConn, err = net.DialTimeout("tcp", idxReplicaPort, storageNodeDialTimeout)
 				if err != nil {
 					log.Printf("ERROR: ReplicationManager: Failed to connect to replica %s at %s: %v", replicaID, replicaAddr, err)
 					rm.primaryMu.Unlock()
@@ -454,6 +454,7 @@ func (rm *ReplicationManager) initConnectionAndStreamLogs(currentPrimarySlots ma
 // It concurrently streams logs from both the B-tree's log manager and the inverted index's log manager.
 func (rm *ReplicationManager) streamLogsToReplica(replicaAddr, replicaID string, logType int) {
 	var wg sync.WaitGroup
+	log.Println("Replication: streaming logs to: ", replicaAddr, replicaID, logType)
 	stopStreaming := make(chan struct{}) // Channel to signal goroutines to stop
 
 	// Stream B-tree logs

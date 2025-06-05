@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -21,10 +23,7 @@ import (
 )
 
 const (
-	defaultRaftPort      = 8081
-	defaultHTTPPort      = 8080
-	defaultNodeID        = "node1"
-	defaultRaftDir       = "raft_data"
+	defaultRaftDir       = "raft_data_new"
 	defaultRaftSnapshots = 2                // Number of Raft snapshots to retain
 	heartbeatInterval    = 5 * time.Second  // Interval for Storage Node heartbeats
 	heartbeatTimeout     = 15 * time.Second // Timeout for Storage Node health
@@ -41,24 +40,31 @@ type Controller struct {
 	nodeID       string
 
 	// Node Manager (Initial)
-	localHeartbeatMap   map[string]time.Time // Local map to track last heartbeat time for timeout detection
-	storageNodesMu      sync.Mutex           // Protects local heartbeat tracking map
-	heartbeatListener   *net.UDPConn         // Listener for incoming heartbeats from Storage Nodes
-	heartbeatListenPort int                  // Configurable UDP port for heartbeats
+	localHeartbeatMap      map[string]time.Time // Local map to track last heartbeat time for timeout detection
+	storageNodesMu         sync.Mutex           // Protects local heartbeat tracking map
+	heartbeatListener      *net.Listener        // Listener for incoming heartbeats from Storage Nodes
+	heartbeatListenAddress string               // Configurable UDP port for heartbeats
+}
+
+type HeartbeatMessage struct {
+	NodeID    string `json:"node_id"`
+	Address   string `json:"address"`
+	Timestamp int64  `json:"timestamp"` // Unix timestamp
 }
 
 // NewController creates and initializes a new Controller node.
-func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenPort int) (*Controller, error) {
+func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenAddress string) (*Controller, error) {
 	c := &Controller{
-		fsm:                 fsm.NewGojoDBFSM(), // Initialize our FSM
-		raftDir:             raftDir,
-		raftBindAddr:        raftBindAddr,
-		nodeID:              nodeID,
-		localHeartbeatMap:   make(map[string]time.Time), // Initialize local map
-		heartbeatListenPort: heartbeatListenPort,        // Set configurable port
+		fsm:                    fsm.NewGojoDBFSM(), // Initialize our FSM
+		raftDir:                raftDir,
+		raftBindAddr:           raftBindAddr,
+		nodeID:                 nodeID,
+		localHeartbeatMap:      make(map[string]time.Time), // Initialize local map
+		heartbeatListenAddress: heartbeatListenAddress,     // Set configurable port
 	}
 
 	// Setup Raft
+	log.Println("Join addr: ", joinAddr)
 	if err := c.setupRaft(joinAddr); err != nil {
 		return nil, fmt.Errorf("failed to setup Raft: %w", err)
 	}
@@ -67,7 +73,8 @@ func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir 
 	go c.startHTTPServer(httpAddr)
 
 	// Start Heartbeat Listener for Storage Nodes
-	go c.startHeartbeatListener()
+	// go c.startHeartbeatListener()
+	go c.ReceiveHeartbeatsTCP(context.Background(), heartbeatListenAddress, 10*time.Second)
 
 	// Start background goroutine for monitoring Storage Nodes
 	go c.monitorStorageNodes()
@@ -144,8 +151,12 @@ func (c *Controller) setupRaft(joinAddr string) error {
 	} else {
 		log.Printf("INFO: Attempting to join Raft cluster at %s", joinAddr)
 		// Attempt to join an existing cluster
-		if err := c.joinRaftCluster(joinAddr); err != nil {
-			return fmt.Errorf("failed to join Raft cluster: %w", err)
+		for i := 1; i < 4; i++ {
+			if err := c.joinRaftCluster(joinAddr); err != nil && i >= 4 {
+				return fmt.Errorf("failed to join Raft cluster: %w", err)
+			}
+			log.Println("WARN: couldn't join the raft cluster, retrying in ", i*5, "Seconds")
+			time.Sleep(time.Duration(i) * 5 * time.Second)
 		}
 	}
 
@@ -448,36 +459,47 @@ func (c *Controller) startHTTPServer(httpAddr string) {
 
 // startHeartbeatListener starts a UDP listener for Storage Node heartbeats.
 func (c *Controller) startHeartbeatListener() {
-	addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(c.heartbeatListenPort))
-	if err != nil {
-		log.Fatalf("FATAL: Failed to resolve UDP address for heartbeat listener: %v", err)
-	}
-	listener, err := net.ListenUDP("udp", addr)
+	// addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(c.heartbeatListenPort))
+	// if err != nil {
+	// 	log.Fatalf("FATAL: Failed to resolve UDP address for heartbeat listener: %v", err)
+	// }
+	listener, err := net.Listen("tcp", c.heartbeatListenAddress)
 	if err != nil {
 		log.Fatalf("FATAL: Failed to start UDP heartbeat listener: %v", err)
 	}
-	c.heartbeatListener = listener
-	log.Printf("INFO: Heartbeat listener started on UDP %s", listener.LocalAddr().String())
+	c.heartbeatListener = &listener
+	log.Printf("INFO: Heartbeat listener started on UDP %s", listener.Addr().String())
 
-	buffer := make([]byte, 1024)
 	for {
-		n, remoteAddr, err := listener.ReadFromUDP(buffer)
+		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("ERROR: Error reading heartbeat: %v", err)
 			continue
 		}
-		// Assuming heartbeat message is just the Storage Node ID and its address
-		// Format: "NODE_ID:ADDRESS" e.g., "storage1:localhost:9000"
-		heartbeatMsg := string(buffer[:n])
-		parts := strings.SplitN(heartbeatMsg, ":", 2)
-		if len(parts) != 2 {
-			log.Printf("WARNING: Invalid heartbeat format from %s: '%s'", remoteAddr.String(), heartbeatMsg)
-			continue
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			heartbeatMessage := scanner.Text()
+			if strings.TrimSpace(heartbeatMessage) == "" {
+				continue
+			}
+			parts := strings.SplitN(heartbeatMessage, ":", 2)
+			if len(parts) != 2 {
+				log.Printf("WARNING: Invalid heartbeat format from %s: '%s'", conn.RemoteAddr().String(), heartbeatMessage)
+				continue
+			}
+			storageNodeID := parts[0]
+			storageNodeAddr := parts[1]
+			log.Println("Received heartbeat: ", parts)
+			c.recordHeartbeat(storageNodeID, storageNodeAddr)
+			log.Printf("Received heartbeat from %s: %s", conn.RemoteAddr().String(), heartbeatMessage)
 		}
-		storageNodeID := parts[0]
-		storageNodeAddr := parts[1]
 
-		c.recordHeartbeat(storageNodeID, storageNodeAddr)
+		if err := scanner.Err(); err != nil {
+			log.Printf("Connection error from %s: %v", conn.RemoteAddr().String(), err)
+		} else {
+			log.Printf("Connection closed from %s", conn.RemoteAddr().String())
+		}
+
 	}
 }
 
@@ -509,8 +531,106 @@ func (c *Controller) recordHeartbeat(nodeID string, addr string) {
 			log.Printf("DEBUG: Applied heartbeat for Storage Node %s (%s) to Raft FSM.", nodeID, addr)
 		}
 	} else {
-		log.Printf("DEBUG: Received heartbeat from Storage Node %s (%s) but not leader. Not applying to Raft.", nodeID, addr)
+		// log.Printf("DEBUG: Received heartbeat from Storage Node %s (%s) but not leader. Not applying to Raft.", nodeID, addr)
 	}
+}
+
+// ReceiveHeartbeatsTCP listens for incoming heartbeat messages on a given TCP address.
+// It updates a map of active nodes and removes nodes that haven't sent heartbeats recently.
+// The context allows for graceful shutdown.
+func (c *Controller) ReceiveHeartbeatsTCP(ctx context.Context, listenAddr string, timeout time.Duration) {
+	log.Printf("Starting TCP heartbeat receiver on %s", listenAddr)
+
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("Failed to start TCP listener on %s: %v", listenAddr, err)
+	}
+	defer listener.Close()
+
+	// Map to store last heartbeat time for each node
+	activeNodes := make(map[string]HeartbeatMessage)
+	var mu sync.RWMutex // Mutex to protect activeNodes map
+
+	// Goroutine to periodically clean up timed-out nodes
+	go func() {
+		cleanupTicker := time.NewTicker(timeout / 2) // Check more frequently than timeout
+		defer cleanupTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Heartbeat receiver cleanup routine stopped.")
+				return
+			case <-cleanupTicker.C:
+				mu.Lock()
+				for nodeID, msg := range activeNodes {
+					// Check if the last heartbeat is older than the timeout
+					if time.Now().UnixNano()-msg.Timestamp > int64(timeout) {
+						log.Printf("Node %s (%s) timed out. Removing from active nodes.", nodeID, msg.Address)
+						delete(activeNodes, nodeID)
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	// Goroutine to accept incoming connections
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Heartbeat receiver stopping connection acceptance.")
+				return
+			default:
+				// Set a deadline for accepting new connections
+				conn, err := listener.Accept()
+				if err != nil {
+					if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+						continue // Timeout, try again
+					}
+					log.Printf("Failed to accept connection: %v", err)
+					continue
+				}
+				//conn.SetDeadline(time.Now().Add(time.Second))
+
+				// Handle each connection in a new goroutine
+				go func(conn net.Conn) {
+					defer conn.Close()
+					reader := bufio.NewReader(conn)
+					for {
+						// Read until newline delimiter
+						data, err := reader.ReadBytes('\n')
+						if err != nil {
+							if err.Error() == "EOF" {
+								// Connection closed by sender
+								// log.Printf("Connection from %s closed.", c.RemoteAddr())
+							} else {
+								log.Printf("Error reading heartbeat from %s: %v", conn.RemoteAddr(), err)
+							}
+							return
+						}
+
+						var msg HeartbeatMessage
+						if err := json.Unmarshal(data, &msg); err != nil {
+							log.Printf("Failed to unmarshal heartbeat message from %s: %v", conn.RemoteAddr(), err)
+							continue
+						}
+
+						mu.Lock()
+						activeNodes[msg.NodeID] = msg
+						mu.Unlock()
+						// log.Printf("Received heartbeat from NodeID: %s, Address: %s (Last seen: %s)",
+						// 	msg.NodeID, msg.Address, time.Unix(0, msg.Timestamp).Format(time.StampMilli))
+						c.recordHeartbeat(msg.NodeID, msg.Address)
+					}
+				}(conn)
+			}
+		}
+	}()
+
+	<-ctx.Done() // Block until context is cancelled
+	log.Println("Heartbeat receiver fully stopped.")
 }
 
 // monitorStorageNodes periodically checks the health of registered Storage Nodes.
@@ -580,27 +700,22 @@ func main() {
 
 	nodeID := os.Getenv("NODE_ID")
 	if nodeID == "" {
-		nodeID = defaultNodeID // Default for single node testing
+		log.Fatal("NODE_ID is not set in environmnet")
 	}
 	raftBindAddr := os.Getenv("RAFT_BIND_ADDR")
 	if raftBindAddr == "" {
-		raftBindAddr = fmt.Sprintf("localhost:%d", defaultRaftPort)
+		log.Fatal("RAFT_BIND_ADDR is not set in environmnet")
 	}
 	httpAddr := os.Getenv("HTTP_ADDR")
 	if httpAddr == "" {
-		httpAddr = fmt.Sprintf("localhost:%d", defaultHTTPPort)
+		log.Fatal("HTTP_ADDR is not set in environmnet")
 	}
 	joinAddr := os.Getenv("JOIN_ADDR") // Optional: address of an existing node to join
 
 	// Configurable Heartbeat Listen Port for Controller
-	heartbeatListenPortStr := os.Getenv("HEARTBEAT_LISTEN_PORT")
-	heartbeatListenPort := defaultHeartbeatListenPort
-	if heartbeatListenPortStr != "" {
-		parsedPort, err := strconv.Atoi(heartbeatListenPortStr)
-		if err != nil {
-			log.Fatalf("FATAL: Invalid HEARTBEAT_LISTEN_PORT: %v", err)
-		}
-		heartbeatListenPort = parsedPort
+	heartbeatListenAddress := os.Getenv("HEARTBEAT_LISTEN_ADDR")
+	if heartbeatListenAddress == "" {
+		log.Fatal("HEARTBEAT_LISTEN_ADDR is not set in environmnet")
 	}
 
 	// Simulated Storage Node parameters (for testing heartbeat integration)
@@ -625,7 +740,7 @@ func main() {
 	}
 	log.Printf("INFO: Raft data directory for %s: %s", nodeID, raftDataPath)
 
-	_, err := NewController(nodeID, raftBindAddr, httpAddr, raftDataPath, joinAddr, heartbeatListenPort) // Pass heartbeatListenPort
+	_, err := NewController(nodeID, raftBindAddr, httpAddr, raftDataPath, joinAddr, heartbeatListenAddress) // Pass heartbeatListenPort
 	if err != nil {
 		log.Fatalf("FATAL: Failed to create controller: %v", err)
 	}
