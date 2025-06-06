@@ -1,4 +1,4 @@
-package main
+package basic
 
 import (
 	"bufio"
@@ -15,11 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/raft"
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus" // Import the FSM for sharding info (e.g., GetSlotForHashKey, SlotRangeInfo)
 )
 
 var (
-	apiServiceAddr          = os.Getenv("API_SERVICE_ADDR")
+	apiControllerAddr       = os.Getenv("API_SERVICE_ADDR")
 	controllerHTTPAddresses = os.Getenv("RAFT_ADDRESS") // Comma-separated list of Controller HTTP addresses
 )
 
@@ -77,8 +78,8 @@ type ControllerStatus struct {
 	Address  string // HTTP address of this controller node
 }
 
-// APIService manages the API endpoints and routing logic.
-type APIService struct {
+// APIController manages the API endpoints and routing logic.
+type APIController struct {
 	controllerAddrs []string
 
 	// Controller Cluster State
@@ -108,10 +109,10 @@ type APIService struct {
 	nextTxnIDMu sync.Mutex
 }
 
-// NewAPIService creates and initializes a new API Service.
-func NewAPIService(controllerHTTPAddrs string) *APIService {
-	service := &APIService{
-		controllerAddrs:      strings.Split(controllerHTTPAddrs, ","),
+// NewAPIController creates and initializes a new API Service.
+func NewAPIController(raftController *raft.Raft, fsmStore *fsm.FSM) *APIController {
+	service := &APIController{
+		controllerAddrs:      []string{},
 		controllerStates:     make(map[string]ControllerStatus),
 		storageNodeAddresses: make(map[string]string),
 		storageNodeHealth:    make(map[string]bool),
@@ -119,14 +120,14 @@ func NewAPIService(controllerHTTPAddrs string) *APIService {
 		storageNodePools:     make(map[string]*sync.Pool),
 		nextTxnID:            time.Now().UnixNano(), // Basic unique ID for transactions
 	}
-	go service.monitorControllerCluster() // Start monitoring controller cluster and fetching shard map
-	go service.monitorStorageNodeHealth() // Start monitoring storage node health
+	go service.monitorControllerCluster(raftController, fsmStore) // Start monitoring controller cluster and fetching shard map
+	go service.monitorStorageNodeHealth(raftController, fsmStore) // Start monitoring storage node health
 	return service
 }
 
 // monitorControllerCluster periodically pings controller nodes to find the current Raft leader,
 // fetch their status, and update the cached storage node addresses and shard map.
-func (s *APIService) monitorControllerCluster() {
+func (s *APIController) monitorControllerCluster(raftController *raft.Raft, fsmStore *fsm.FSM) {
 	ticker := time.NewTicker(controllerMonitorInterval)
 	defer ticker.Stop()
 
@@ -134,9 +135,21 @@ func (s *APIService) monitorControllerCluster() {
 		currentLeader := ""
 		tempControllerStates := make(map[string]ControllerStatus)
 		tempStorageNodeAddresses := make(map[string]string)
-
+		leaderServerAddr, leaderID := raftController.LeaderWithID()
 		// 1. Ping all controllers to get their status and find the leader
-		for _, addr := range s.controllerAddrs {
+		controllerStats := raftController.Stats()
+		c, found := controllerStats["latest_configuration"]
+		controllers := make(map[string]string)
+		if found {}
+		str, err := json.Unmarshal([]byte(c), &controllers)
+		if err != nil {
+			log.Println("Controllers: ", c, err)
+		}
+
+		for k,v := range(controllers) {
+			log.Println("K V: ", k, v)
+		}
+		for key, addr := range  {
 			resp, err := http.Get(fmt.Sprintf("http://%s/status", addr))
 			if err != nil {
 				// log.Printf("DEBUG: API Service: Failed to reach Controller %s for status: %v", addr, err) // Too noisy
@@ -239,7 +252,7 @@ func (s *APIService) monitorControllerCluster() {
 }
 
 // monitorStorageNodeHealth periodically pings all known storage nodes to update their health status.
-func (s *APIService) monitorStorageNodeHealth() {
+func (s *APIController) monitorStorageNodeHealth(raftController *raft.Raft, fsmStore *fsm.FSM) {
 	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
 
@@ -293,7 +306,7 @@ func (s *APIService) monitorStorageNodeHealth() {
 // getNodeIDFromAddress is a helper to get the NodeID from its address.
 // This is a reverse lookup and might be inefficient for large numbers of nodes.
 // For logging purposes, it's acceptable.
-func (s *APIService) getNodeIDFromAddress(addr string) string {
+func (s *APIController) getNodeIDFromAddress(addr string) string {
 	s.storageNodeAddressesMu.RLock()
 	defer s.storageNodeAddressesMu.RUnlock()
 	for id, a := range s.storageNodeAddresses {
@@ -305,7 +318,7 @@ func (s *APIService) getNodeIDFromAddress(addr string) string {
 }
 
 // getStorageNodeConn gets or establishes a TCP connection to a Storage Node from the pool.
-func (s *APIService) getStorageNodeConn(nodeAddr string) (net.Conn, error) {
+func (s *APIController) getStorageNodeConn(nodeAddr string) (net.Conn, error) {
 	s.storageNodeHealthMu.RLock()
 	isHealthy := s.storageNodeHealth[nodeAddr]
 	s.storageNodeHealthMu.RUnlock()
@@ -377,7 +390,7 @@ func isConnWritable(conn net.Conn) bool {
 }
 
 // returnStorageNodeConn returns a connection to its pool.
-func (s *APIService) returnStorageNodeConn(nodeAddr string, conn net.Conn) {
+func (s *APIController) returnStorageNodeConn(nodeAddr string, conn net.Conn) {
 	s.storageNodePoolsMu.Lock()
 	defer s.storageNodePoolsMu.Unlock()
 
@@ -404,7 +417,7 @@ func authenticate(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleAPIRequest is the main router for all incoming HTTP requests to the API service.
-func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
+func (s *APIController) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	// --- Check for Controller Leader (Fail Fast if no leader for critical ops) ---
@@ -445,7 +458,7 @@ func (s *APIService) handleAPIRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAdminRequest routes authenticated admin requests to the Controller Leader.
-func (s *APIService) handleAdminRequest(w http.ResponseWriter, r *http.Request) {
+func (s *APIController) handleAdminRequest(w http.ResponseWriter, r *http.Request) {
 	s.leaderMu.RLock()
 	leaderAddr := s.currentControllerLeader
 	s.leaderMu.RUnlock()
@@ -489,7 +502,7 @@ func (s *APIService) handleAdminRequest(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleClusterStatus queries all Controller nodes and aggregates their status.
-func (s *APIService) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
+func (s *APIController) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	s.controllerStatesMu.RLock()
 	states := s.controllerStates // Get a copy of the current states
 	s.controllerStatesMu.RUnlock()
@@ -582,7 +595,7 @@ func setConnDeadline(conn net.Conn) net.Conn {
 
 // getResponsibleNodesForSlot returns a list of healthy storage node addresses responsible for a given slot.
 // If `forWrite` is true, it returns only the primary. If false, it returns primary + replicas.
-func (s *APIService) getResponsibleNodesForSlot(slot int, forWrite bool) ([]string, error) {
+func (s *APIController) getResponsibleNodesForSlot(slot int, forWrite bool) ([]string, error) {
 	log.Printf("DEBUG: getResponsibleNodesForSlot called for slot %d, forWrite: %t", slot, forWrite)
 
 	s.slotAssignmentsMu.RLock()
@@ -658,7 +671,7 @@ func (s *APIService) getResponsibleNodesForSlot(slot int, forWrite bool) ([]stri
 }
 
 // handleDataRequest processes client data requests (PUT/GET/DELETE) and routes them to Storage Nodes.
-func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
+func (s *APIController) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { // Using POST for all commands for simplicity
 		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
 		return
@@ -776,7 +789,7 @@ func (s *APIService) handleDataRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTransactionRequest handles distributed transaction requests (2PC Coordinator).
-func (s *APIService) handleTransactionRequest(w http.ResponseWriter, r *http.Request) {
+func (s *APIController) handleTransactionRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
 		return
@@ -911,7 +924,7 @@ func (s *APIService) handleTransactionRequest(w http.ResponseWriter, r *http.Req
 }
 
 // sendStorageNodeCommand is a helper to send a command string to a Storage Node and get its response.
-func (s *APIService) sendStorageNodeCommand(nodeAddr string, command string) (APIResponse, error) {
+func (s *APIController) sendStorageNodeCommand(nodeAddr string, command string) (APIResponse, error) {
 	conn, err := s.getStorageNodeConn(nodeAddr)
 	if err != nil {
 		return APIResponse{Status: "ERROR"}, fmt.Errorf("failed to get connection to storage node %s: %w", nodeAddr, err)
@@ -970,7 +983,7 @@ func deserializeOperations(s string) ([]TransactionOperation, error) {
 }
 
 // handleQueryRequest processes client range query and aggregation requests.
-func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) {
+func (s *APIController) handleQueryRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
 		return
@@ -1035,7 +1048,7 @@ func (s *APIService) handleQueryRequest(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleTextSearchRequest processes client text-based search requests.
-func (s *APIService) handleTextSearchRequest(w http.ResponseWriter, r *http.Request) {
+func (s *APIController) handleTextSearchRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
 		return
@@ -1111,27 +1124,27 @@ func (s *APIService) handleTextSearchRequest(w http.ResponseWriter, r *http.Requ
 	log.Printf("INFO: API Service: Text search '%s' completed with status: %s", apiReq.Query, apiResp.Status)
 }
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
+// func main() {
+// 	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include file and line number in logs for debugging
 
-	// Create API service instance
-	service := NewAPIService(controllerHTTPAddresses)
+// 	// Create API service instance
+// 	service := NewAPIController(controllerHTTPAddresses)
 
-	// Set up HTTP handler for the main router
-	http.HandleFunc("/", service.handleAPIRequest) // Route all incoming requests through handleAPIRequest
+// 	// Set up HTTP handler for the main router
+// 	http.HandleFunc("/", service.handleAPIRequest) // Route all incoming requests through handleAPIRequest
 
-	log.Printf("INFO: GojoDB API Service listening on %s", apiServiceAddr)
-	log.Println("INFO: API Endpoints:")
-	log.Println("  - /api/data (POST): { \"command\": \"PUT/GET/DELETE\", \"key\": \"...\", \"value\": \"...\" }")
-	log.Println("    (Use GOJODB.TEXT(your text) for text indexing in PUT value)")
-	log.Println("  - /api/transaction (POST): { \"operations\": [ {\"command\":\"PUT/DELETE\", \"key\":\"...\", \"value\":\"...\"}, ... ] }")
-	log.Println("  - /api/query (POST): { \"command\": \"GET_RANGE/COUNT_RANGE/SUM_RANGE/MIN_RANGE/MAX_RANGE\", \"start_key\": \"...\", \"end_key\": \"...\" }")
-	log.Println("  - /api/text_search (POST): { \"query\": \"your search terms\" }") // NEW: Text search endpoint
-	log.Println("  - /admin/assign_slot_range (POST, authenticated): Proxy to Controller Leader")
-	log.Println("  - /admin/get_node_for_key (GET, authenticated): Proxy to Controller Leader")
-	log.Println("  - /admin/set_metadata (POST, authenticated): Proxy to Controller Leader")
-	log.Println("  - /status (GET): Get aggregated status of Controller cluster and Storage Nodes")
-	log.Printf("  Admin API Key: %s (for X-API-Key header)", adminAPIKey)
+// 	log.Printf("INFO: GojoDB API Service listening on %s", apiControllerAddr)
+// 	log.Println("INFO: API Endpoints:")
+// 	log.Println("  - /api/data (POST): { \"command\": \"PUT/GET/DELETE\", \"key\": \"...\", \"value\": \"...\" }")
+// 	log.Println("    (Use GOJODB.TEXT(your text) for text indexing in PUT value)")
+// 	log.Println("  - /api/transaction (POST): { \"operations\": [ {\"command\":\"PUT/DELETE\", \"key\":\"...\", \"value\":\"...\"}, ... ] }")
+// 	log.Println("  - /api/query (POST): { \"command\": \"GET_RANGE/COUNT_RANGE/SUM_RANGE/MIN_RANGE/MAX_RANGE\", \"start_key\": \"...\", \"end_key\": \"...\" }")
+// 	log.Println("  - /api/text_search (POST): { \"query\": \"your search terms\" }") // NEW: Text search endpoint
+// 	log.Println("  - /admin/assign_slot_range (POST, authenticated): Proxy to Controller Leader")
+// 	log.Println("  - /admin/get_node_for_key (GET, authenticated): Proxy to Controller Leader")
+// 	log.Println("  - /admin/set_metadata (POST, authenticated): Proxy to Controller Leader")
+// 	log.Println("  - /status (GET): Get aggregated status of Controller cluster and Storage Nodes")
+// 	log.Printf("  Admin API Key: %s (for X-API-Key header)", adminAPIKey)
 
-	log.Fatal(http.ListenAndServe(apiServiceAddr, nil))
-}
+// 	log.Fatal(http.ListenAndServe(apiControllerAddr, nil))
+// }

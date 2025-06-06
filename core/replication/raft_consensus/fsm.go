@@ -49,12 +49,22 @@ const (
 
 var TotalHashSlots uint32 = 1024
 
+// var sample string = `
+// {
+// 	"type":1,
+// 	"node_id":"node_1",
+// 	"node_addr":"127.0.0.1:8080",
+// 	"slot_range":"0-511"
+// }
+// `
+
 // Command represents a command to be applied to the FSM.
 type Command struct {
 	Type          CommandType       `json:"type"`
 	NodeID        string            `json:"node_id,omitempty"`
 	NodeAddr      string            `json:"node_addr,omitempty"` // For registration, replication endpoint
 	SlotID        uint64            `json:"slot_id,omitempty"`
+	SlotRange     string            `json:"slot_range"`
 	TargetNodeID  string            `json:"target_node_id,omitempty"`  // For replica add/remove, migration target
 	ShardID       string            `json:"shard_id,omitempty"`        // For more granular shard ID if different from SlotID
 	Replicas      map[string]string `json:"replicas,omitempty"`        // map[NodeID]NodeAddr for a slot's replicas
@@ -89,6 +99,12 @@ type StorageNodeInfo struct {
 	RegisteredAt      time.Time         `json:"registered_at"`
 }
 type NodeCapacityInfo struct { /* ... */
+}
+
+type SlotRangeInfo struct {
+	SlotRange     string            `json:"slot_range"`
+	PrimaryNodeID string            `json:"primary_node_id"`
+	ReplicaNodes  map[string]string `json:"replica_nodes"` // map[ReplicaNodeID]ReplicaNodeAddr
 }
 
 // SlotAssignment defines the primary and replicas for a given slot.
@@ -135,6 +151,7 @@ type FSM struct {
 	// Cluster State
 	storageNodes    map[string]*StorageNodeInfo                   // Key: NodeID
 	slotAssignments map[uint64]*SlotAssignment                    // Key: SlotID (or ShardID if 1:1)
+	slotRangeInfo   map[string]*SlotRangeInfo                     // Key: SlotRange(0-511, 512-1024)
 	dlmPolicies     map[string]*tiered_storage.DLMPolicy          // Key: PolicyID
 	tieringMetadata map[string]*tiered_storage.TieredDataMetadata // Key: LogicalUnitID (e.g., PageID, WALSegmentName)
 
@@ -899,4 +916,35 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 func (s *fsmSnapshot) Release() {
 	s.logger.Debug("Releasing FSM snapshot resources.")
 	s.data = nil // Allow GC
+}
+
+func Keys[K comparable, V any](m map[K]V) []K {
+	keys := make([]K, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (f *FSM) GetShardMap() map[string]*SlotRangeInfo {
+	return f.slotRangeInfo
+}
+
+// Status returns a comprehensive overview of the cluster's current state.
+func (f *FSM) Status() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	status := make(map[string]string)
+	nodeDetails := ""
+	for _, nodeInfo := range f.storageNodes {
+		nodeDetails += nodeInfo.NodeID + " " + nodeInfo.APIAddr + "\n"
+	}
+	status["storage_nodes"] = nodeDetails
+	slotDetails := ""
+	for rangeID, slot := range f.slotRangeInfo {
+		slotDetails += rangeID + ": " + "Primary (" + slot.PrimaryNodeID + ") Replicas: (" + strings.Join(Keys(slot.ReplicaNodes), ",") + ")"
+	}
+	status["slot_assignments"] = slotDetails
+	b, _ := json.Marshal(status)
+	return string(b)
 }

@@ -30,6 +30,7 @@ import (
 	// GojoDB API services
 	// basic_api "github.com/sushant-115/gojodb/api/basic"
 	// Alias for GraphQL server
+
 	indread_api "github.com/sushant-115/gojodb/api/indexed_reads_service"
 	indwrite_api "github.com/sushant-115/gojodb/api/indexed_writes_service"
 
@@ -802,6 +803,12 @@ func addMuxHandler(mux *http.ServeMux) error {
 		_, _ = w.Write([]byte("OK"))
 	})
 
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		status := raftFSM.Status()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(status))
+	})
+
 	mux.HandleFunc("/raft/join", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -871,6 +878,20 @@ func addMuxHandler(mux *http.ServeMux) error {
 		}
 		leaderAddr, leaderID := raftNode.LeaderWithID()
 		json.NewEncoder(w).Encode(map[string]interface{}{"leader_addr": leaderAddr, "leader_id": leaderID})
+	})
+
+	mux.HandleFunc("/shardmap", func(w http.ResponseWriter, r *http.Request) {
+		if raftNode == nil {
+			http.Error(w, "Raft not initialized", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		shardmap := raftFSM.GetShardMap()
+		if shardmap == nil {
+			json.NewEncoder(w).Encode("{}")
+		} else {
+			json.NewEncoder(w).Encode(shardmap)
+		}
 	})
 
 	// Generic Raft command handler
