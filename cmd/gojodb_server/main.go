@@ -31,9 +31,6 @@ import (
 	// basic_api "github.com/sushant-115/gojodb/api/basic"
 	// Alias for GraphQL server
 
-	indread_api "github.com/sushant-115/gojodb/api/indexed_reads_service"
-	indwrite_api "github.com/sushant-115/gojodb/api/indexed_writes_service"
-
 	// External libraries
 
 	"github.com/hashicorp/go-hclog"
@@ -41,9 +38,8 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-
 	// Protobufs (ensure these paths are correct for your project structure)
-	pb "github.com/sushant-115/gojodb/api/proto" // Assuming a common proto package
+	// Assuming a common proto package
 )
 
 var (
@@ -693,8 +689,8 @@ func startGRPCServer() {
 
 	// Register services
 	// pb.RegisterBasicServiceServer(grpcServer, basic_api.NewBasicServer(dbInstance, zlogger))
-	pb.RegisterGatewayServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
-	pb.RegisterSnapshotServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
+	// pb.RegisterGatewayServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
+	// pb.RegisterSnapshotServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
 	// pb.RegisterAggregationServiceServer(grpcServer, &aggregationServiceServerImpl{})
 	// pb.RegisterBulkWriteServiceServer(grpcServer, &bulkWriteServiceServerImpl{})
 
