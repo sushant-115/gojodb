@@ -306,7 +306,6 @@ func initStorageNode() error {
 func initAndStartRaft() error {
 	zlogger.Info("Initializing Raft...")
 	config := raft.DefaultConfig()
-	zlogger.Info("Initializing Raft... 309")
 	config.LocalID = raft.ServerID(myStorageNodeID) // Use myStorageNodeID directly
 	config.Logger = hclog.Default()
 	// Adjust Raft timings if needed, defaults are generally okay for testing
@@ -319,39 +318,36 @@ func initAndStartRaft() error {
 	if err := os.MkdirAll(raftDataPath, 0700); err != nil {
 		return fmt.Errorf("failed to create Raft data directory %s: %w", raftDataPath, err)
 	}
-	zlogger.Info("DIrectory... 322")
+
 	// Setup Raft communication transport
 	addr, err := net.ResolveTCPAddr("tcp", *raftAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve raft address %s: %w", *raftAddr, err)
 	}
-	zlogger.Info("DIrectory... 328")
 	transport, err := raft.NewTCPTransport(*raftAddr, addr, RaftTransportMaxPool, RaftTransportTimeout, config.LogOutput) // Pass a logger to transport
 	if err != nil {
 		return fmt.Errorf("failed to create raft TCP transport: %w", err)
 	}
-	zlogger.Info("DIrectory... 333")
 
 	// Create snapshot store
 	snapshots, err := raft.NewFileSnapshotStore(raftDataPath, RaftSnapShotRetain, config.LogOutput)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot store at %s: %w", raftDataPath, err)
 	}
-	zlogger.Info("DIrectory... 340")
+
 	// Create log store and stable store (BoltDB)
 	boltDBPath := filepath.Join(raftDataPath, "raft.db")
-	zlogger.Info("DIrectory... 343", zap.String("boltDBPath; ", boltDBPath))
 	boltDB, err := raftboltdb.NewBoltStore(boltDBPath)
 	if err != nil {
 		return fmt.Errorf("failed to create bolt store at %s: %w", boltDBPath, err)
 	}
-	zlogger.Info("DIrectory... 347")
+
 	// Instantiate Raft
 	raftNode, err = raft.NewRaft(config, raftFSM, boltDB, boltDB, snapshots, transport)
 	if err != nil {
 		return fmt.Errorf("failed to create raft node: %w", err)
 	}
-	zlogger.Info("DIrectory... 353")
+
 	if *bootstrap {
 		zlogger.Info("Bootstrapping Raft cluster as the first node...")
 		configuration := raft.Configuration{
@@ -371,9 +367,7 @@ func initAndStartRaft() error {
 		// Attempt to join an existing cluster via the controller.
 		// This is a non-blocking attempt; FSM might also handle joining later.
 		// This call to joinRaftCluster should not block startup indefinitely.
-		zlogger.Info("DIrectory... 373")
 		go func() { // Run in a goroutine to avoid blocking main startup
-			zlogger.Info("DIrectory... 375")
 			if err := joinRaftClusterViaController(); err != nil {
 				zlogger.Warn("Failed to join Raft cluster via controller on initial attempt", zap.Error(err), zap.String("controllerAddr", *controllerAddr))
 			}
@@ -550,25 +544,25 @@ func initialFetchShardMapFromController() {
 			time.Sleep(ControllerRetryDelay)
 			continue
 		}
-		var shardMap fsm.ClusterShardMap // Assuming fsm.ClusterShardMap is the structure
-		if err := json.NewDecoder(resp.Body).Decode(&shardMap); err != nil {
-			zlogger.Error("Failed to decode shard map from controller", zap.Error(err))
-			time.Sleep(ControllerRetryDelay)
-			continue
-		}
-		zlogger.Info("Successfully fetched initial shard map from controller (data not applied here, FSM handles via Raft log)", zap.Any("shardMapPreview", shardMap.Version)) // Log a preview
-
-		// Now, the leader should propose this shardMap as a Raft command.
-		if raftNode.State() == raft.Leader {
-			cmd := fsm.Command{Type: fsm.CommandUpdateShardMap, ShardMap: shardMap}
-			cmdBytes, _ := json.Marshal(cmd)
-			applyFuture := raftNode.Apply(cmdBytes, 5*time.Second)
-			if err := applyFuture.Error(); err != nil {
-				zlogger.Error("Failed to apply initial shard map update via Raft", zap.Error(err))
-			} else {
-				zlogger.Info("Initial shard map update proposed to Raft cluster.")
-			}
-		}
+		// var shardMap fsm.ClusterShardMap // Assuming fsm.ClusterShardMap is the structure
+		// if err := json.NewDecoder(resp.Body).Decode(&shardMap); err != nil {
+		//  zlogger.Error("Failed to decode shard map from controller", zap.Error(err))
+		//  time.Sleep(ControllerRetryDelay)
+		//  continue
+		// }
+		// zlogger.Info("Successfully fetched initial shard map from controller (data not applied here, FSM handles via Raft log)", zap.Any("shardMapPreview", shardMap.Version)) // Log a preview
+		//
+		// // Now, the leader should propose this shardMap as a Raft command.
+		// // if raftNode.State() == raft.Leader {
+		// //  cmd := fsm.Command{Type: fsm.CommandUpdateShardMap, ShardMap: shardMap}
+		// //  cmdBytes, _ := json.Marshal(cmd)
+		// //  applyFuture := raftNode.Apply(cmdBytes, 5*time.Second)
+		// //  if err := applyFuture.Error(); err != nil {
+		// //      zlogger.Error("Failed to apply initial shard map update via Raft", zap.Error(err))
+		// //  } else {
+		// //      zlogger.Info("Initial shard map update proposed to Raft cluster.")
+		// //  }
+		// // }
 		// return // Success or handled by leader.
 		zlogger.Info("Initial shard map fetch logic placeholder: FSM is responsible for updates via Raft log based on controller state or leader actions.")
 		return // Placeholder for now.
@@ -723,7 +717,85 @@ func startHTTPServer() {
 	// srv := handler.NewDefaultServer(generated.NewExecutableSchema(generated.Config{Resolvers: gqlResolver}))
 	// mux.Handle("/query", srv)                                                     // GraphQL queries
 	// mux.Handle("/playground", playground.Handler("GraphQL playground", "/query")) // Interactive playground
+	addMuxHandler((mux))
 
+	httpServer = &http.Server{
+		Addr:    *httpAddr,
+		Handler: mux,
+	}
+
+	zlogger.Info("HTTP server (GraphQL, Health) starting", zap.String("address", *httpAddr))
+	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		zlogger.Error("HTTP server failed to serve or closed unexpectedly", zap.Error(err))
+	} else {
+		zlogger.Info("HTTP server stopped gracefully.")
+	}
+}
+
+func handleRaftCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var cmd fsm.Command
+	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if cmd.Type == fsm.CommandNoOp {
+		http.Error(w, "Cannot apply NoOp command via API", http.StatusBadRequest)
+		return
+	}
+
+	cmdBytes, err := json.Marshal(cmd)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to marshal command: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	applyFuture := raftNode.Apply(cmdBytes, 5*time.Second) // 5-second timeout
+	if err := applyFuture.Error(); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to apply command to Raft FSM: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	response := applyFuture.Response()
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to marshal FSM response: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(responseBytes)
+}
+
+func setupSignalHandling() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-signals
+		zlogger.Info("Received signal, initiating graceful shutdown", zap.String("signal", sig.String()))
+
+		// Start shutdown sequence
+		closeStorageNode()
+
+		// If there are other goroutines managed by globalWG that closeStorageNode doesn't explicitly stop,
+		// they should also check a global shutdown channel or context.
+		// For now, closeStorageNode is assumed to handle stopping most things directly or indirectly.
+
+		// Give some time for graceful shutdown before forceful exit (optional)
+		// time.AfterFunc(30*time.Second, func() {
+		//  zlogger.Fatal("Graceful shutdown timed out, forcing exit.")
+		// })
+	}()
+}
+
+func addMuxHandler(mux *http.ServeMux) error {
 	// Health check endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -780,6 +852,7 @@ func startHTTPServer() {
 
 		log.Printf("node %s at %s joined successfully", req.NodeID, req.RaftAddr)
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
 	})
 
 	// Raft status (example, might need more secure access)
@@ -800,68 +873,7 @@ func startHTTPServer() {
 		json.NewEncoder(w).Encode(map[string]interface{}{"leader_addr": leaderAddr, "leader_id": leaderID})
 	})
 
-	// This endpoint returns the current cluster membership.
-	mux.HandleFunc("/shardmap", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Get the current Raft configuration.
-		configFuture := raftNode.GetConfiguration()
-		if err := configFuture.Error(); err != nil {
-			log.Printf("failed to get raft configuration: %v", err)
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		// Create a map of node IDs to their Raft addresses.
-		// In a real system, you'd likely want to map to the client-facing HTTP/RPC address.
-		shardMap := make(map[raft.ServerID]raft.ServerAddress)
-		for _, srv := range configFuture.Configuration().Servers {
-			shardMap[srv.ID] = srv.Address
-		}
-
-		// Respond with the shard map as JSON.
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(shardMap); err != nil {
-			log.Printf("failed to encode shardmap: %v", err)
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-		}
-	})
-
-	httpServer = &http.Server{
-		Addr:    *httpAddr,
-		Handler: mux,
-	}
-
-	zlogger.Info("HTTP server (GraphQL, Health) starting", zap.String("address", *httpAddr))
-	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-		zlogger.Error("HTTP server failed to serve or closed unexpectedly", zap.Error(err))
-	} else {
-		zlogger.Info("HTTP server stopped gracefully.")
-	}
-}
-
-func setupSignalHandling() {
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-signals
-		zlogger.Info("Received signal, initiating graceful shutdown", zap.String("signal", sig.String()))
-
-		// Start shutdown sequence
-		closeStorageNode()
-
-		// If there are other goroutines managed by globalWG that closeStorageNode doesn't explicitly stop,
-		// they should also check a global shutdown channel or context.
-		// For now, closeStorageNode is assumed to handle stopping most things directly or indirectly.
-
-		// Give some time for graceful shutdown before forceful exit (optional)
-		// time.AfterFunc(30*time.Second, func() {
-		//  zlogger.Fatal("Graceful shutdown timed out, forcing exit.")
-		// })
-	}()
+	// Generic Raft command handler
+	mux.HandleFunc("/raft/command", handleRaftCommand)
+	return nil
 }
