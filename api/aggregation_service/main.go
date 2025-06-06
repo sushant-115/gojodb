@@ -17,7 +17,7 @@ import (
 
 // AggregationServer implements the AggregationService gRPC service.
 type AggregationServer struct {
-	pb.UnimplementedAggregationServiceServer
+	pb.UnimplementedGatewayServiceServer
 	BTreeStore    *btree.BTree[string, string]  // Primary data source
 	InvertedIndex *inverted_index.InvertedIndex // For $match stages using text search
 	Logger        *zap.Logger

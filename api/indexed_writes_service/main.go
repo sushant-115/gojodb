@@ -14,11 +14,11 @@ import (
 
 // IndexedWriteServer implements the IndexedWriteService gRPC service.
 type IndexedWriteServer struct {
-	pb.UnimplementedIndexedWriteServiceServer                               // For forward compatibility
-	BTreeStore                                *btree.BTree[string, string]  // Primary B-Tree store for documents
-	InvertedIndex                             *inverted_index.InvertedIndex // Inverted index instance
-	SpatialIndex                              *spatial.SpatialIndexManager  // Spatial index instance
-	Logger                                    *zap.Logger                   // Logger instance
+	pb.UnimplementedGatewayServiceServer                               // For forward compatibility
+	BTreeStore                           *btree.BTree[string, string]  // Primary B-Tree store for documents
+	InvertedIndex                        *inverted_index.InvertedIndex // Inverted index instance
+	SpatialIndex                         *spatial.SpatialIndexManager  // Spatial index instance
+	Logger                               *zap.Logger                   // Logger instance
 }
 
 // NewIndexedWriteServer creates a new IndexedWriteServer.

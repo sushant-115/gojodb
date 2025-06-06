@@ -2,256 +2,271 @@ syntax = "proto3";
 
 package proto;
 
-option go_package = "github.com/sushant-115/gojodb/api/proto"; // Adjust to your actual Go module path
+option go_package = "./;proto";
 
-import "google/protobuf/struct.proto"; // For flexible JSON-like document data
-import "google/protobuf/timestamp.proto";
+// --- Existing Messages (from original api/proto/api.proto) ---
 
-// Common Messages
-message Document {
-    string id = 1; // Unique ID of the document
-    google.protobuf.Struct data = 2; // Document content as a JSON-like structure
-    map<string, string> metadata = 3; // Optional metadata (e.g., content_type, source)
+message PutRequest {
+    string key = 1;
+    bytes value = 2;
 }
 
-message GeoPoint {
-    double latitude = 1;
-    double longitude = 2;
+message PutResponse {
+    bool success = 1;
+    string message = 2;
 }
 
-message GeoShape {
-    // Could be a polygon, circle, etc. For simplicity, let's assume a bounding box for now.
-    GeoPoint top_left = 1;
-    GeoPoint bottom_right = 2;
-    // TODO: Add more shape types (e.g., using a oneof for different geometric types)
+message GetRequest {
+    string key = 1;
 }
 
-message WriteResult {
-    string id = 1;
-    bool success = 2;
-    string message = 3; // Optional message, e.g., error details
-    string lsn = 4;     // Log Sequence Number for the write operation
-}
-
-// --- Indexed Writes Service ---
-service IndexedWriteService {
-    // Writes (inserts or updates) a single document and updates all relevant indexes.
-    rpc IndexedWrite(IndexedWriteRequest) returns (WriteResult);
-    // Specifically updates the inverted index (e.g., adding terms for a document).
-    // This might be used internally or for fine-grained control.
-    rpc UpdateInvertedIndex(UpdateInvertedIndexRequest) returns (WriteResult);
-    // Specifically updates the spatial index (e.g., adding a geo-shape for a document).
-    rpc UpdateSpatialIndex(UpdateSpatialIndexRequest) returns (WriteResult);
-    // Deletes a document by ID and removes its entries from all indexes.
-    rpc DeleteDocument(DeleteDocumentRequest) returns (WriteResult);
-}
-
-message IndexedWriteRequest {
-    Document document = 1;
-    // Optional: Specify which indexes to update explicitly. If empty, update all applicable.
-    repeated string indexes_to_update = 2; // e.g., ["inverted", "spatial"]
-}
-
-message UpdateInvertedIndexRequest {
-    string document_id = 1;
-    map<string, string> text_fields = 2; // Field name to text content for indexing
-}
-
-message UpdateSpatialIndexRequest {
-    string document_id = 1;
-    GeoShape shape = 2;
-    map<string, google.protobuf.Value> attributes = 3; // Optional attributes for the spatial entry
-}
-
-message DeleteDocumentRequest {
-    string document_id = 1;
-}
-
-
-// --- Indexed Reads Service ---
-service IndexedReadService {
-    // Reads a single document by its ID from the primary B-Tree store.
-    rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
-    // Performs a search using the inverted index.
-    rpc SearchInvertedIndex(SearchInvertedIndexRequest) returns (SearchResponse);
-    // Performs a search using the spatial index.
-    rpc SearchSpatialIndex(SearchSpatialIndexRequest) returns (SearchResponse);
-    // Performs a range scan on the primary B-Tree index.
-    rpc RangeScan(RangeScanRequest) returns (stream Document); // Streams matching documents
-}
-
-message GetDocumentRequest {
-    string document_id = 1;
-}
-
-message GetDocumentResponse {
-    Document document = 1;
+message GetResponse {
+    bytes value = 1;
     bool found = 2;
 }
 
-message SearchInvertedIndexRequest {
-    string query = 1; // Search query (e.g., "term1 AND term2 NOT term3")
-    // TODO: Add pagination, sorting, filtering options
-    int32 limit = 2;
-    int32 offset = 3;
-    repeated string fields_to_search = 4; // Optional: specify fields to search in
+message DeleteRequest {
+    string key = 1;
 }
 
-message SearchSpatialIndexRequest {
-    GeoShape query_shape = 1; // The shape to query against (e.g., find documents within this shape)
-    SpatialQueryType query_type = 2; // e.g., INTERSECTS, CONTAINS, WITHIN
-    // TODO: Add pagination, filtering by attributes
+message DeleteResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetRangeRequest {
+    string start_key = 1;
+    string end_key = 2;
     int32 limit = 3;
-    int32 offset = 4;
 }
 
-enum SpatialQueryType {
-    INTERSECTS = 0;
-    CONTAINS = 1;   // Query shape contains document shapes
-    WITHIN = 2;     // Document shapes are within query shape
+message KeyValuePair {
+    string key = 1;
+    bytes value = 2;
 }
 
-message SearchResponse {
-    repeated Document documents = 1;
-    int64 total_hits = 2; // Total number of matching documents (can be an estimate)
-    // TODO: Add facets, highlighting, etc.
+message GetRangeResponse {
+    repeated KeyValuePair entries = 1;
 }
 
-message RangeScanRequest {
-    string start_key = 1; // Inclusive start key
-    string end_key = 2;   // Exclusive end key
-    int32 limit = 3;      // Max number of documents to return
+message TextSearchRequest {
+    string query = 1;
+    string index_name = 2;
+    int32 limit = 3;
 }
 
-// --- Bulk Writes Service ---
-service BulkWriteService {
-    // Performs multiple write operations (insert, update, delete) in a batch.
-    // Can be implemented as a single RPC call with a list, or a client-streaming RPC for very large batches.
-    // For simplicity, starting with a single call with a list.
-    rpc BulkWrite(BulkWriteRequest) returns (BulkWriteResponse);
-    // Client-streaming version for potentially very large batches
-    rpc StreamBulkWrite(stream BulkOperation) returns (BulkWriteSummaryResponse);
+message TextSearchResult {
+    string key = 1;
+    double score = 2;
 }
 
-enum OperationType {
-    UPSERT = 0; // Insert or Update
-    DELETE = 1;
+message TextSearchResponse {
+    repeated TextSearchResult results = 1;
 }
 
-message BulkOperation {
-    OperationType operation_type = 1;
-    Document document = 2; // Used for UPSERT. For DELETE, document.id is used.
+message BulkPutRequest {
+    repeated KeyValuePair entries = 1;
 }
 
-message BulkWriteRequest {
-    repeated BulkOperation operations = 1;
-    // Optional: could add transactionality hints, error handling preferences (e.g., fail fast vs continue on error)
+message BulkPutResponse {
+    bool success = 1;
+    string message = 2;
 }
 
-message BulkWriteResponse {
-    repeated WriteResult results = 1; // Result for each operation in the batch
-    int32 success_count = 2;
-    int32 failure_count = 3;
+message BulkDeleteRequest {
+    repeated string keys = 1;
 }
 
-message BulkWriteSummaryResponse {
-    int32 total_operations = 1;
-    int32 success_count = 2;
-    int32 failure_count = 3;
-    repeated string failed_operation_ids = 4; // IDs of documents that failed
-    string first_error_message = 5; // Message of the first error encountered
+message BulkDeleteResponse {
+    bool success = 1;
+    string message = 2;
 }
 
+// --- New Messages for Cluster Management and Data Migration ---
 
-// --- Aggregation Service ---
-service AggregationService {
-    // Performs an aggregation query.
-    rpc Aggregate(AggregationRequest) returns (AggregationResponse);
+// StorageNode defines a storage node in the cluster
+message StorageNode {
+    string node_id = 1;
+    string address = 2; // gRPC address (host:port) for data operations
+    string status = 3; // e.g., "active", "down", "onboarding", "migrating"
 }
 
-message AggregationRequest {
-    string collection_name = 1; // Or table name; target of aggregation
-    repeated AggregationPipelineStage stages = 2; // Sequence of aggregation stages
+// AddStorageNodeRequest requests to register a new storage node.
+// This doesn't actually start the node, but informs the controller of its expected presence.
+message AddStorageNodeRequest {
+    string node_id = 1;
+    string address = 2; // Address where the storage node will be listening
 }
 
-message AggregationPipelineStage {
-    oneof stage_type {
-        MatchStage match = 1;
-        GroupStage group = 2;
-        SortStage sort = 3;
-        ProjectStage project = 4;
-        LimitStage limit = 5;
-        SkipStage skip = 6;
-        CountStage count = 7;
-        // Add more stages like $unwind, $lookup (more complex)
-    }
+message AddStorageNodeResponse {
+    bool success = 1;
+    string message = 2;
 }
 
-// MatchStage: Filters documents (similar to WHERE clause)
-message MatchStage {
-    // Define filter conditions. Using a simple map for now.
-    // Could be a more structured query language (e.g., using google.protobuf.Struct for MongoDB-like queries)
-    map<string, google.protobuf.Value> filter = 1;
+// RemoveStorageNodeRequest requests to remove a storage node.
+message RemoveStorageNodeRequest {
+    string node_id = 1;
 }
 
-// GroupStage: Groups documents by a specified key and applies accumulators.
-message GroupStage {
-    string group_by_field = 1; // Field to group by (e.g., "$category")
-    // Accumulators: field_name_in_output -> {accumulator_type: "$field_to_accumulate_on"}
-    map<string, Accumulator> accumulators = 2;
+message RemoveStorageNodeResponse {
+    bool success = 1;
+    string message = 2;
 }
 
-message Accumulator {
-    enum AccumulatorType {
-        SUM = 0;
-        AVG = 1;
-        MIN = 2;
-        MAX = 3;
-        COUNT = 4; // Counts documents in group
-        FIRST = 5;
-        LAST = 6;
-        PUSH = 7; // Creates an array of values (more complex)
-    }
-    AccumulatorType type = 1;
-    string field = 2; // Field to apply accumulator on (e.g., "$price" for $sum). Not needed for COUNT.
+// ShardSlotAssignment represents a shard slot's primary and replicas.
+message ShardSlotAssignment {
+    uint32 slot_id = 1;
+    string primary_node_id = 2;
+    repeated string replica_node_ids = 3;
 }
 
-// SortStage: Sorts documents.
-message SortStage {
-    map<string, SortDirection> fields = 1; // field_name -> direction
+// AssignShardSlotRequest requests to assign a slot to a primary and replicas.
+message AssignShardSlotRequest {
+    uint32 slot_id = 1;
+    string primary_node_id = 2;
+    repeated string replica_node_ids = 3;
 }
 
-enum SortDirection {
-    ASC = 0;
-    DESC = 1;
+message AssignShardSlotResponse {
+    bool success = 1;
+    string message = 2;
 }
 
-// ProjectStage: Reshapes documents (selects, renames, computes fields).
-message ProjectStage {
-    // field_name_in_output -> expression (e.g., "$source_field_name", or computed value)
-    // For simplicity: 1 for include, 0 for exclude (like MongoDB).
-    // Or map<string, string> for renaming/simple projections: new_name -> "$old_name"
-    map<string, int32> fields = 1; // 1 to include, 0 to exclude (_id default include unless specified 0)
+// InitiateReplicaOnboardingRequest initiates a new replica's onboarding process.
+message InitiateReplicaOnboardingRequest {
+    uint32 slot_id = 1;
+    string replica_node_id = 2; // The node joining as a replica
+    string primary_node_id = 3; // The current primary to snapshot from
+    string replica_address = 4; // gRPC address of the replica for snapshot streaming
+    string primary_address = 5; // gRPC address of the primary for snapshot streaming
 }
 
-message LimitStage {
-    int32 count = 1;
+message InitiateReplicaOnboardingResponse {
+    bool success = 1;
+    string message = 2;
+    string onboarding_id = 3; // Unique ID for tracking this onboarding process
 }
 
-message SkipStage {
-    int32 count = 1;
+// UpdateReplicaOnboardingStateRequest updates the state of an ongoing replica onboarding.
+message UpdateReplicaOnboardingStateRequest {
+    string onboarding_id = 1;
+    string status = 2; // e.g., "in_progress", "snapshot_complete", "log_catchup", "completed", "failed"
+    uint64 current_lsn = 3; // Last Sequence Number processed by replica
+    uint64 target_lsn = 4; // Target LSN on primary at initiation
+    string error_message = 5;
 }
 
-message CountStage {
-    string output_field_name = 1; // Field name for the count result
+message UpdateReplicaOnboardingStateResponse {
+    bool success = 1;
+    string message = 2;
 }
 
-
-message AggregationResponse {
-    // Results can be a list of documents or aggregated values.
-    // Using google.protobuf.Struct to represent flexible result documents.
-    repeated google.protobuf.Struct results = 1;
-    bool success = 2;
-    string message = 3; // Optional message, e.g., error details
+// InitiateShardMigrationRequest initiates data migration for a shard.
+message InitiateShardMigrationRequest {
+    uint32 slot_id = 1;
+    string source_node_id = 2; // Current primary/replica holding the data
+    string target_node_id = 3; // New primary/replica to migrate data to
+    string source_address = 4; // gRPC address of the source node
+    string target_address = 5; // gRPC address of the target node
 }
 
+message InitiateShardMigrationResponse {
+    bool success = 1;
+    string message = 2;
+    string migration_id = 3; // Unique ID for tracking this migration process
+}
+
+// CommitShardMigrationRequest commits a pending shard migration.
+message CommitShardMigrationRequest {
+    uint32 slot_id = 1;
+    string new_primary_node_id = 2; // The node that will become the new primary
+    repeated string new_replica_node_ids = 3; // Optional: new set of replicas
+}
+
+message CommitShardMigrationResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// GetClusterStatusRequest requests the overall cluster status.
+message GetClusterStatusRequest {}
+
+message GetClusterStatusResponse {
+    repeated StorageNode active_nodes = 1;
+    repeated ShardSlotAssignment shard_assignments = 2;
+    repeated ReplicaOnboardingState onboarding_states = 3;
+    repeated ShardMigrationState migration_states = 4;
+}
+
+// ReplicaOnboardingState details an ongoing replica onboarding process.
+message ReplicaOnboardingState {
+    string onboarding_id = 1;
+    uint32 slot_id = 2;
+    string replica_node_id = 3;
+    string primary_node_id = 4;
+    string status = 5; // e.g., "snapshotting", "log_catching_up", "completed", "failed"
+    uint64 current_lsn = 6;
+    uint64 target_lsn = 7;
+    string error_message = 8;
+}
+
+// ShardMigrationState details an ongoing shard migration process.
+message ShardMigrationState {
+    string migration_id = 1;
+    uint32 slot_id = 2;
+    string source_node_id = 3;
+    string target_node_id = 4;
+    string status = 5; // e.g., "snapshotting", "log_catching_up", "completed", "failed"
+    uint64 current_lsn = 6;
+    uint64 target_lsn = 7;
+    string error_message = 8;
+}
+
+// GetShardMapRequest requests the current shard map.
+message GetShardMapRequest {}
+
+message GetShardMapResponse {
+    repeated ShardSlotAssignment shard_assignments = 1;
+}
+
+// --- New Service for Gateway (combining data and admin ops) ---
+
+service GatewayService {
+    // Data operations
+    rpc Put (PutRequest) returns (PutResponse);
+    rpc Get (GetRequest) returns (GetResponse);
+    rpc Delete (DeleteRequest) returns (DeleteResponse);
+    rpc GetRange (GetRangeRequest) returns (GetRangeResponse);
+    rpc TextSearch (TextSearchRequest) returns (TextSearchResponse);
+    rpc BulkPut (BulkPutRequest) returns (BulkPutResponse);
+    rpc BulkDelete (BulkDeleteRequest) returns (BulkDeleteResponse);
+
+    // Cluster management operations
+    rpc AddStorageNode (AddStorageNodeRequest) returns (AddStorageNodeResponse);
+    rpc RemoveStorageNode (RemoveStorageNodeRequest) returns (RemoveStorageNodeResponse);
+    rpc AssignShardSlot (AssignShardSlotRequest) returns (AssignShardSlotResponse);
+    rpc InitiateReplicaOnboarding (InitiateReplicaOnboardingRequest) returns (InitiateReplicaOnboardingResponse);
+    rpc UpdateReplicaOnboardingState (UpdateReplicaOnboardingStateRequest) returns (UpdateReplicaOnboardingStateResponse);
+    rpc InitiateShardMigration (InitiateShardMigrationRequest) returns (InitiateShardMigrationResponse);
+    rpc CommitShardMigration (CommitShardMigrationRequest) returns (CommitShardMigrationResponse);
+    rpc GetClusterStatus (GetClusterStatusRequest) returns (GetClusterStatusResponse);
+    rpc GetShardMap (GetShardMapRequest) returns (GetShardMapResponse);
+}
+
+// --- New Service for Snapshot Streaming (on Storage Nodes) ---
+// This service will be implemented by gojodb_server to serve snapshots
+
+message StreamSnapshotRequest {
+    uint32 slot_id = 1;
+    string index_type = 2; // e.g., "btree", "inverted", "spatial"
+    string snapshot_id = 3; // ID of the prepared snapshot on the source node
+}
+
+message StreamSnapshotResponse {
+    bytes chunk = 1;
+}
+
+service SnapshotService {
+    // StreamSnapshot streams a prepared snapshot from a storage node.
+    rpc StreamSnapshot (StreamSnapshotRequest) returns (stream StreamSnapshotResponse);
+}

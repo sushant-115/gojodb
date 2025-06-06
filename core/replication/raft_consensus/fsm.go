@@ -117,7 +117,8 @@ type SlotAssignment struct {
 
 // ReplicaOnboardingState tracks the progress of a new replica joining a shard. (Ref: Blueprint Table 2)
 type ReplicaOnboardingState struct {
-	OperationID       string    `json:"operation_id"` // Links to the command that initiated it
+	OperationID       string `json:"operation_id"` // Links to the command that initiated it
+	SlotID            uint64
 	ShardID           string    `json:"shard_id"`
 	TargetNodeID      string    `json:"target_node_id"` // The new replica node
 	SourceNodeID      string    `json:"source_node_id"` // Node providing the snapshot
@@ -131,8 +132,9 @@ type ReplicaOnboardingState struct {
 
 // ShardMigrationState tracks the progress of a shard rebalancing (migration) operation. (Ref: Blueprint Table 3)
 type ShardMigrationState struct {
-	OperationID         string    `json:"operation_id"`
-	ShardID             string    `json:"shard_id"`
+	OperationID         string `json:"operation_id"`
+	ShardID             string `json:"shard_id"`
+	SlotID              uint64
 	SourceNodeID        string    `json:"source_node_id"`
 	TargetNodeID        string    `json:"target_node_id"`
 	CurrentPhase        string    `json:"current_phase"` // e.g., "PREPARING", "DATA_COPYING", "FINAL_SYNC"
@@ -894,11 +896,11 @@ type fsmSnapshot struct {
 	logger *zap.Logger
 }
 
-func GetSlotForHashKey(key string) int {
+func GetSlotForHashKey(key string) uint32 {
 	// Using CRC32 IEEE polynomial for hashing, similar to Redis Cluster
 	// The result is then modulo TotalHashSlots to get the slot number.
 	checksum := crc32.ChecksumIEEE([]byte(key))
-	return int(checksum % TotalHashSlots)
+	return uint32(checksum % TotalHashSlots)
 }
 
 // Persist saves the FSM snapshot to a sink.

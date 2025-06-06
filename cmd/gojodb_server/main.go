@@ -693,8 +693,8 @@ func startGRPCServer() {
 
 	// Register services
 	// pb.RegisterBasicServiceServer(grpcServer, basic_api.NewBasicServer(dbInstance, zlogger))
-	pb.RegisterIndexedWriteServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
-	pb.RegisterIndexedReadServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
+	pb.RegisterGatewayServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
+	pb.RegisterSnapshotServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
 	// pb.RegisterAggregationServiceServer(grpcServer, &aggregationServiceServerImpl{})
 	// pb.RegisterBulkWriteServiceServer(grpcServer, &bulkWriteServiceServerImpl{})
 

@@ -19,229 +19,682 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	IndexedWriteService_IndexedWrite_FullMethodName        = "/proto.IndexedWriteService/IndexedWrite"
-	IndexedWriteService_UpdateInvertedIndex_FullMethodName = "/proto.IndexedWriteService/UpdateInvertedIndex"
-	IndexedWriteService_UpdateSpatialIndex_FullMethodName  = "/proto.IndexedWriteService/UpdateSpatialIndex"
-	IndexedWriteService_DeleteDocument_FullMethodName      = "/proto.IndexedWriteService/DeleteDocument"
+	GatewayService_Put_FullMethodName                          = "/proto.GatewayService/Put"
+	GatewayService_Get_FullMethodName                          = "/proto.GatewayService/Get"
+	GatewayService_Delete_FullMethodName                       = "/proto.GatewayService/Delete"
+	GatewayService_GetRange_FullMethodName                     = "/proto.GatewayService/GetRange"
+	GatewayService_TextSearch_FullMethodName                   = "/proto.GatewayService/TextSearch"
+	GatewayService_BulkPut_FullMethodName                      = "/proto.GatewayService/BulkPut"
+	GatewayService_BulkDelete_FullMethodName                   = "/proto.GatewayService/BulkDelete"
+	GatewayService_AddStorageNode_FullMethodName               = "/proto.GatewayService/AddStorageNode"
+	GatewayService_RemoveStorageNode_FullMethodName            = "/proto.GatewayService/RemoveStorageNode"
+	GatewayService_AssignShardSlot_FullMethodName              = "/proto.GatewayService/AssignShardSlot"
+	GatewayService_InitiateReplicaOnboarding_FullMethodName    = "/proto.GatewayService/InitiateReplicaOnboarding"
+	GatewayService_UpdateReplicaOnboardingState_FullMethodName = "/proto.GatewayService/UpdateReplicaOnboardingState"
+	GatewayService_InitiateShardMigration_FullMethodName       = "/proto.GatewayService/InitiateShardMigration"
+	GatewayService_CommitShardMigration_FullMethodName         = "/proto.GatewayService/CommitShardMigration"
+	GatewayService_GetClusterStatus_FullMethodName             = "/proto.GatewayService/GetClusterStatus"
+	GatewayService_GetShardMap_FullMethodName                  = "/proto.GatewayService/GetShardMap"
 )
 
-// IndexedWriteServiceClient is the client API for IndexedWriteService service.
+// GatewayServiceClient is the client API for GatewayService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-//
-// --- Indexed Writes Service ---
-type IndexedWriteServiceClient interface {
-	// Writes (inserts or updates) a single document and updates all relevant indexes.
-	IndexedWrite(ctx context.Context, in *IndexedWriteRequest, opts ...grpc.CallOption) (*WriteResult, error)
-	// Specifically updates the inverted index (e.g., adding terms for a document).
-	// This might be used internally or for fine-grained control.
-	UpdateInvertedIndex(ctx context.Context, in *UpdateInvertedIndexRequest, opts ...grpc.CallOption) (*WriteResult, error)
-	// Specifically updates the spatial index (e.g., adding a geo-shape for a document).
-	UpdateSpatialIndex(ctx context.Context, in *UpdateSpatialIndexRequest, opts ...grpc.CallOption) (*WriteResult, error)
-	// Deletes a document by ID and removes its entries from all indexes.
-	DeleteDocument(ctx context.Context, in *DeleteDocumentRequest, opts ...grpc.CallOption) (*WriteResult, error)
+type GatewayServiceClient interface {
+	// Data operations
+	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
+	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
+	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	GetRange(ctx context.Context, in *GetRangeRequest, opts ...grpc.CallOption) (*GetRangeResponse, error)
+	TextSearch(ctx context.Context, in *TextSearchRequest, opts ...grpc.CallOption) (*TextSearchResponse, error)
+	BulkPut(ctx context.Context, in *BulkPutRequest, opts ...grpc.CallOption) (*BulkPutResponse, error)
+	BulkDelete(ctx context.Context, in *BulkDeleteRequest, opts ...grpc.CallOption) (*BulkDeleteResponse, error)
+	// Cluster management operations
+	AddStorageNode(ctx context.Context, in *AddStorageNodeRequest, opts ...grpc.CallOption) (*AddStorageNodeResponse, error)
+	RemoveStorageNode(ctx context.Context, in *RemoveStorageNodeRequest, opts ...grpc.CallOption) (*RemoveStorageNodeResponse, error)
+	AssignShardSlot(ctx context.Context, in *AssignShardSlotRequest, opts ...grpc.CallOption) (*AssignShardSlotResponse, error)
+	InitiateReplicaOnboarding(ctx context.Context, in *InitiateReplicaOnboardingRequest, opts ...grpc.CallOption) (*InitiateReplicaOnboardingResponse, error)
+	UpdateReplicaOnboardingState(ctx context.Context, in *UpdateReplicaOnboardingStateRequest, opts ...grpc.CallOption) (*UpdateReplicaOnboardingStateResponse, error)
+	InitiateShardMigration(ctx context.Context, in *InitiateShardMigrationRequest, opts ...grpc.CallOption) (*InitiateShardMigrationResponse, error)
+	CommitShardMigration(ctx context.Context, in *CommitShardMigrationRequest, opts ...grpc.CallOption) (*CommitShardMigrationResponse, error)
+	GetClusterStatus(ctx context.Context, in *GetClusterStatusRequest, opts ...grpc.CallOption) (*GetClusterStatusResponse, error)
+	GetShardMap(ctx context.Context, in *GetShardMapRequest, opts ...grpc.CallOption) (*GetShardMapResponse, error)
 }
 
-type indexedWriteServiceClient struct {
+type gatewayServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewIndexedWriteServiceClient(cc grpc.ClientConnInterface) IndexedWriteServiceClient {
-	return &indexedWriteServiceClient{cc}
+type GatewayServiceClientImpl struct {
+	gatewayServiceClient
+	conn *grpc.ClientConn
 }
 
-func (c *indexedWriteServiceClient) IndexedWrite(ctx context.Context, in *IndexedWriteRequest, opts ...grpc.CallOption) (*WriteResult, error) {
+func NewGatewayServiceClient(conn *grpc.ClientConn) *GatewayServiceClientImpl {
+	return &GatewayServiceClientImpl{
+		conn: conn,
+	}
+}
+
+func (c *gatewayServiceClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WriteResult)
-	err := c.cc.Invoke(ctx, IndexedWriteService_IndexedWrite_FullMethodName, in, out, cOpts...)
+	out := new(PutResponse)
+	err := c.cc.Invoke(ctx, GatewayService_Put_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *indexedWriteServiceClient) UpdateInvertedIndex(ctx context.Context, in *UpdateInvertedIndexRequest, opts ...grpc.CallOption) (*WriteResult, error) {
+func (c *gatewayServiceClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WriteResult)
-	err := c.cc.Invoke(ctx, IndexedWriteService_UpdateInvertedIndex_FullMethodName, in, out, cOpts...)
+	out := new(GetResponse)
+	err := c.cc.Invoke(ctx, GatewayService_Get_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *indexedWriteServiceClient) UpdateSpatialIndex(ctx context.Context, in *UpdateSpatialIndexRequest, opts ...grpc.CallOption) (*WriteResult, error) {
+func (c *gatewayServiceClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WriteResult)
-	err := c.cc.Invoke(ctx, IndexedWriteService_UpdateSpatialIndex_FullMethodName, in, out, cOpts...)
+	out := new(DeleteResponse)
+	err := c.cc.Invoke(ctx, GatewayService_Delete_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *indexedWriteServiceClient) DeleteDocument(ctx context.Context, in *DeleteDocumentRequest, opts ...grpc.CallOption) (*WriteResult, error) {
+func (c *gatewayServiceClient) GetRange(ctx context.Context, in *GetRangeRequest, opts ...grpc.CallOption) (*GetRangeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WriteResult)
-	err := c.cc.Invoke(ctx, IndexedWriteService_DeleteDocument_FullMethodName, in, out, cOpts...)
+	out := new(GetRangeResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetRange_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// IndexedWriteServiceServer is the server API for IndexedWriteService service.
-// All implementations must embed UnimplementedIndexedWriteServiceServer
+func (c *gatewayServiceClient) TextSearch(ctx context.Context, in *TextSearchRequest, opts ...grpc.CallOption) (*TextSearchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TextSearchResponse)
+	err := c.cc.Invoke(ctx, GatewayService_TextSearch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) BulkPut(ctx context.Context, in *BulkPutRequest, opts ...grpc.CallOption) (*BulkPutResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BulkPutResponse)
+	err := c.cc.Invoke(ctx, GatewayService_BulkPut_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) BulkDelete(ctx context.Context, in *BulkDeleteRequest, opts ...grpc.CallOption) (*BulkDeleteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BulkDeleteResponse)
+	err := c.cc.Invoke(ctx, GatewayService_BulkDelete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) AddStorageNode(ctx context.Context, in *AddStorageNodeRequest, opts ...grpc.CallOption) (*AddStorageNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AddStorageNodeResponse)
+	err := c.cc.Invoke(ctx, GatewayService_AddStorageNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) RemoveStorageNode(ctx context.Context, in *RemoveStorageNodeRequest, opts ...grpc.CallOption) (*RemoveStorageNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveStorageNodeResponse)
+	err := c.cc.Invoke(ctx, GatewayService_RemoveStorageNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) AssignShardSlot(ctx context.Context, in *AssignShardSlotRequest, opts ...grpc.CallOption) (*AssignShardSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AssignShardSlotResponse)
+	err := c.cc.Invoke(ctx, GatewayService_AssignShardSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) InitiateReplicaOnboarding(ctx context.Context, in *InitiateReplicaOnboardingRequest, opts ...grpc.CallOption) (*InitiateReplicaOnboardingResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InitiateReplicaOnboardingResponse)
+	err := c.cc.Invoke(ctx, GatewayService_InitiateReplicaOnboarding_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) UpdateReplicaOnboardingState(ctx context.Context, in *UpdateReplicaOnboardingStateRequest, opts ...grpc.CallOption) (*UpdateReplicaOnboardingStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateReplicaOnboardingStateResponse)
+	err := c.cc.Invoke(ctx, GatewayService_UpdateReplicaOnboardingState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) InitiateShardMigration(ctx context.Context, in *InitiateShardMigrationRequest, opts ...grpc.CallOption) (*InitiateShardMigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InitiateShardMigrationResponse)
+	err := c.cc.Invoke(ctx, GatewayService_InitiateShardMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CommitShardMigration(ctx context.Context, in *CommitShardMigrationRequest, opts ...grpc.CallOption) (*CommitShardMigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CommitShardMigrationResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CommitShardMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) GetClusterStatus(ctx context.Context, in *GetClusterStatusRequest, opts ...grpc.CallOption) (*GetClusterStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetClusterStatusResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetClusterStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) GetShardMap(ctx context.Context, in *GetShardMapRequest, opts ...grpc.CallOption) (*GetShardMapResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetShardMapResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetShardMap_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GatewayServiceServer is the server API for GatewayService service.
+// All implementations must embed UnimplementedGatewayServiceServer
 // for forward compatibility.
-//
-// --- Indexed Writes Service ---
-type IndexedWriteServiceServer interface {
-	// Writes (inserts or updates) a single document and updates all relevant indexes.
-	IndexedWrite(context.Context, *IndexedWriteRequest) (*WriteResult, error)
-	// Specifically updates the inverted index (e.g., adding terms for a document).
-	// This might be used internally or for fine-grained control.
-	UpdateInvertedIndex(context.Context, *UpdateInvertedIndexRequest) (*WriteResult, error)
-	// Specifically updates the spatial index (e.g., adding a geo-shape for a document).
-	UpdateSpatialIndex(context.Context, *UpdateSpatialIndexRequest) (*WriteResult, error)
-	// Deletes a document by ID and removes its entries from all indexes.
-	DeleteDocument(context.Context, *DeleteDocumentRequest) (*WriteResult, error)
-	mustEmbedUnimplementedIndexedWriteServiceServer()
+type GatewayServiceServer interface {
+	// Data operations
+	Put(context.Context, *PutRequest) (*PutResponse, error)
+	Get(context.Context, *GetRequest) (*GetResponse, error)
+	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	GetRange(context.Context, *GetRangeRequest) (*GetRangeResponse, error)
+	TextSearch(context.Context, *TextSearchRequest) (*TextSearchResponse, error)
+	BulkPut(context.Context, *BulkPutRequest) (*BulkPutResponse, error)
+	BulkDelete(context.Context, *BulkDeleteRequest) (*BulkDeleteResponse, error)
+	// Cluster management operations
+	AddStorageNode(context.Context, *AddStorageNodeRequest) (*AddStorageNodeResponse, error)
+	RemoveStorageNode(context.Context, *RemoveStorageNodeRequest) (*RemoveStorageNodeResponse, error)
+	AssignShardSlot(context.Context, *AssignShardSlotRequest) (*AssignShardSlotResponse, error)
+	InitiateReplicaOnboarding(context.Context, *InitiateReplicaOnboardingRequest) (*InitiateReplicaOnboardingResponse, error)
+	UpdateReplicaOnboardingState(context.Context, *UpdateReplicaOnboardingStateRequest) (*UpdateReplicaOnboardingStateResponse, error)
+	InitiateShardMigration(context.Context, *InitiateShardMigrationRequest) (*InitiateShardMigrationResponse, error)
+	CommitShardMigration(context.Context, *CommitShardMigrationRequest) (*CommitShardMigrationResponse, error)
+	GetClusterStatus(context.Context, *GetClusterStatusRequest) (*GetClusterStatusResponse, error)
+	GetShardMap(context.Context, *GetShardMapRequest) (*GetShardMapResponse, error)
+	mustEmbedUnimplementedGatewayServiceServer()
 }
 
-// UnimplementedIndexedWriteServiceServer must be embedded to have
+// UnimplementedGatewayServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedIndexedWriteServiceServer struct{}
+type UnimplementedGatewayServiceServer struct{}
 
-func (UnimplementedIndexedWriteServiceServer) IndexedWrite(context.Context, *IndexedWriteRequest) (*WriteResult, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method IndexedWrite not implemented")
+func (UnimplementedGatewayServiceServer) Put(context.Context, *PutRequest) (*PutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
 }
-func (UnimplementedIndexedWriteServiceServer) UpdateInvertedIndex(context.Context, *UpdateInvertedIndexRequest) (*WriteResult, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method UpdateInvertedIndex not implemented")
+func (UnimplementedGatewayServiceServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Get not implemented")
 }
-func (UnimplementedIndexedWriteServiceServer) UpdateSpatialIndex(context.Context, *UpdateSpatialIndexRequest) (*WriteResult, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method UpdateSpatialIndex not implemented")
+func (UnimplementedGatewayServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
 }
-func (UnimplementedIndexedWriteServiceServer) DeleteDocument(context.Context, *DeleteDocumentRequest) (*WriteResult, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method DeleteDocument not implemented")
+func (UnimplementedGatewayServiceServer) GetRange(context.Context, *GetRangeRequest) (*GetRangeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetRange not implemented")
 }
-func (UnimplementedIndexedWriteServiceServer) mustEmbedUnimplementedIndexedWriteServiceServer() {}
-func (UnimplementedIndexedWriteServiceServer) testEmbeddedByValue()                             {}
+func (UnimplementedGatewayServiceServer) TextSearch(context.Context, *TextSearchRequest) (*TextSearchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TextSearch not implemented")
+}
+func (UnimplementedGatewayServiceServer) BulkPut(context.Context, *BulkPutRequest) (*BulkPutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BulkPut not implemented")
+}
+func (UnimplementedGatewayServiceServer) BulkDelete(context.Context, *BulkDeleteRequest) (*BulkDeleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BulkDelete not implemented")
+}
+func (UnimplementedGatewayServiceServer) AddStorageNode(context.Context, *AddStorageNodeRequest) (*AddStorageNodeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddStorageNode not implemented")
+}
+func (UnimplementedGatewayServiceServer) RemoveStorageNode(context.Context, *RemoveStorageNodeRequest) (*RemoveStorageNodeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveStorageNode not implemented")
+}
+func (UnimplementedGatewayServiceServer) AssignShardSlot(context.Context, *AssignShardSlotRequest) (*AssignShardSlotResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AssignShardSlot not implemented")
+}
+func (UnimplementedGatewayServiceServer) InitiateReplicaOnboarding(context.Context, *InitiateReplicaOnboardingRequest) (*InitiateReplicaOnboardingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method InitiateReplicaOnboarding not implemented")
+}
+func (UnimplementedGatewayServiceServer) UpdateReplicaOnboardingState(context.Context, *UpdateReplicaOnboardingStateRequest) (*UpdateReplicaOnboardingStateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateReplicaOnboardingState not implemented")
+}
+func (UnimplementedGatewayServiceServer) InitiateShardMigration(context.Context, *InitiateShardMigrationRequest) (*InitiateShardMigrationResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method InitiateShardMigration not implemented")
+}
+func (UnimplementedGatewayServiceServer) CommitShardMigration(context.Context, *CommitShardMigrationRequest) (*CommitShardMigrationResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CommitShardMigration not implemented")
+}
+func (UnimplementedGatewayServiceServer) GetClusterStatus(context.Context, *GetClusterStatusRequest) (*GetClusterStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetClusterStatus not implemented")
+}
+func (UnimplementedGatewayServiceServer) GetShardMap(context.Context, *GetShardMapRequest) (*GetShardMapResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetShardMap not implemented")
+}
+func (UnimplementedGatewayServiceServer) mustEmbedUnimplementedGatewayServiceServer() {}
+func (UnimplementedGatewayServiceServer) testEmbeddedByValue()                        {}
 
-// UnsafeIndexedWriteServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to IndexedWriteServiceServer will
+// UnsafeGatewayServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to GatewayServiceServer will
 // result in compilation errors.
-type UnsafeIndexedWriteServiceServer interface {
-	mustEmbedUnimplementedIndexedWriteServiceServer()
+type UnsafeGatewayServiceServer interface {
+	mustEmbedUnimplementedGatewayServiceServer()
 }
 
-func RegisterIndexedWriteServiceServer(s grpc.ServiceRegistrar, srv IndexedWriteServiceServer) {
-	// If the following call pancis, it indicates UnimplementedIndexedWriteServiceServer was
+func RegisterGatewayServiceServer(s grpc.ServiceRegistrar, srv GatewayServiceServer) {
+	// If the following call pancis, it indicates UnimplementedGatewayServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&IndexedWriteService_ServiceDesc, srv)
+	s.RegisterService(&GatewayService_ServiceDesc, srv)
 }
 
-func _IndexedWriteService_IndexedWrite_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(IndexedWriteRequest)
+func _GatewayService_Put_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(IndexedWriteServiceServer).IndexedWrite(ctx, in)
+		return srv.(GatewayServiceServer).Put(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: IndexedWriteService_IndexedWrite_FullMethodName,
+		FullMethod: GatewayService_Put_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IndexedWriteServiceServer).IndexedWrite(ctx, req.(*IndexedWriteRequest))
+		return srv.(GatewayServiceServer).Put(ctx, req.(*PutRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _IndexedWriteService_UpdateInvertedIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(UpdateInvertedIndexRequest)
+func _GatewayService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(IndexedWriteServiceServer).UpdateInvertedIndex(ctx, in)
+		return srv.(GatewayServiceServer).Get(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: IndexedWriteService_UpdateInvertedIndex_FullMethodName,
+		FullMethod: GatewayService_Get_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IndexedWriteServiceServer).UpdateInvertedIndex(ctx, req.(*UpdateInvertedIndexRequest))
+		return srv.(GatewayServiceServer).Get(ctx, req.(*GetRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _IndexedWriteService_UpdateSpatialIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(UpdateSpatialIndexRequest)
+func _GatewayService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(IndexedWriteServiceServer).UpdateSpatialIndex(ctx, in)
+		return srv.(GatewayServiceServer).Delete(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: IndexedWriteService_UpdateSpatialIndex_FullMethodName,
+		FullMethod: GatewayService_Delete_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IndexedWriteServiceServer).UpdateSpatialIndex(ctx, req.(*UpdateSpatialIndexRequest))
+		return srv.(GatewayServiceServer).Delete(ctx, req.(*DeleteRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _IndexedWriteService_DeleteDocument_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(DeleteDocumentRequest)
+func _GatewayService_GetRange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRangeRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(IndexedWriteServiceServer).DeleteDocument(ctx, in)
+		return srv.(GatewayServiceServer).GetRange(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: IndexedWriteService_DeleteDocument_FullMethodName,
+		FullMethod: GatewayService_GetRange_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IndexedWriteServiceServer).DeleteDocument(ctx, req.(*DeleteDocumentRequest))
+		return srv.(GatewayServiceServer).GetRange(ctx, req.(*GetRangeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// IndexedWriteService_ServiceDesc is the grpc.ServiceDesc for IndexedWriteService service.
+func _GatewayService_TextSearch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TextSearchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).TextSearch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_TextSearch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).TextSearch(ctx, req.(*TextSearchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_BulkPut_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BulkPutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).BulkPut(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_BulkPut_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).BulkPut(ctx, req.(*BulkPutRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_BulkDelete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BulkDeleteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).BulkDelete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_BulkDelete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).BulkDelete(ctx, req.(*BulkDeleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_AddStorageNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddStorageNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).AddStorageNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_AddStorageNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).AddStorageNode(ctx, req.(*AddStorageNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_RemoveStorageNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveStorageNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).RemoveStorageNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_RemoveStorageNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).RemoveStorageNode(ctx, req.(*RemoveStorageNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_AssignShardSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AssignShardSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).AssignShardSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_AssignShardSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).AssignShardSlot(ctx, req.(*AssignShardSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_InitiateReplicaOnboarding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InitiateReplicaOnboardingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).InitiateReplicaOnboarding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_InitiateReplicaOnboarding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).InitiateReplicaOnboarding(ctx, req.(*InitiateReplicaOnboardingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_UpdateReplicaOnboardingState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateReplicaOnboardingStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).UpdateReplicaOnboardingState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_UpdateReplicaOnboardingState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).UpdateReplicaOnboardingState(ctx, req.(*UpdateReplicaOnboardingStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_InitiateShardMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InitiateShardMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).InitiateShardMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_InitiateShardMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).InitiateShardMigration(ctx, req.(*InitiateShardMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CommitShardMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitShardMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CommitShardMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CommitShardMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CommitShardMigration(ctx, req.(*CommitShardMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_GetClusterStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetClusterStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).GetClusterStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_GetClusterStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).GetClusterStatus(ctx, req.(*GetClusterStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_GetShardMap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetShardMapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).GetShardMap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_GetShardMap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).GetShardMap(ctx, req.(*GetShardMapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// GatewayService_ServiceDesc is the grpc.ServiceDesc for GatewayService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var IndexedWriteService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "proto.IndexedWriteService",
-	HandlerType: (*IndexedWriteServiceServer)(nil),
+var GatewayService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "proto.GatewayService",
+	HandlerType: (*GatewayServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "IndexedWrite",
-			Handler:    _IndexedWriteService_IndexedWrite_Handler,
+			MethodName: "Put",
+			Handler:    _GatewayService_Put_Handler,
 		},
 		{
-			MethodName: "UpdateInvertedIndex",
-			Handler:    _IndexedWriteService_UpdateInvertedIndex_Handler,
+			MethodName: "Get",
+			Handler:    _GatewayService_Get_Handler,
 		},
 		{
-			MethodName: "UpdateSpatialIndex",
-			Handler:    _IndexedWriteService_UpdateSpatialIndex_Handler,
+			MethodName: "Delete",
+			Handler:    _GatewayService_Delete_Handler,
 		},
 		{
-			MethodName: "DeleteDocument",
-			Handler:    _IndexedWriteService_DeleteDocument_Handler,
+			MethodName: "GetRange",
+			Handler:    _GatewayService_GetRange_Handler,
+		},
+		{
+			MethodName: "TextSearch",
+			Handler:    _GatewayService_TextSearch_Handler,
+		},
+		{
+			MethodName: "BulkPut",
+			Handler:    _GatewayService_BulkPut_Handler,
+		},
+		{
+			MethodName: "BulkDelete",
+			Handler:    _GatewayService_BulkDelete_Handler,
+		},
+		{
+			MethodName: "AddStorageNode",
+			Handler:    _GatewayService_AddStorageNode_Handler,
+		},
+		{
+			MethodName: "RemoveStorageNode",
+			Handler:    _GatewayService_RemoveStorageNode_Handler,
+		},
+		{
+			MethodName: "AssignShardSlot",
+			Handler:    _GatewayService_AssignShardSlot_Handler,
+		},
+		{
+			MethodName: "InitiateReplicaOnboarding",
+			Handler:    _GatewayService_InitiateReplicaOnboarding_Handler,
+		},
+		{
+			MethodName: "UpdateReplicaOnboardingState",
+			Handler:    _GatewayService_UpdateReplicaOnboardingState_Handler,
+		},
+		{
+			MethodName: "InitiateShardMigration",
+			Handler:    _GatewayService_InitiateShardMigration_Handler,
+		},
+		{
+			MethodName: "CommitShardMigration",
+			Handler:    _GatewayService_CommitShardMigration_Handler,
+		},
+		{
+			MethodName: "GetClusterStatus",
+			Handler:    _GatewayService_GetClusterStatus_Handler,
+		},
+		{
+			MethodName: "GetShardMap",
+			Handler:    _GatewayService_GetShardMap_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -249,73 +702,29 @@ var IndexedWriteService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	IndexedReadService_GetDocument_FullMethodName         = "/proto.IndexedReadService/GetDocument"
-	IndexedReadService_SearchInvertedIndex_FullMethodName = "/proto.IndexedReadService/SearchInvertedIndex"
-	IndexedReadService_SearchSpatialIndex_FullMethodName  = "/proto.IndexedReadService/SearchSpatialIndex"
-	IndexedReadService_RangeScan_FullMethodName           = "/proto.IndexedReadService/RangeScan"
+	SnapshotService_StreamSnapshot_FullMethodName = "/proto.SnapshotService/StreamSnapshot"
 )
 
-// IndexedReadServiceClient is the client API for IndexedReadService service.
+// SnapshotServiceClient is the client API for SnapshotService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-//
-// --- Indexed Reads Service ---
-type IndexedReadServiceClient interface {
-	// Reads a single document by its ID from the primary B-Tree store.
-	GetDocument(ctx context.Context, in *GetDocumentRequest, opts ...grpc.CallOption) (*GetDocumentResponse, error)
-	// Performs a search using the inverted index.
-	SearchInvertedIndex(ctx context.Context, in *SearchInvertedIndexRequest, opts ...grpc.CallOption) (*SearchResponse, error)
-	// Performs a search using the spatial index.
-	SearchSpatialIndex(ctx context.Context, in *SearchSpatialIndexRequest, opts ...grpc.CallOption) (*SearchResponse, error)
-	// Performs a range scan on the primary B-Tree index.
-	RangeScan(ctx context.Context, in *RangeScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Document], error)
+type SnapshotServiceClient interface {
+	// StreamSnapshot streams a prepared snapshot from a storage node.
+	StreamSnapshot(ctx context.Context, in *StreamSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamSnapshotResponse], error)
 }
 
-type indexedReadServiceClient struct {
+type snapshotServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewIndexedReadServiceClient(cc grpc.ClientConnInterface) IndexedReadServiceClient {
-	return &indexedReadServiceClient{cc}
-}
 
-func (c *indexedReadServiceClient) GetDocument(ctx context.Context, in *GetDocumentRequest, opts ...grpc.CallOption) (*GetDocumentResponse, error) {
+func (c *snapshotServiceClient) StreamSnapshot(ctx context.Context, in *StreamSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamSnapshotResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetDocumentResponse)
-	err := c.cc.Invoke(ctx, IndexedReadService_GetDocument_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SnapshotService_ServiceDesc.Streams[0], SnapshotService_StreamSnapshot_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
-}
-
-func (c *indexedReadServiceClient) SearchInvertedIndex(ctx context.Context, in *SearchInvertedIndexRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(SearchResponse)
-	err := c.cc.Invoke(ctx, IndexedReadService_SearchInvertedIndex_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *indexedReadServiceClient) SearchSpatialIndex(ctx context.Context, in *SearchSpatialIndexRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(SearchResponse)
-	err := c.cc.Invoke(ctx, IndexedReadService_SearchSpatialIndex_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *indexedReadServiceClient) RangeScan(ctx context.Context, in *RangeScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Document], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &IndexedReadService_ServiceDesc.Streams[0], IndexedReadService_RangeScan_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[RangeScanRequest, Document]{ClientStream: stream}
+	x := &grpc.GenericClientStream[StreamSnapshotRequest, StreamSnapshotResponse]{ClientStream: stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -326,410 +735,72 @@ func (c *indexedReadServiceClient) RangeScan(ctx context.Context, in *RangeScanR
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type IndexedReadService_RangeScanClient = grpc.ServerStreamingClient[Document]
+type SnapshotService_StreamSnapshotClient = grpc.ServerStreamingClient[StreamSnapshotResponse]
 
-// IndexedReadServiceServer is the server API for IndexedReadService service.
-// All implementations must embed UnimplementedIndexedReadServiceServer
+// SnapshotServiceServer is the server API for SnapshotService service.
+// All implementations must embed UnimplementedSnapshotServiceServer
 // for forward compatibility.
-//
-// --- Indexed Reads Service ---
-type IndexedReadServiceServer interface {
-	// Reads a single document by its ID from the primary B-Tree store.
-	GetDocument(context.Context, *GetDocumentRequest) (*GetDocumentResponse, error)
-	// Performs a search using the inverted index.
-	SearchInvertedIndex(context.Context, *SearchInvertedIndexRequest) (*SearchResponse, error)
-	// Performs a search using the spatial index.
-	SearchSpatialIndex(context.Context, *SearchSpatialIndexRequest) (*SearchResponse, error)
-	// Performs a range scan on the primary B-Tree index.
-	RangeScan(*RangeScanRequest, grpc.ServerStreamingServer[Document]) error
-	mustEmbedUnimplementedIndexedReadServiceServer()
+type SnapshotServiceServer interface {
+	// StreamSnapshot streams a prepared snapshot from a storage node.
+	StreamSnapshot(*StreamSnapshotRequest, grpc.ServerStreamingServer[StreamSnapshotResponse]) error
+	mustEmbedUnimplementedSnapshotServiceServer()
 }
 
-// UnimplementedIndexedReadServiceServer must be embedded to have
+// UnimplementedSnapshotServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedIndexedReadServiceServer struct{}
+type UnimplementedSnapshotServiceServer struct{}
 
-func (UnimplementedIndexedReadServiceServer) GetDocument(context.Context, *GetDocumentRequest) (*GetDocumentResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetDocument not implemented")
+func (UnimplementedSnapshotServiceServer) StreamSnapshot(*StreamSnapshotRequest, grpc.ServerStreamingServer[StreamSnapshotResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method StreamSnapshot not implemented")
 }
-func (UnimplementedIndexedReadServiceServer) SearchInvertedIndex(context.Context, *SearchInvertedIndexRequest) (*SearchResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method SearchInvertedIndex not implemented")
-}
-func (UnimplementedIndexedReadServiceServer) SearchSpatialIndex(context.Context, *SearchSpatialIndexRequest) (*SearchResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method SearchSpatialIndex not implemented")
-}
-func (UnimplementedIndexedReadServiceServer) RangeScan(*RangeScanRequest, grpc.ServerStreamingServer[Document]) error {
-	return status.Errorf(codes.Unimplemented, "method RangeScan not implemented")
-}
-func (UnimplementedIndexedReadServiceServer) mustEmbedUnimplementedIndexedReadServiceServer() {}
-func (UnimplementedIndexedReadServiceServer) testEmbeddedByValue()                            {}
+func (UnimplementedSnapshotServiceServer) mustEmbedUnimplementedSnapshotServiceServer() {}
+func (UnimplementedSnapshotServiceServer) testEmbeddedByValue()                         {}
 
-// UnsafeIndexedReadServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to IndexedReadServiceServer will
+// UnsafeSnapshotServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SnapshotServiceServer will
 // result in compilation errors.
-type UnsafeIndexedReadServiceServer interface {
-	mustEmbedUnimplementedIndexedReadServiceServer()
+type UnsafeSnapshotServiceServer interface {
+	mustEmbedUnimplementedSnapshotServiceServer()
 }
 
-func RegisterIndexedReadServiceServer(s grpc.ServiceRegistrar, srv IndexedReadServiceServer) {
-	// If the following call pancis, it indicates UnimplementedIndexedReadServiceServer was
+func RegisterSnapshotServiceServer(s grpc.ServiceRegistrar, srv SnapshotServiceServer) {
+	// If the following call pancis, it indicates UnimplementedSnapshotServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&IndexedReadService_ServiceDesc, srv)
+	s.RegisterService(&SnapshotService_ServiceDesc, srv)
 }
 
-func _IndexedReadService_GetDocument_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetDocumentRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(IndexedReadServiceServer).GetDocument(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: IndexedReadService_GetDocument_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IndexedReadServiceServer).GetDocument(ctx, req.(*GetDocumentRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _IndexedReadService_SearchInvertedIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SearchInvertedIndexRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(IndexedReadServiceServer).SearchInvertedIndex(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: IndexedReadService_SearchInvertedIndex_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IndexedReadServiceServer).SearchInvertedIndex(ctx, req.(*SearchInvertedIndexRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _IndexedReadService_SearchSpatialIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SearchSpatialIndexRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(IndexedReadServiceServer).SearchSpatialIndex(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: IndexedReadService_SearchSpatialIndex_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IndexedReadServiceServer).SearchSpatialIndex(ctx, req.(*SearchSpatialIndexRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _IndexedReadService_RangeScan_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(RangeScanRequest)
+func _SnapshotService_StreamSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamSnapshotRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(IndexedReadServiceServer).RangeScan(m, &grpc.GenericServerStream[RangeScanRequest, Document]{ServerStream: stream})
+	return srv.(SnapshotServiceServer).StreamSnapshot(m, &grpc.GenericServerStream[StreamSnapshotRequest, StreamSnapshotResponse]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type IndexedReadService_RangeScanServer = grpc.ServerStreamingServer[Document]
+type SnapshotService_StreamSnapshotServer = grpc.ServerStreamingServer[StreamSnapshotResponse]
 
-// IndexedReadService_ServiceDesc is the grpc.ServiceDesc for IndexedReadService service.
+// SnapshotService_ServiceDesc is the grpc.ServiceDesc for SnapshotService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var IndexedReadService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "proto.IndexedReadService",
-	HandlerType: (*IndexedReadServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "GetDocument",
-			Handler:    _IndexedReadService_GetDocument_Handler,
-		},
-		{
-			MethodName: "SearchInvertedIndex",
-			Handler:    _IndexedReadService_SearchInvertedIndex_Handler,
-		},
-		{
-			MethodName: "SearchSpatialIndex",
-			Handler:    _IndexedReadService_SearchSpatialIndex_Handler,
-		},
-	},
+var SnapshotService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "proto.SnapshotService",
+	HandlerType: (*SnapshotServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "RangeScan",
-			Handler:       _IndexedReadService_RangeScan_Handler,
+			StreamName:    "StreamSnapshot",
+			Handler:       _SnapshotService_StreamSnapshot_Handler,
 			ServerStreams: true,
 		},
 	},
-	Metadata: "api.proto",
-}
-
-const (
-	BulkWriteService_BulkWrite_FullMethodName       = "/proto.BulkWriteService/BulkWrite"
-	BulkWriteService_StreamBulkWrite_FullMethodName = "/proto.BulkWriteService/StreamBulkWrite"
-)
-
-// BulkWriteServiceClient is the client API for BulkWriteService service.
-//
-// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-//
-// --- Bulk Writes Service ---
-type BulkWriteServiceClient interface {
-	// Performs multiple write operations (insert, update, delete) in a batch.
-	// Can be implemented as a single RPC call with a list, or a client-streaming RPC for very large batches.
-	// For simplicity, starting with a single call with a list.
-	BulkWrite(ctx context.Context, in *BulkWriteRequest, opts ...grpc.CallOption) (*BulkWriteResponse, error)
-	// Client-streaming version for potentially very large batches
-	StreamBulkWrite(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[BulkOperation, BulkWriteSummaryResponse], error)
-}
-
-type bulkWriteServiceClient struct {
-	cc grpc.ClientConnInterface
-}
-
-func NewBulkWriteServiceClient(cc grpc.ClientConnInterface) BulkWriteServiceClient {
-	return &bulkWriteServiceClient{cc}
-}
-
-func (c *bulkWriteServiceClient) BulkWrite(ctx context.Context, in *BulkWriteRequest, opts ...grpc.CallOption) (*BulkWriteResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(BulkWriteResponse)
-	err := c.cc.Invoke(ctx, BulkWriteService_BulkWrite_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *bulkWriteServiceClient) StreamBulkWrite(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[BulkOperation, BulkWriteSummaryResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &BulkWriteService_ServiceDesc.Streams[0], BulkWriteService_StreamBulkWrite_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[BulkOperation, BulkWriteSummaryResponse]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type BulkWriteService_StreamBulkWriteClient = grpc.ClientStreamingClient[BulkOperation, BulkWriteSummaryResponse]
-
-// BulkWriteServiceServer is the server API for BulkWriteService service.
-// All implementations must embed UnimplementedBulkWriteServiceServer
-// for forward compatibility.
-//
-// --- Bulk Writes Service ---
-type BulkWriteServiceServer interface {
-	// Performs multiple write operations (insert, update, delete) in a batch.
-	// Can be implemented as a single RPC call with a list, or a client-streaming RPC for very large batches.
-	// For simplicity, starting with a single call with a list.
-	BulkWrite(context.Context, *BulkWriteRequest) (*BulkWriteResponse, error)
-	// Client-streaming version for potentially very large batches
-	StreamBulkWrite(grpc.ClientStreamingServer[BulkOperation, BulkWriteSummaryResponse]) error
-	mustEmbedUnimplementedBulkWriteServiceServer()
-}
-
-// UnimplementedBulkWriteServiceServer must be embedded to have
-// forward compatible implementations.
-//
-// NOTE: this should be embedded by value instead of pointer to avoid a nil
-// pointer dereference when methods are called.
-type UnimplementedBulkWriteServiceServer struct{}
-
-func (UnimplementedBulkWriteServiceServer) BulkWrite(context.Context, *BulkWriteRequest) (*BulkWriteResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method BulkWrite not implemented")
-}
-func (UnimplementedBulkWriteServiceServer) StreamBulkWrite(grpc.ClientStreamingServer[BulkOperation, BulkWriteSummaryResponse]) error {
-	return status.Errorf(codes.Unimplemented, "method StreamBulkWrite not implemented")
-}
-func (UnimplementedBulkWriteServiceServer) mustEmbedUnimplementedBulkWriteServiceServer() {}
-func (UnimplementedBulkWriteServiceServer) testEmbeddedByValue()                          {}
-
-// UnsafeBulkWriteServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to BulkWriteServiceServer will
-// result in compilation errors.
-type UnsafeBulkWriteServiceServer interface {
-	mustEmbedUnimplementedBulkWriteServiceServer()
-}
-
-func RegisterBulkWriteServiceServer(s grpc.ServiceRegistrar, srv BulkWriteServiceServer) {
-	// If the following call pancis, it indicates UnimplementedBulkWriteServiceServer was
-	// embedded by pointer and is nil.  This will cause panics if an
-	// unimplemented method is ever invoked, so we test this at initialization
-	// time to prevent it from happening at runtime later due to I/O.
-	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
-		t.testEmbeddedByValue()
-	}
-	s.RegisterService(&BulkWriteService_ServiceDesc, srv)
-}
-
-func _BulkWriteService_BulkWrite_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(BulkWriteRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(BulkWriteServiceServer).BulkWrite(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: BulkWriteService_BulkWrite_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(BulkWriteServiceServer).BulkWrite(ctx, req.(*BulkWriteRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _BulkWriteService_StreamBulkWrite_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(BulkWriteServiceServer).StreamBulkWrite(&grpc.GenericServerStream[BulkOperation, BulkWriteSummaryResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type BulkWriteService_StreamBulkWriteServer = grpc.ClientStreamingServer[BulkOperation, BulkWriteSummaryResponse]
-
-// BulkWriteService_ServiceDesc is the grpc.ServiceDesc for BulkWriteService service.
-// It's only intended for direct use with grpc.RegisterService,
-// and not to be introspected or modified (even as a copy)
-var BulkWriteService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "proto.BulkWriteService",
-	HandlerType: (*BulkWriteServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "BulkWrite",
-			Handler:    _BulkWriteService_BulkWrite_Handler,
-		},
-	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "StreamBulkWrite",
-			Handler:       _BulkWriteService_StreamBulkWrite_Handler,
-			ClientStreams: true,
-		},
-	},
-	Metadata: "api.proto",
-}
-
-const (
-	AggregationService_Aggregate_FullMethodName = "/proto.AggregationService/Aggregate"
-)
-
-// AggregationServiceClient is the client API for AggregationService service.
-//
-// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-//
-// --- Aggregation Service ---
-type AggregationServiceClient interface {
-	// Performs an aggregation query.
-	Aggregate(ctx context.Context, in *AggregationRequest, opts ...grpc.CallOption) (*AggregationResponse, error)
-}
-
-type aggregationServiceClient struct {
-	cc grpc.ClientConnInterface
-}
-
-func NewAggregationServiceClient(cc grpc.ClientConnInterface) AggregationServiceClient {
-	return &aggregationServiceClient{cc}
-}
-
-func (c *aggregationServiceClient) Aggregate(ctx context.Context, in *AggregationRequest, opts ...grpc.CallOption) (*AggregationResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(AggregationResponse)
-	err := c.cc.Invoke(ctx, AggregationService_Aggregate_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// AggregationServiceServer is the server API for AggregationService service.
-// All implementations must embed UnimplementedAggregationServiceServer
-// for forward compatibility.
-//
-// --- Aggregation Service ---
-type AggregationServiceServer interface {
-	// Performs an aggregation query.
-	Aggregate(context.Context, *AggregationRequest) (*AggregationResponse, error)
-	mustEmbedUnimplementedAggregationServiceServer()
-}
-
-// UnimplementedAggregationServiceServer must be embedded to have
-// forward compatible implementations.
-//
-// NOTE: this should be embedded by value instead of pointer to avoid a nil
-// pointer dereference when methods are called.
-type UnimplementedAggregationServiceServer struct{}
-
-func (UnimplementedAggregationServiceServer) Aggregate(context.Context, *AggregationRequest) (*AggregationResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Aggregate not implemented")
-}
-func (UnimplementedAggregationServiceServer) mustEmbedUnimplementedAggregationServiceServer() {}
-func (UnimplementedAggregationServiceServer) testEmbeddedByValue()                            {}
-
-// UnsafeAggregationServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to AggregationServiceServer will
-// result in compilation errors.
-type UnsafeAggregationServiceServer interface {
-	mustEmbedUnimplementedAggregationServiceServer()
-}
-
-func RegisterAggregationServiceServer(s grpc.ServiceRegistrar, srv AggregationServiceServer) {
-	// If the following call pancis, it indicates UnimplementedAggregationServiceServer was
-	// embedded by pointer and is nil.  This will cause panics if an
-	// unimplemented method is ever invoked, so we test this at initialization
-	// time to prevent it from happening at runtime later due to I/O.
-	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
-		t.testEmbeddedByValue()
-	}
-	s.RegisterService(&AggregationService_ServiceDesc, srv)
-}
-
-func _AggregationService_Aggregate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AggregationRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(AggregationServiceServer).Aggregate(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: AggregationService_Aggregate_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AggregationServiceServer).Aggregate(ctx, req.(*AggregationRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-// AggregationService_ServiceDesc is the grpc.ServiceDesc for AggregationService service.
-// It's only intended for direct use with grpc.RegisterService,
-// and not to be introspected or modified (even as a copy)
-var AggregationService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "proto.AggregationService",
-	HandlerType: (*AggregationServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "Aggregate",
-			Handler:    _AggregationService_Aggregate_Handler,
-		},
-	},
-	Streams:  []grpc.StreamDesc{},
 	Metadata: "api.proto",
 }
