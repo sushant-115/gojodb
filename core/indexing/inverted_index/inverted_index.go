@@ -96,6 +96,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 	}
 
 	// 2. Initialize DiskManager for the inverted index data file
+	log.Println("filepath: ", filePath)
 	idx.dm, err = flushmanager.NewDiskManager(filePath, invertedIndexPageSize)
 	if err != nil {
 		idx.lm.Close() // Clean up log manager

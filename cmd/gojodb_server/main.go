@@ -23,19 +23,19 @@ import (
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	logreplication "github.com/sushant-115/gojodb/core/replication/log_replication"
-	"github.com/sushant-115/gojodb/core/replication/raft_consensus/fsm"
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
+	"github.com/sushant-115/gojodb/core/storage_engine/tiered_storage"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 
 	// GojoDB API services
-	basic_api "github.com/sushant-115/gojodb/api/basic"
-	gqlserver "github.com/sushant-115/gojodb/api/graphql_service/graph" // Alias for GraphQL server
-	"github.com/sushant-115/gojodb/api/graphql_service/graph/generated"
+	// basic_api "github.com/sushant-115/gojodb/api/basic"
+	// Alias for GraphQL server
 	indread_api "github.com/sushant-115/gojodb/api/indexed_reads_service"
 	indwrite_api "github.com/sushant-115/gojodb/api/indexed_writes_service"
 
 	// External libraries
-	"github.com/99designs/gqlgen/graphql/handler"
-	"github.com/99designs/gqlgen/graphql/playground"
+
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"go.uber.org/zap"
@@ -49,7 +49,7 @@ var (
 	dbInstance            *btree.BTree[string, string]
 	logManager            *wal.LogManager
 	invertedIndexInstance *inverted_index.InvertedIndex
-	spatialIdx            *spatial.IndexManager
+	spatialIdx            *spatial.SpatialIndexManager
 	tieredStorageManager  *tiered_storage.TieredStorageManager // Corrected type name
 
 	// OLD: replicationManager    *logreplication.ReplicationManager
@@ -104,8 +104,8 @@ func main() {
 		log.Fatalf("CRITICAL: Can't initialize zap logger: %v", err)
 	}
 	defer func() {
-		if cerr := zlogger.Sync(); cerr != nil {
-			log.Printf("WARN: Failed to sync logger: %v\n", cerr)
+		if err := zlogger.Sync(); err != nil && !strings.Contains(err.Error(), "inappropriate ioctl for device") {
+			log.Printf("Failed to sync logger: %v", err)
 		}
 	}() // flushes buffer, if any
 
@@ -173,7 +173,19 @@ func initStorageNode() error {
 
 	// Initialize B-tree Index
 	dbPath := filepath.Join(baseDataDir, "btree.db")
-	dbInstance, err = btree.NewBTree(DefaultPageSize, DefaultBufferPoolSize, dbPath, logManager)
+	dbInstance, err = btree.NewBTreeFile[string, string](
+		dbPath, 3,
+		btree.DefaultKeyOrder[string],
+		btree.KeyValueSerializer[string, string]{
+			SerializeKey:     btree.SerializeString,
+			DeserializeKey:   btree.DeserializeString,
+			SerializeValue:   btree.SerializeString,
+			DeserializeValue: btree.DeserializeString,
+		},
+		10,
+		4096,
+		logManager,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create B-tree instance: %w", err)
 	}
@@ -181,6 +193,15 @@ func initStorageNode() error {
 
 	// Initialize Inverted Index
 	invertedIndexPath := filepath.Join(baseDataDir, "inverted_index")
+	invertedIndexDBPath := filepath.Join(invertedIndexPath, "inverted_index.db")
+	if err := os.MkdirAll(invertedIndexPath, 0750); err != nil {
+		return fmt.Errorf("failed to create inverted index directory %s: %w", invertedIndexPath, err)
+	}
+	invertedIndexLogPath := filepath.Join(invertedIndexPath, "wal")
+	if err := os.MkdirAll(invertedIndexPath, 0750); err != nil {
+		return fmt.Errorf("failed to create inverted index directory %s: %w", invertedIndexPath, err)
+	}
+	invertedIndexArchiveLogPath := filepath.Join(invertedIndexPath, "archive")
 	if err := os.MkdirAll(invertedIndexPath, 0750); err != nil {
 		return fmt.Errorf("failed to create inverted index directory %s: %w", invertedIndexPath, err)
 	}
@@ -189,7 +210,7 @@ func initStorageNode() error {
 	// For replication, it should ideally manage its own WAL file stream or use distinct log types in a shared WAL.
 	// Assuming it uses the main logManager for now for its WAL records relevant to replication.
 	// If it has its OWN WAL that needs replicating, its GetLogManager() should return that.
-	invertedIndexInstance, err = inverted_index.NewInvertedIndex(invertedIndexPath, logManager) // Pass main logManager
+	invertedIndexInstance, err = inverted_index.NewInvertedIndex(invertedIndexDBPath, invertedIndexLogPath, invertedIndexArchiveLogPath) // Pass main logManager
 	if err != nil {
 		return fmt.Errorf("failed to create inverted index instance: %w", err)
 	}
@@ -197,6 +218,7 @@ func initStorageNode() error {
 
 	// Initialize Spatial Index
 	spatialIndexPath := filepath.Join(baseDataDir, "spatial_index")
+	spatialIndexDBPath := filepath.Join(baseDataDir, "spatial_index.db")
 	if err := os.MkdirAll(spatialIndexPath, 0750); err != nil {
 		return fmt.Errorf("failed to create spatial index directory %s: %w", spatialIndexPath, err)
 	}
@@ -210,7 +232,7 @@ func initStorageNode() error {
 	if err != nil {
 		return fmt.Errorf("failed to create spatial log manager: %w", err)
 	}
-	spatialIdx, err = spatial.NewIndexManager(spatialIndexPath, spatialLm) // Pass path and its own LM
+	spatialIdx, err = spatial.NewSpatialIndexManager(spatialLogManagerPath, spatialIndexDBPath, 10, 4096) // Pass path and its own LM
 	if err != nil {
 		return fmt.Errorf("failed to create spatial index instance: %w", err)
 	}
@@ -223,16 +245,16 @@ func initStorageNode() error {
 	if err := os.MkdirAll(hotStoragePath, 0750); err != nil {
 		return fmt.Errorf("failed to create hot storage directory %s: %w", hotStoragePath, err)
 	}
-	hotAdapter := hot_storage.NewFileStoreAdapter(hotStoragePath)
-	coldAdapter := cold_storage.NewNoOpColdStorageAdapter() // Replace with actual (e.g., S3Adapter)
-	tieredStorageManager = tiered_storage.NewTieredStorageManager(hotAdapter, coldAdapter, logManager, zlogger)
+	// hotAdapter := hot_storage.NewFileStoreAdapter(hotStoragePath)
+	// coldAdapter := cold_storage.NewNoOpColdStorageAdapter() // Replace with actual (e.g., S3Adapter)
+	// tieredStorageManager = tiered_storage.NewTieredStorageManager(hotAdapter, coldAdapter, logManager, zlogger)
 	zlogger.Info("Tiered Storage Manager initialized")
 
 	// --- Initialize Index Replication Managers ---
 	indexReplicationManagers = make(map[logreplication.IndexType]logreplication.ReplicationManagerInterface)
 
 	// B-tree Replication Manager (uses the main logManager)
-	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger)
+	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, dbPath)
 	indexReplicationManagers[logreplication.BTreeIndexType] = bTreeRepMgr
 	zlogger.Info("B-tree Replication Manager initialized")
 
@@ -244,12 +266,12 @@ func initStorageNode() error {
 		zlogger.Warn("InvertedIndex GetLogManager returned nil, using main logManager for its replication. Review InvertedIndex WAL strategy.")
 		iiLogManager = logManager // Fallback, ensure this is correct for how Inverted Index logs its changes.
 	}
-	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger)
+	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger, invertedIndexPath)
 	indexReplicationManagers[logreplication.InvertedIndexType] = invertedIndexRepMgr
 	zlogger.Info("Inverted Index Replication Manager initialized")
 
 	// Spatial Index Replication Manager (uses its own `spatialLm`)
-	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger)
+	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger, spatialIndexPath)
 	indexReplicationManagers[logreplication.SpatialIndexType] = spatialRepMgr
 	zlogger.Info("Spatial Index Replication Manager initialized")
 
@@ -266,14 +288,14 @@ func initStorageNode() error {
 
 	// Initialize FSM, passing the map of replication managers.
 	// The FSM uses these managers to react to shard assignment changes from Raft log.
+	var replMgrs = make(map[logreplication.IndexType]logreplication.ReplicationManagerInterface)
+	replMgrs[logreplication.BTreeIndexType] = bTreeRepMgr
+	replMgrs[logreplication.InvertedIndexType] = invertedIndexRepMgr
+	replMgrs[logreplication.SpatialIndexType] = spatialRepMgr
 	raftFSM = fsm.NewFSM(
-		dbInstance,
-		logManager, // Main log manager for FSM state itself
-		invertedIndexInstance,
-		spatialIdx,
 		myStorageNodeID,
-		myStorageNodeAddr, // Pass this node's replication address to FSM
-		indexReplicationManagers,
+		myStorageNodeAddr,
+		replMgrs,
 		zlogger,
 	)
 	zlogger.Info("Raft FSM initialized")
@@ -285,7 +307,7 @@ func initAndStartRaft() error {
 	zlogger.Info("Initializing Raft...")
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(myStorageNodeID) // Use myStorageNodeID directly
-	config.Logger = NewRaftLoggerAdapter(zlogger.Named("raft-library"))
+	config.Logger = hclog.Default()
 	// Adjust Raft timings if needed, defaults are generally okay for testing
 	// config.HeartbeatTimeout = 1000 * time.Millisecond
 	// config.ElectionTimeout = 1000 * time.Millisecond
@@ -302,13 +324,13 @@ func initAndStartRaft() error {
 	if err != nil {
 		return fmt.Errorf("failed to resolve raft address %s: %w", *raftAddr, err)
 	}
-	transport, err := raft.NewTCPTransport(*raftAddr, addr, RaftTransportMaxPool, RaftTransportTimeout, zlogger.Named("raft-transport").Sugar()) // Pass a logger to transport
+	transport, err := raft.NewTCPTransport(*raftAddr, addr, RaftTransportMaxPool, RaftTransportTimeout, config.LogOutput) // Pass a logger to transport
 	if err != nil {
 		return fmt.Errorf("failed to create raft TCP transport: %w", err)
 	}
 
 	// Create snapshot store
-	snapshots, err := raft.NewFileSnapshotStore(raftDataPath, RaftSnapShotRetain, zlogger.Named("raft-snapshot").Sugar())
+	snapshots, err := raft.NewFileSnapshotStore(raftDataPath, RaftSnapShotRetain, config.LogOutput)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot store at %s: %w", raftDataPath, err)
 	}
@@ -651,6 +673,7 @@ func (l *RaftLoggerAdapter) Debug(msg string, args ...interface{}) { l.logger.De
 func (l *RaftLoggerAdapter) Info(msg string, args ...interface{})  { l.logger.Infof(msg, args...) }
 func (l *RaftLoggerAdapter) Warn(msg string, args ...interface{})  { l.logger.Warnf(msg, args...) }
 func (l *RaftLoggerAdapter) Error(msg string, args ...interface{}) { l.logger.Errorf(msg, args...) }
+func (l *RaftLoggerAdapter) GetLevel() hclog.Level                 { return hclog.Level(l.logger.Level()) }
 
 func startGRPCServer() {
 	defer globalWG.Done()
@@ -668,7 +691,7 @@ func startGRPCServer() {
 	)
 
 	// Register services
-	pb.RegisterBasicServiceServer(grpcServer, basic_api.NewBasicServer(dbInstance, zlogger))
+	// pb.RegisterBasicServiceServer(grpcServer, basic_api.NewBasicServer(dbInstance, zlogger))
 	pb.RegisterIndexedWriteServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
 	pb.RegisterIndexedReadServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
 	// pb.RegisterAggregationServiceServer(grpcServer, &aggregationServiceServerImpl{})
@@ -690,13 +713,18 @@ func startHTTPServer() {
 	mux := http.NewServeMux()
 
 	// GraphQL endpoint
-	gqlResolver := gqlserver.NewResolver(dbInstance, invertedIndexInstance, spatialIdx, zlogger)
-	srv := handler.NewDefaultServer(generated.NewExecutableSchema(generated.Config{Resolvers: gqlResolver}))
-	mux.Handle("/query", srv)                                                     // GraphQL queries
-	mux.Handle("/playground", playground.Handler("GraphQL playground", "/query")) // Interactive playground
+	// gqlResolver := gqlserver.NewResolver(dbInstance, invertedIndexInstance, spatialIdx, zlogger)
+	// srv := handler.NewDefaultServer(generated.NewExecutableSchema(generated.Config{Resolvers: gqlResolver}))
+	// mux.Handle("/query", srv)                                                     // GraphQL queries
+	// mux.Handle("/playground", playground.Handler("GraphQL playground", "/query")) // Interactive playground
 
 	// Health check endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	mux.HandleFunc("/join", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})

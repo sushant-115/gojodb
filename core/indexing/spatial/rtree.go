@@ -71,7 +71,8 @@ func (r Rect) Enlargement(other Rect) float64 {
 // SpatialData holds the actual data associated with a spatial entry.
 // For GojoDB, this typically includes the document ID or key.
 type SpatialData struct {
-	ID string // The document ID or key associated with this spatial entry
+	ID         string
+	Attributes map[string]interface{} // The document ID or key associated with this spatial entry
 	// Add other relevant data fields here if needed, e.g., type, metadata
 }
 

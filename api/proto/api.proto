@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "github.com/sushant-115/gojodb/api/proto"; // Adjust to your actual Go module path
+
+import "google/protobuf/struct.proto"; // For flexible JSON-like document data
+import "google/protobuf/timestamp.proto";
+
+// Common Messages
+message Document {
+    string id = 1; // Unique ID of the document
+    google.protobuf.Struct data = 2; // Document content as a JSON-like structure
+    map<string, string> metadata = 3; // Optional metadata (e.g., content_type, source)
+}
+
+message GeoPoint {
+    double latitude = 1;
+    double longitude = 2;
+}
+
+message GeoShape {
+    // Could be a polygon, circle, etc. For simplicity, let's assume a bounding box for now.
+    GeoPoint top_left = 1;
+    GeoPoint bottom_right = 2;
+    // TODO: Add more shape types (e.g., using a oneof for different geometric types)
+}
+
+message WriteResult {
+    string id = 1;
+    bool success = 2;
+    string message = 3; // Optional message, e.g., error details
+    string lsn = 4;     // Log Sequence Number for the write operation
+}
+
+// --- Indexed Writes Service ---
+service IndexedWriteService {
+    // Writes (inserts or updates) a single document and updates all relevant indexes.
+    rpc IndexedWrite(IndexedWriteRequest) returns (WriteResult);
+    // Specifically updates the inverted index (e.g., adding terms for a document).
+    // This might be used internally or for fine-grained control.
+    rpc UpdateInvertedIndex(UpdateInvertedIndexRequest) returns (WriteResult);
+    // Specifically updates the spatial index (e.g., adding a geo-shape for a document).
+    rpc UpdateSpatialIndex(UpdateSpatialIndexRequest) returns (WriteResult);
+    // Deletes a document by ID and removes its entries from all indexes.
+    rpc DeleteDocument(DeleteDocumentRequest) returns (WriteResult);
+}
+
+message IndexedWriteRequest {
+    Document document = 1;
+    // Optional: Specify which indexes to update explicitly. If empty, update all applicable.
+    repeated string indexes_to_update = 2; // e.g., ["inverted", "spatial"]
+}
+
+message UpdateInvertedIndexRequest {
+    string document_id = 1;
+    map<string, string> text_fields = 2; // Field name to text content for indexing
+}
+
+message UpdateSpatialIndexRequest {
+    string document_id = 1;
+    GeoShape shape = 2;
+    map<string, google.protobuf.Value> attributes = 3; // Optional attributes for the spatial entry
+}
+
+message DeleteDocumentRequest {
+    string document_id = 1;
+}
+
+
+// --- Indexed Reads Service ---
+service IndexedReadService {
+    // Reads a single document by its ID from the primary B-Tree store.
+    rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
+    // Performs a search using the inverted index.
+    rpc SearchInvertedIndex(SearchInvertedIndexRequest) returns (SearchResponse);
+    // Performs a search using the spatial index.
+    rpc SearchSpatialIndex(SearchSpatialIndexRequest) returns (SearchResponse);
+    // Performs a range scan on the primary B-Tree index.
+    rpc RangeScan(RangeScanRequest) returns (stream Document); // Streams matching documents
+}
+
+message GetDocumentRequest {
+    string document_id = 1;
+}
+
+message GetDocumentResponse {
+    Document document = 1;
+    bool found = 2;
+}
+
+message SearchInvertedIndexRequest {
+    string query = 1; // Search query (e.g., "term1 AND term2 NOT term3")
+    // TODO: Add pagination, sorting, filtering options
+    int32 limit = 2;
+    int32 offset = 3;
+    repeated string fields_to_search = 4; // Optional: specify fields to search in
+}
+
+message SearchSpatialIndexRequest {
+    GeoShape query_shape = 1; // The shape to query against (e.g., find documents within this shape)
+    SpatialQueryType query_type = 2; // e.g., INTERSECTS, CONTAINS, WITHIN
+    // TODO: Add pagination, filtering by attributes
+    int32 limit = 3;
+    int32 offset = 4;
+}
+
+enum SpatialQueryType {
+    INTERSECTS = 0;
+    CONTAINS = 1;   // Query shape contains document shapes
+    WITHIN = 2;     // Document shapes are within query shape
+}
+
+message SearchResponse {
+    repeated Document documents = 1;
+    int64 total_hits = 2; // Total number of matching documents (can be an estimate)
+    // TODO: Add facets, highlighting, etc.
+}
+
+message RangeScanRequest {
+    string start_key = 1; // Inclusive start key
+    string end_key = 2;   // Exclusive end key
+    int32 limit = 3;      // Max number of documents to return
+}
+
+// --- Bulk Writes Service ---
+service BulkWriteService {
+    // Performs multiple write operations (insert, update, delete) in a batch.
+    // Can be implemented as a single RPC call with a list, or a client-streaming RPC for very large batches.
+    // For simplicity, starting with a single call with a list.
+    rpc BulkWrite(BulkWriteRequest) returns (BulkWriteResponse);
+    // Client-streaming version for potentially very large batches
+    rpc StreamBulkWrite(stream BulkOperation) returns (BulkWriteSummaryResponse);
+}
+
+enum OperationType {
+    UPSERT = 0; // Insert or Update
+    DELETE = 1;
+}
+
+message BulkOperation {
+    OperationType operation_type = 1;
+    Document document = 2; // Used for UPSERT. For DELETE, document.id is used.
+}
+
+message BulkWriteRequest {
+    repeated BulkOperation operations = 1;
+    // Optional: could add transactionality hints, error handling preferences (e.g., fail fast vs continue on error)
+}
+
+message BulkWriteResponse {
+    repeated WriteResult results = 1; // Result for each operation in the batch
+    int32 success_count = 2;
+    int32 failure_count = 3;
+}
+
+message BulkWriteSummaryResponse {
+    int32 total_operations = 1;
+    int32 success_count = 2;
+    int32 failure_count = 3;
+    repeated string failed_operation_ids = 4; // IDs of documents that failed
+    string first_error_message = 5; // Message of the first error encountered
+}
+
+
+// --- Aggregation Service ---
+service AggregationService {
+    // Performs an aggregation query.
+    rpc Aggregate(AggregationRequest) returns (AggregationResponse);
+}
+
+message AggregationRequest {
+    string collection_name = 1; // Or table name; target of aggregation
+    repeated AggregationPipelineStage stages = 2; // Sequence of aggregation stages
+}
+
+message AggregationPipelineStage {
+    oneof stage_type {
+        MatchStage match = 1;
+        GroupStage group = 2;
+        SortStage sort = 3;
+        ProjectStage project = 4;
+        LimitStage limit = 5;
+        SkipStage skip = 6;
+        CountStage count = 7;
+        // Add more stages like $unwind, $lookup (more complex)
+    }
+}
+
+// MatchStage: Filters documents (similar to WHERE clause)
+message MatchStage {
+    // Define filter conditions. Using a simple map for now.
+    // Could be a more structured query language (e.g., using google.protobuf.Struct for MongoDB-like queries)
+    map<string, google.protobuf.Value> filter = 1;
+}
+
+// GroupStage: Groups documents by a specified key and applies accumulators.
+message GroupStage {
+    string group_by_field = 1; // Field to group by (e.g., "$category")
+    // Accumulators: field_name_in_output -> {accumulator_type: "$field_to_accumulate_on"}
+    map<string, Accumulator> accumulators = 2;
+}
+
+message Accumulator {
+    enum AccumulatorType {
+        SUM = 0;
+        AVG = 1;
+        MIN = 2;
+        MAX = 3;
+        COUNT = 4; // Counts documents in group
+        FIRST = 5;
+        LAST = 6;
+        PUSH = 7; // Creates an array of values (more complex)
+    }
+    AccumulatorType type = 1;
+    string field = 2; // Field to apply accumulator on (e.g., "$price" for $sum). Not needed for COUNT.
+}
+
+// SortStage: Sorts documents.
+message SortStage {
+    map<string, SortDirection> fields = 1; // field_name -> direction
+}
+
+enum SortDirection {
+    ASC = 0;
+    DESC = 1;
+}
+
+// ProjectStage: Reshapes documents (selects, renames, computes fields).
+message ProjectStage {
+    // field_name_in_output -> expression (e.g., "$source_field_name", or computed value)
+    // For simplicity: 1 for include, 0 for exclude (like MongoDB).
+    // Or map<string, string> for renaming/simple projections: new_name -> "$old_name"
+    map<string, int32> fields = 1; // 1 to include, 0 to exclude (_id default include unless specified 0)
+}
+
+message LimitStage {
+    int32 count = 1;
+}
+
+message SkipStage {
+    int32 count = 1;
+}
+
+message CountStage {
+    string output_field_name = 1; // Field name for the count result
+}
+
+
+message AggregationResponse {
+    // Results can be a list of documents or aggregated values.
+    // Using google.protobuf.Struct to represent flexible result documents.
+    repeated google.protobuf.Struct results = 1;
+    bool success = 2;
+    string message = 3; // Optional message, e.g., error details
+}
+

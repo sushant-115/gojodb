@@ -9,16 +9,6 @@ import (
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
-// IndexType is a string alias for identifying different index types.
-type IndexType string
-
-const (
-	BTreeIndexType       IndexType = "btree"
-	InvertedIndexType    IndexType = "inverted_index"
-	SpatialIndexType     IndexType = "spatial_index"
-	PlaceholderIndexType IndexType = "placeholder"
-)
-
 // ReplicaDetail contains information about a replica node for a specific index.
 type ReplicaDetail struct {
 	NodeID  string

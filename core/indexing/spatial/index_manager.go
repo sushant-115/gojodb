@@ -99,11 +99,8 @@ type SpatialIndexManager struct {
 // 	return sim, nil
 // }
 
-func NewSpatialIndexManager(
-	uniqueSpatialIndexArchiveDir, uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath string,
-	logBufferSize, logSegmentSize, dbPageSize int,
-	maxEntries int, // Max entries per R-tree node
-	minEntries int, // Min entries per R-tree node
+func NewSpatialIndexManager(uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath string,
+	logBufferSize, dbPageSize int,
 ) (*SpatialIndexManager, error) {
 
 	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir)
