@@ -1,8 +1,10 @@
 package gojodbcontroller
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv" // Added for parsing slot IDs from JSON keys
@@ -20,14 +22,15 @@ const (
 	HTTPListenAddr = "localhost:8080"
 	// HEARTBEAT_LISTEN_ADDR is the address where the controller expects heartbeats from storage nodes.
 	HEARTBEAT_LISTEN_ADDR = ":8081"
-	HeartbeatTimeout      = 10 * time.Second // Timeout for storage node heartbeats
+	HeartbeatTimeout      = 15 * time.Second // Timeout for storage node heartbeats
 )
 
 // Controller manages the Raft cluster and storage node metadata.
 type Controller struct {
-	raft       *raft.Raft
-	fsm        *fsm.FSM
-	httpServer *http.Server
+	raft                 *raft.Raft
+	fsm                  *fsm.FSM
+	httpServer           *http.Server
+	leaderControllerAddr string
 	// Track active storage nodes based on heartbeats
 	activeStorageNodes     map[string]time.Time // nodeId -> lastHeartbeatTime
 	storageNodeInfoMutex   sync.RWMutex
@@ -37,13 +40,14 @@ type Controller struct {
 }
 
 // NewController creates a new Controller instance.
-func NewController(raftFSM *fsm.FSM, raftNode *raft.Raft, heartbeatAddr string) (*Controller, error) {
+func NewController(raftFSM *fsm.FSM, raftNode *raft.Raft, heartbeatAddr string, leaderAddr string) (*Controller, error) {
 	c := &Controller{
 		fsm:                    raftFSM,
 		activeStorageNodes:     make(map[string]time.Time),
 		storageNodeIDToAddress: make(map[string]string),
 		lastHeartbeatReceived:  make(map[string]time.Time),
 		heartbeatAddress:       heartbeatAddr,
+		leaderControllerAddr:   leaderAddr,
 	}
 
 	c.raft = raftNode
@@ -69,7 +73,7 @@ func (c *Controller) startHeartbeatListener(heartbeatAddr string) {
 		Handler: mux,
 	}
 
-	log.Printf("Heartbeat listener starting on %s", HEARTBEAT_LISTEN_ADDR)
+	log.Printf("Heartbeat listener starting on %s", heartbeatAddr)
 	if err := heartbeatServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Heartbeat listener failed: %v", err)
 	}
@@ -85,7 +89,7 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	nodeID := r.URL.Query().Get("nodeId")
 	address := r.URL.Query().Get("address") // gRPC address of the storage node
-
+	log.Print("Received heartbeat: ", nodeID, address)
 	if nodeID == "" || address == "" {
 		http.Error(w, "nodeId and address are required", http.StatusBadRequest)
 		return
@@ -104,9 +108,12 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		Type:     fsm.CommandRegisterNode, // Use RegisterNode for heartbeats to update status/address
 		NodeID:   nodeID,
 		NodeAddr: address,
-		Payload:  json.RawMessage([]byte("active")),
+		Payload:  json.RawMessage(`{"status":"active"}`),
 	}
-	c.applyCommand(cmd)
+	err := c.applyCommand(cmd)
+	if err != nil {
+		http.Error(w, "failed to apply raft command: "+err.Error(), http.StatusBadRequest)
+	}
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Heartbeat received"))
@@ -128,7 +135,7 @@ func (c *Controller) monitorStorageNodes() {
 					cmd := fsm.Command{
 						Type:    fsm.CommandUpdateNodeStatus,
 						NodeID:  nodeID,
-						Payload: json.RawMessage([]byte("down")),
+						Payload: json.RawMessage(`{"status":"down"}`),
 					}
 					c.applyCommand(cmd)
 				} else {
@@ -138,23 +145,52 @@ func (c *Controller) monitorStorageNodes() {
 						cmd := fsm.Command{
 							Type:    fsm.CommandUpdateNodeStatus,
 							NodeID:  nodeID,
-							Payload: json.RawMessage([]byte("active")),
+							Payload: json.RawMessage(`{"status":"active"}`),
 						}
 						c.applyCommand(cmd)
 					}
 				}
 			}
 			c.storageNodeInfoMutex.Unlock()
-		case <-make(chan struct{}): // Use a real quit channel from Controller struct if available
+		case <-c.fsm.ShutdownChan(): // Use a real quit channel from Controller struct if available
 			return
 		}
 	}
 }
 
+func (c *Controller) forwardRaftCommandToLeader(cmd fsm.Command) error {
+	cmdBytes, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("follower: failed to marshal command for forwarding: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/admin/apply_forwarded_command", c.leaderControllerAddr), bytes.NewBuffer(cmdBytes))
+	if err != nil {
+		return fmt.Errorf("follower: failed to create forwarding request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("follower: failed to forward command to leader %s: %v", c.leaderControllerAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("follower: leader returned non-OK status %d for forwarded command: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	return nil
+}
+
 // applyCommand submits a command to the Raft leader.
 func (c *Controller) applyCommand(cmd fsm.Command) error {
 	if c.raft.State() != raft.Leader {
-		return fmt.Errorf("not leader, cannot apply command")
+		log.Println("Can't apply command not leader, forwarding it to leader: ", c.leaderControllerAddr)
+		if err := c.forwardRaftCommandToLeader(cmd); err != nil {
+			return fmt.Errorf("failed to forward the apply command to leader %s , error: %v", c.leaderControllerAddr, err)
+		}
 	}
 
 	cmdBytes, err := json.Marshal(cmd)
@@ -195,6 +231,8 @@ func (c *Controller) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/update_replica_onboarding_state", c.handleAdminUpdateReplicaOnboardingState)
 	mux.HandleFunc("/admin/initiate_shard_migration", c.handleAdminInitiateShardMigration)
 	mux.HandleFunc("/admin/commit_shard_migration", c.handleAdminCommitShardMigration)
+	// New internal endpoint for forwarded commands
+	mux.HandleFunc("/admin/apply_forwarded_command", c.handleApplyForwardedCommand)
 }
 
 // handleJoin handles requests to join a new Raft peer.
@@ -314,15 +352,25 @@ func (c *Controller) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 
 	c.storageNodeInfoMutex.RLock()
-	for nodeID, lastHeartbeat := range c.lastHeartbeatReceived {
+	for nodeID, address := range nodeAddresses { // Changed to iterate over nodeAddresses from FSM
+		// Get status from FSM
+		status := nodeStatuses[nodeID]
+		// Get local last heartbeat time, if available
+		lastHeartbeat, heartbeatFound := c.lastHeartbeatReceived[nodeID]
+
 		activeNodesInfo[nodeID] = struct {
 			Address       string `json:"address"`
 			Status        string `json:"status"`
 			LastHeartbeat string `json:"last_heartbeat"`
 		}{
-			Address:       nodeAddresses[nodeID], // Get the actual gRPC address from FSM
-			Status:        nodeStatuses[nodeID],
-			LastHeartbeat: lastHeartbeat.Format(time.RFC3339),
+			Address: address, // This is directly from FSM
+			Status:  status,  // This is directly from FSM
+			LastHeartbeat: func() string {
+				if heartbeatFound {
+					return lastHeartbeat.Format(time.RFC3339)
+				}
+				return "N/A" // Node known by FSM, but this controller hasn't received a heartbeat yet
+			}(),
 		}
 	}
 	c.storageNodeInfoMutex.RUnlock()
@@ -375,7 +423,7 @@ func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.R
 	}
 
 	var req struct {
-		SlotID         uint64   `json:"slotId"`
+		SlotRange      string   `json:"slotRange"`
 		PrimaryNodeID  string   `json:"primaryNodeId"`
 		ReplicaNodeIDs []string `json:"replicaNodeIds"`
 	}
@@ -386,7 +434,7 @@ func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.R
 
 	cmd := fsm.Command{
 		Type:           fsm.CommandAssignSlot,
-		SlotID:         uint64(req.SlotID),
+		SlotRange:      req.SlotRange,
 		PrimaryNodeID:  req.PrimaryNodeID,
 		ReplicaNodeIDs: req.ReplicaNodeIDs,
 	}
@@ -397,7 +445,7 @@ func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.R
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf("Slot %d assigned to primary %s with replicas %v", req.SlotID, req.PrimaryNodeID, req.ReplicaNodeIDs)))
+	w.Write([]byte(fmt.Sprintf("Slot %d assigned to primary %s with replicas %v", req.SlotRange, req.PrimaryNodeID, req.ReplicaNodeIDs)))
 }
 
 // handleAdminGetAllSlotAssignments returns the current shard slot assignments.
@@ -508,7 +556,7 @@ func (c *Controller) handleAdminRegisterStorageNode(w http.ResponseWriter, r *ht
 		Type:     fsm.CommandRegisterNode,
 		NodeID:   req.NodeID,
 		NodeAddr: req.Address,
-		Payload:  json.RawMessage("registered"), // Initial status
+		Payload:  json.RawMessage(`{"status": "registered"}`), // Initial status
 	}
 	if err := c.applyCommand(cmd); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to register storage node: %v", err), http.StatusInternalServerError)
@@ -633,6 +681,42 @@ func (c *Controller) handleAdminUpdateReplicaOnboardingState(w http.ResponseWrit
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Replica onboarding state updated"))
+}
+
+// handleApplyForwardedCommand receives forwarded commands from followers.
+// This endpoint is only intended for internal Raft communication, not external clients.
+func (c *Controller) handleApplyForwardedCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if c.raft.State() != raft.Leader {
+		// This should theoretically not happen if followers correctly forward to the leader,
+		// but it's a good safeguard.
+		http.Error(w, "Not the Raft leader", http.StatusForbidden)
+		return
+	}
+
+	var cmd fsm.Command
+	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid forwarded command body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Apply the command received from the follower.
+	// This will go through the regular Raft Apply path on the leader.
+	if err := c.applyCommand(cmd); err != nil {
+		// Log the error but return 200 to the follower, as the follower's job
+		// was just to forward. The error is now the leader's responsibility.
+		// A more robust system might relay the exact error back.
+		log.Printf("Leader failed to apply forwarded command type %d: %v", cmd.Type, err)
+		http.Error(w, fmt.Sprintf("Leader failed to apply forwarded command: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Command applied by leader"))
 }
 
 // handleAdminInitiateShardMigration initiates a shard migration process.

@@ -1,3 +1,4 @@
+.DS_Store
 cmd/gojodb_server/data/
 cmd/refactored_server/
 cmd/gojodb_controller/raft_data/

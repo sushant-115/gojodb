@@ -399,7 +399,10 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 
 func (f *FSM) GetNodeStatus(nodeID string) (string, bool) {
 	node, found := f.storageNodes[nodeID]
-	return node.Status, found
+	if found {
+		return node.Status, found
+	}
+	return "", false
 }
 
 func (f *FSM) GetNodeStatuses() map[string]string {
@@ -413,7 +416,7 @@ func (f *FSM) GetNodeStatuses() map[string]string {
 func (f *FSM) GetNodeAddresses() map[string]string {
 	nodeAddresses := make(map[string]string)
 	for node, nodeInfo := range f.storageNodes {
-		nodeAddresses[node] = nodeInfo.APIAddr
+		nodeAddresses[node] = nodeInfo.RaftAddr
 	}
 	return nodeAddresses
 }
@@ -505,20 +508,20 @@ func (f *FSM) applyUpdateNodeStatus(cmd Command) error {
 }
 
 func (f *FSM) applyAssignSlot(cmd Command) error {
-	if cmd.SlotID == 0 || cmd.NodeID == "" { // NodeID is the new primary
-		return fmt.Errorf("AssignSlot command missing SlotID or NodeID (primary)")
+	if cmd.SlotRange == "" || cmd.PrimaryNodeID == "" { // NodeID is the new primary
+		return fmt.Errorf("AssignSlot command missing SlotID or NodeID (primary) %s, node: %s", cmd.PrimaryNodeID, cmd.NodeID)
 	}
 	if _, nodeExists := f.storageNodes[cmd.NodeID]; !nodeExists {
 		return fmt.Errorf("cannot assign slot to unknown node %s", cmd.NodeID)
 	}
 
 	var oldPrimaryNodeID string
-	assignment, exists := f.slotAssignments[cmd.SlotID]
+	assignment, exists := f.slotRangeInfo[cmd.SlotRange]
 	if exists {
 		oldPrimaryNodeID = assignment.PrimaryNodeID
 		if oldPrimaryNodeID == cmd.NodeID && mapsAreEqual(assignment.ReplicaNodes, cmd.Replicas) {
-			f.logger.Info("Slot assignment unchanged", zap.Uint64("slotID", cmd.SlotID))
-			assignment.Version++ // Still bump version for idempotency if needed, or just return
+			f.logger.Info("Slot assignment unchanged", zap.String("SlotRange", cmd.SlotRange))
+			// Still bump version for idempotency if needed, or just return
 			return nil
 		}
 		// If primary changes, update old primary's owned shards
@@ -528,8 +531,8 @@ func (f *FSM) applyAssignSlot(cmd Command) error {
 			}
 		}
 	} else {
-		assignment = &SlotAssignment{SlotID: cmd.SlotID}
-		f.slotAssignments[cmd.SlotID] = assignment
+		assignment = &SlotRangeInfo{SlotRange: cmd.SlotRange}
+		f.slotRangeInfo[cmd.SlotRange] = assignment
 	}
 
 	assignment.PrimaryNodeID = cmd.NodeID
@@ -537,15 +540,14 @@ func (f *FSM) applyAssignSlot(cmd Command) error {
 	if assignment.ReplicaNodes == nil {
 		assignment.ReplicaNodes = make(map[string]string)
 	}
-	assignment.Version++
 
 	// Update new primary's owned shards
-	f.storageNodes[cmd.NodeID].ShardsOwned[cmd.SlotID] = true
-	// Ensure new primary is not also listed as its own replica for this slot
-	delete(f.storageNodes[cmd.NodeID].ShardsReplicating, cmd.SlotID)
+	// f.storageNodes[cmd.NodeID].ShardsOwned[cmd.SlotID] = true
+	// // Ensure new primary is not also listed as its own replica for this slot
+	// delete(f.storageNodes[cmd.NodeID].ShardsReplicating, cmd.SlotID)
 
 	f.logger.Info("Assigned slot to node (primary)",
-		zap.Uint64("slotID", cmd.SlotID),
+		zap.String("slotRange", cmd.SlotRange),
 		zap.String("primaryNodeID", cmd.NodeID),
 		zap.Any("replicas", cmd.Replicas),
 		zap.String("oldPrimary", oldPrimaryNodeID))

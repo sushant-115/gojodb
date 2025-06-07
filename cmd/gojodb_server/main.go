@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log" // Standard log, consider replacing all with zap eventually
 	"net"
 	"net/http"
@@ -143,8 +144,12 @@ func main() {
 	globalWG.Add(1)
 	go initialFetchShardMapFromController()
 
+	globalWG.Add(1)
+	stopChan := make(chan struct{})
+	go sendHeartBeats(stopChan)
+
 	// Graceful shutdown
-	setupSignalHandling()
+	setupSignalHandling(stopChan)
 
 	globalWG.Wait() // Wait for all essential goroutines to finish
 	zlogger.Info("GojoDB storage node shut down gracefully.")
@@ -375,12 +380,46 @@ func initAndStartRaft() error {
 	} else {
 		zlogger.Warn("Node is not bootstrapping and no controller address provided. It might remain isolated unless manually joined.")
 	}
-	raftController, err = gojodbcontroller.NewController(raftFSM, raftNode, *heartbeatAddr)
+	raftController, err = gojodbcontroller.NewController(raftFSM, raftNode, *heartbeatAddr, *controllerAddr)
 	if err != nil {
 		return fmt.Errorf("failed to create raft controller: %w", err)
 	}
 
 	return nil
+}
+
+func sendHeartBeats(stopChan chan struct{}) {
+	defer globalWG.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	data := map[string]string{
+		"nodeId":  *nodeID,
+		"address": *httpAddr,
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		panic(err)
+	}
+	heartbeatPath := fmt.Sprintf("http://%s/heartbeat?nodeId=%s&address=%s", *heartbeatAddr, *nodeID, *httpAddr)
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			resp, err := http.Post(heartbeatPath, "application/json", bytes.NewBuffer(jsonData))
+			if err != nil {
+				zlogger.Warn("Failed to send heartbeat: ", zap.Error(err), zap.String("heartbeartAddr", *heartbeatAddr))
+				continue
+			}
+			body, _ := ioutil.ReadAll(resp.Body)
+			log.Println("Heartbeat response: ", string(body), heartbeatPath)
+			//zlogger.Warn("Sent heartbeat: ", zap.String("heartbeartAddr", *heartbeatAddr))
+		}
+	}
+
 }
 
 // listenForReplicationRequests handles incoming connections from primaries that want to stream logs.
@@ -779,7 +818,7 @@ func handleRaftCommand(w http.ResponseWriter, r *http.Request) {
 	w.Write(responseBytes)
 }
 
-func setupSignalHandling() {
+func setupSignalHandling(stopChan chan struct{}) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
@@ -789,6 +828,7 @@ func setupSignalHandling() {
 
 		// Start shutdown sequence
 		closeStorageNode()
+		stopChan <- struct{}{}
 
 		// If there are other goroutines managed by globalWG that closeStorageNode doesn't explicitly stop,
 		// they should also check a global shutdown channel or context.

@@ -145,7 +145,12 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 	}
 
 	// Open or create the file. 'create=true' means it will create if not exists, error if exists.
-	_, err = dm.OpenOrCreateFile(false, degree, 0)
+	create := false
+	_, statErr := os.Stat(filePath)
+	if os.IsNotExist(statErr) {
+		create = true
+	}
+	_, err = dm.OpenOrCreateFile(create, degree, 0)
 	if err != nil {
 		dm.Close() // Ensure disk manager is closed on failure
 		// If the file already exists, it's an error for NewBTreeFile
