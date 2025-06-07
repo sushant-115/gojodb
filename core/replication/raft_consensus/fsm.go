@@ -23,6 +23,7 @@ type CommandType uint8
 const (
 	CommandNoOp                  CommandType = iota // Ensure NoOp is 0 for safety
 	CommandRegisterNode                             // Storage node registers with controller/FSM
+	CommandDeregisterNode                           //Removes a node from the cluster
 	CommandUpdateNodeStatus                         // Storage node sends heartbeat/status
 	CommandAssignSlot                               // Assign a shard/slot to a node (making it primary)
 	CommandAddReplicaToSlot                         // Add a replica to a shard/slot
@@ -60,15 +61,16 @@ var TotalHashSlots uint32 = 1024
 
 // Command represents a command to be applied to the FSM.
 type Command struct {
-	Type          CommandType       `json:"type"`
-	NodeID        string            `json:"node_id,omitempty"`
-	NodeAddr      string            `json:"node_addr,omitempty"` // For registration, replication endpoint
-	SlotID        uint64            `json:"slot_id,omitempty"`
-	SlotRange     string            `json:"slot_range"`
-	TargetNodeID  string            `json:"target_node_id,omitempty"`  // For replica add/remove, migration target
-	ShardID       string            `json:"shard_id,omitempty"`        // For more granular shard ID if different from SlotID
-	Replicas      map[string]string `json:"replicas,omitempty"`        // map[NodeID]NodeAddr for a slot's replicas
-	PrimaryNodeID string            `json:"primary_node_id,omitempty"` // For setting primary
+	Type           CommandType       `json:"type"`
+	NodeID         string            `json:"node_id,omitempty"`
+	NodeAddr       string            `json:"node_addr,omitempty"` // For registration, replication endpoint
+	SlotID         uint64            `json:"slot_id,omitempty"`
+	SlotRange      string            `json:"slot_range"`
+	TargetNodeID   string            `json:"target_node_id,omitempty"`  // For replica add/remove, migration target
+	ShardID        string            `json:"shard_id,omitempty"`        // For more granular shard ID if different from SlotID
+	Replicas       map[string]string `json:"replicas,omitempty"`        // map[NodeID]NodeAddr for a slot's replicas
+	PrimaryNodeID  string            `json:"primary_node_id,omitempty"` // For setting primary
+	ReplicaNodeIDs []string          `json:"replica_node_ids,omitempty"`
 
 	// Tiered Storage Fields
 	TieringMetadata *tiered_storage.TieredDataMetadata `json:"tiering_metadata,omitempty"`
@@ -221,6 +223,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	switch cmd.Type {
 	case CommandRegisterNode:
 		return f.applyRegisterNode(cmd)
+	case CommandDeregisterNode:
+		return f.applyDeregisterNode(cmd)
 	case CommandUpdateNodeStatus:
 		return f.applyUpdateNodeStatus(cmd)
 	case CommandAssignSlot: // Make a node primary for a slot, also informs replicas
@@ -392,6 +396,51 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	}
 }
 
+func (f *FSM) GetNodeStatus(nodeID string) (string, bool) {
+	node, found := f.storageNodes[nodeID]
+	return node.Status, found
+}
+
+func (f *FSM) GetNodeStatuses() map[string]string {
+	nodeStatuses := make(map[string]string)
+	for node, nodeInfo := range f.storageNodes {
+		nodeStatuses[node] = nodeInfo.Status
+	}
+	return nodeStatuses
+}
+
+func (f *FSM) GetNodeAddresses() map[string]string {
+	nodeAddresses := make(map[string]string)
+	for node, nodeInfo := range f.storageNodes {
+		nodeAddresses[node] = nodeInfo.APIAddr
+	}
+	return nodeAddresses
+}
+
+func (f *FSM) GetSlotAssignments() map[uint64]SlotAssignment {
+	slotAssignments := make(map[uint64]SlotAssignment)
+	for slot, slotInfo := range f.slotAssignments {
+		slotAssignments[slot] = *slotInfo
+	}
+	return slotAssignments
+}
+
+func (f *FSM) GetReplicaOnboardingStates() map[string]ReplicaOnboardingState {
+	replicaOnboardingState := make(map[string]ReplicaOnboardingState)
+	for s, info := range f.activeReplicaOnboardings {
+		replicaOnboardingState[s] = *info
+	}
+	return replicaOnboardingState
+}
+
+func (f *FSM) GetShardMigrationStates() map[string]ShardMigrationState {
+	shardMigrationState := make(map[string]ShardMigrationState)
+	for s, info := range f.activeShardMigrations {
+		shardMigrationState[s] = *info
+	}
+	return shardMigrationState
+}
+
 func (f *FSM) applyRegisterNode(cmd Command) error {
 	if cmd.NodeID == "" || cmd.NodeAddr == "" { // NodeAddr here is Raft Addr
 		return fmt.Errorf("RegisterNode command missing NodeID or RaftAddr")
@@ -418,6 +467,21 @@ func (f *FSM) applyRegisterNode(cmd Command) error {
 		ShardsReplicating: make(map[uint64]string),
 	}
 	f.logger.Info("Registered new storage node", zap.String("nodeID", cmd.NodeID), zap.String("raftAddr", cmd.NodeAddr))
+	return nil
+}
+
+func (f *FSM) applyDeregisterNode(cmd Command) error {
+	if cmd.NodeID == "" { // NodeAddr here is Raft Addr
+		return fmt.Errorf("RegisterNode command missing NodeID or RaftAddr")
+	}
+	if _, exists := f.storageNodes[cmd.NodeID]; exists {
+		f.logger.Warn("Deregistering the node from cluster", zap.String("nodeID", cmd.NodeID))
+		// Update existing node info (e.g. if address changed or for re-registration)
+		delete(f.storageNodes, cmd.NodeID)
+		return nil
+	}
+
+	f.logger.Info("Deregistered storage node", zap.String("nodeID", cmd.NodeID), zap.String("raftAddr", cmd.NodeAddr))
 	return nil
 }
 

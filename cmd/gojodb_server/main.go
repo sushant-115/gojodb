@@ -19,6 +19,7 @@ import (
 	"time"
 
 	// GojoDB core packages
+	gojodbcontroller "github.com/sushant-115/gojodb/cmd/gojodb_controller"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
@@ -53,11 +54,12 @@ var (
 	// NEW: Map of index type to its replication manager
 	indexReplicationManagers map[logreplication.IndexType]logreplication.ReplicationManagerInterface
 
-	raftNode   *raft.Raft
-	raftFSM    *fsm.FSM
-	grpcServer *grpc.Server
-	httpServer *http.Server
-	zlogger    *zap.Logger // Changed from logger to zlogger to avoid conflict with standard log package
+	raftNode       *raft.Raft
+	raftFSM        *fsm.FSM
+	grpcServer     *grpc.Server
+	raftController *gojodbcontroller.Controller
+	httpServer     *http.Server
+	zlogger        *zap.Logger // Changed from logger to zlogger to avoid conflict with standard log package
 
 	// Command-line flags
 	nodeID            = flag.String("node_id", "node1", "Unique ID for the node")
@@ -67,9 +69,10 @@ var (
 	httpAddr          = flag.String("http_addr", "127.0.0.1:8080", "HTTP bind address for GraphQL and health checks")
 	bootstrap         = flag.Bool("bootstrap", false, "Bootstrap the Raft cluster (only for the first node)")
 	controllerAddr    = flag.String("controller_addr", "127.0.0.1:9000", "Controller address for joining Raft cluster and fetching shard map")
-	replicationPort   = flag.String("repl_port", "6000", "Port for replication data exchange between storage nodes") // Clarified purpose
-	myStorageNodeID   string                                                                                         // Set from nodeID flag
-	myStorageNodeAddr string                                                                                         // Address this node is reachable at by other storage nodes (e.g. for replication)
+	replicationPort   = flag.String("repl_port", "6000", "Port for replication data exchange between storage nodes")                // Clarified purpose
+	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes") // Clarified purpose
+	myStorageNodeID   string                                                                                                        // Set from nodeID flag
+	myStorageNodeAddr string                                                                                                        // Address this node is reachable at by other storage nodes (e.g. for replication)
 
 	// Global wait group to manage graceful shutdown of goroutines
 	globalWG sync.WaitGroup
@@ -372,6 +375,11 @@ func initAndStartRaft() error {
 	} else {
 		zlogger.Warn("Node is not bootstrapping and no controller address provided. It might remain isolated unless manually joined.")
 	}
+	raftController, err = gojodbcontroller.NewController(raftFSM, raftNode, *heartbeatAddr)
+	if err != nil {
+		return fmt.Errorf("failed to create raft controller: %w", err)
+	}
+
 	return nil
 }
 
@@ -715,6 +723,7 @@ func startHTTPServer() {
 	// mux.Handle("/query", srv)                                                     // GraphQL queries
 	// mux.Handle("/playground", playground.Handler("GraphQL playground", "/query")) // Interactive playground
 	addMuxHandler((mux))
+	raftController.RegisterHandlers(mux)
 
 	httpServer = &http.Server{
 		Addr:    *httpAddr,
@@ -799,11 +808,11 @@ func addMuxHandler(mux *http.ServeMux) error {
 		_, _ = w.Write([]byte("OK"))
 	})
 
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		status := raftFSM.Status()
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(status))
-	})
+	// mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+	// 	status := raftFSM.Status()
+	// 	w.WriteHeader(http.StatusOK)
+	// 	_, _ = w.Write([]byte(status))
+	// })
 
 	mux.HandleFunc("/raft/join", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -891,6 +900,6 @@ func addMuxHandler(mux *http.ServeMux) error {
 	})
 
 	// Generic Raft command handler
-	mux.HandleFunc("/raft/command", handleRaftCommand)
+	//mux.HandleFunc("/raft/command", handleRaftCommand)
 	return nil
 }

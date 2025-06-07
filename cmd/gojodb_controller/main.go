@@ -1,776 +1,750 @@
-package main
+package gojodbcontroller
 
 import (
-	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
+	"strconv" // Added for parsing slot IDs from JSON keys
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"                   // Raft library
-	raftboltdb "github.com/hashicorp/raft-boltdb" // BoltDB backend for Raft log and stable store
-
-	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus" // Our custom FSM
+	"github.com/hashicorp/raft"
+	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 )
 
 const (
-	defaultRaftDir       = "raft_data_new"
-	defaultRaftSnapshots = 2                // Number of Raft snapshots to retain
-	heartbeatInterval    = 5 * time.Second  // Interval for Storage Node heartbeats
-	heartbeatTimeout     = 15 * time.Second // Timeout for Storage Node health
-
-	defaultHeartbeatListenPort = 8086 // Default UDP port for Storage Node heartbeats
+	RaftDir        = "./raft"
+	RaftBindAddr   = "localhost:7000"
+	NodeID         = "nodeA"
+	HTTPListenAddr = "localhost:8080"
+	// HEARTBEAT_LISTEN_ADDR is the address where the controller expects heartbeats from storage nodes.
+	HEARTBEAT_LISTEN_ADDR = ":8081"
+	HeartbeatTimeout      = 10 * time.Second // Timeout for storage node heartbeats
 )
 
-// Controller represents a single GojoDB Controller Node.
+// Controller manages the Raft cluster and storage node metadata.
 type Controller struct {
-	raft         *raft.Raft     // Raft consensus mechanism
-	fsm          *fsm.GojoDBFSM // Our replicated state machine
-	raftDir      string
-	raftBindAddr string
-	nodeID       string
-
-	// Node Manager (Initial)
-	localHeartbeatMap      map[string]time.Time // Local map to track last heartbeat time for timeout detection
-	storageNodesMu         sync.Mutex           // Protects local heartbeat tracking map
-	heartbeatListener      *net.Listener        // Listener for incoming heartbeats from Storage Nodes
-	heartbeatListenAddress string               // Configurable UDP port for heartbeats
+	raft       *raft.Raft
+	fsm        *fsm.FSM
+	httpServer *http.Server
+	// Track active storage nodes based on heartbeats
+	activeStorageNodes     map[string]time.Time // nodeId -> lastHeartbeatTime
+	storageNodeInfoMutex   sync.RWMutex
+	storageNodeIDToAddress map[string]string // nodeID -> gRPC Address received via heartbeat/registration
+	lastHeartbeatReceived  map[string]time.Time
+	heartbeatAddress       string
 }
 
-type HeartbeatMessage struct {
-	NodeID    string `json:"node_id"`
-	Address   string `json:"address"`
-	Timestamp int64  `json:"timestamp"` // Unix timestamp
-}
-
-// NewController creates and initializes a new Controller node.
-func NewController(nodeID string, raftBindAddr string, httpAddr string, raftDir string, joinAddr string, heartbeatListenAddress string) (*Controller, error) {
+// NewController creates a new Controller instance.
+func NewController(raftFSM *fsm.FSM, raftNode *raft.Raft, heartbeatAddr string) (*Controller, error) {
 	c := &Controller{
-		fsm:                    fsm.NewGojoDBFSM(), // Initialize our FSM
-		raftDir:                raftDir,
-		raftBindAddr:           raftBindAddr,
-		nodeID:                 nodeID,
-		localHeartbeatMap:      make(map[string]time.Time), // Initialize local map
-		heartbeatListenAddress: heartbeatListenAddress,     // Set configurable port
+		fsm:                    raftFSM,
+		activeStorageNodes:     make(map[string]time.Time),
+		storageNodeIDToAddress: make(map[string]string),
+		lastHeartbeatReceived:  make(map[string]time.Time),
+		heartbeatAddress:       heartbeatAddr,
 	}
 
-	// Setup Raft
-	log.Println("Join addr: ", joinAddr)
-	if err := c.setupRaft(joinAddr); err != nil {
-		return nil, fmt.Errorf("failed to setup Raft: %w", err)
+	c.raft = raftNode
+
+	c.httpServer = &http.Server{
+		Addr: HTTPListenAddr,
 	}
 
-	// Start HTTP server for client/admin interaction
-	go c.startHTTPServer(httpAddr)
-
-	// Start Heartbeat Listener for Storage Nodes
-	// go c.startHeartbeatListener()
-	go c.ReceiveHeartbeatsTCP(context.Background(), heartbeatListenAddress, 10*time.Second)
-
-	// Start background goroutine for monitoring Storage Nodes
+	// Start monitoring storage node heartbeats
 	go c.monitorStorageNodes()
+	go c.startHeartbeatListener(heartbeatAddr)
 
 	return c, nil
 }
 
-// setupRaft initializes the Raft instance.
-func (c *Controller) setupRaft(joinAddr string) error {
-	// Ensure Raft data directory exists
-	if err := os.MkdirAll(c.raftDir, 0755); err != nil {
-		return fmt.Errorf("failed to create Raft directory: %w", err)
+// startHeartbeatListener starts an HTTP server to receive heartbeats from storage nodes.
+func (c *Controller) startHeartbeatListener(heartbeatAddr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/heartbeat", c.handleHeartbeat)
+
+	heartbeatServer := &http.Server{
+		Addr:    heartbeatAddr,
+		Handler: mux,
 	}
 
-	// Setup Raft configuration
-	config := raft.DefaultConfig()
-	config.LocalID = raft.ServerID(c.nodeID)
-	config.Logger = nil // Raft-specific logger
-
-	// Setup Raft transport
-	addr, err := net.ResolveTCPAddr("tcp", c.raftBindAddr)
-	if err != nil {
-		return fmt.Errorf("failed to resolve TCP address: %w", err)
+	log.Printf("Heartbeat listener starting on %s", HEARTBEAT_LISTEN_ADDR)
+	if err := heartbeatServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Heartbeat listener failed: %v", err)
 	}
-	transport, err := raft.NewTCPTransport(addr.String(), addr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		return fmt.Errorf("failed to create TCP transport: %w", err)
-	}
-
-	// Setup Raft log store (BoltDB)
-	// This stores Raft's log entries and metadata persistently.
-	logStore, err := raftboltdb.NewBoltStore(filepath.Join(c.raftDir, "raft-log.db"))
-	if err != nil {
-		return fmt.Errorf("failed to create BoltDB log store: %w", err)
-	}
-
-	// Setup Raft stable store (BoltDB)
-	// This stores Raft's configuration and vote information persistently.
-	stableStore, err := raftboltdb.NewBoltStore(filepath.Join(c.raftDir, "raft-stable.db"))
-	if err != nil {
-		return fmt.Errorf("failed to create BoltDB stable store: %w", err)
-	}
-
-	// Setup Raft snapshot store
-	snapshotStore, err := raft.NewFileSnapshotStore(c.raftDir, defaultRaftSnapshots, os.Stderr)
-	if err != nil {
-		return fmt.Errorf("failed to create file snapshot store: %w", err)
-	}
-
-	// Create the Raft instance
-	ra, err := raft.NewRaft(config, c.fsm, logStore, stableStore, snapshotStore, transport)
-	if err != nil {
-		return fmt.Errorf("failed to create Raft instance: %w", err)
-	}
-	c.raft = ra
-
-	// Check if this is the first node or joining an existing cluster
-	if joinAddr == "" {
-		log.Printf("INFO: Starting new Raft cluster as leader on %s", c.raftBindAddr)
-		// Bootstrap the cluster if this is the first node
-		// This makes this node the initial leader
-		cfg := raft.Configuration{
-			Servers: []raft.Server{
-				{
-					ID:      config.LocalID,
-					Address: transport.LocalAddr(),
-				},
-			},
-		}
-		f := ra.BootstrapCluster(cfg)
-		if f.Error() != nil && f.Error() != raft.ErrCantBootstrap {
-			return fmt.Errorf("failed to bootstrap cluster: %w", f.Error())
-		}
-	} else {
-		log.Printf("INFO: Attempting to join Raft cluster at %s", joinAddr)
-		// Attempt to join an existing cluster
-		for i := 1; i < 4; i++ {
-			if err := c.joinRaftCluster(joinAddr); err != nil && i >= 4 {
-				return fmt.Errorf("failed to join Raft cluster: %w", err)
-			}
-			log.Println("WARN: couldn't join the raft cluster, retrying in ", i*5, "Seconds")
-			time.Sleep(time.Duration(i) * 5 * time.Second)
-		}
-	}
-
-	// Wait for Raft to become a leader or follower
-	log.Println("INFO: Waiting for Raft cluster to stabilize...")
-	select {
-	case <-ra.LeaderCh():
-		log.Println("INFO: This node is now the LEADER.")
-	case <-time.After(10 * time.Second): // Give it some time to elect a leader
-		log.Println("INFO: Raft cluster is active (may be follower).")
-	}
-
-	return nil
+	log.Println("Heartbeat listener stopped.")
 }
 
-// joinRaftCluster attempts to join an existing Raft cluster.
-func (c *Controller) joinRaftCluster(joinAddr string) error {
-	// Send a join request to the target Raft node
-	resp, err := http.Get(fmt.Sprintf("http://%s/join?peerID=%s&peerAddr=%s", joinAddr, c.nodeID, c.raftBindAddr))
-	if err != nil {
-		return fmt.Errorf("failed to send join request: %w", err)
+// handleHeartbeat processes heartbeat requests from storage nodes.
+func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("join request failed with status: %s", resp.Status)
+	nodeID := r.URL.Query().Get("nodeId")
+	address := r.URL.Query().Get("address") // gRPC address of the storage node
+
+	if nodeID == "" || address == "" {
+		http.Error(w, "nodeId and address are required", http.StatusBadRequest)
+		return
 	}
-	return nil
+
+	c.storageNodeInfoMutex.Lock()
+	c.lastHeartbeatReceived[nodeID] = time.Now()
+	// Update storage node address if it changes or is new
+	if c.storageNodeIDToAddress[nodeID] != address {
+		c.storageNodeIDToAddress[nodeID] = address
+	}
+	c.storageNodeInfoMutex.Unlock()
+
+	// Submit a command to Raft FSM to update node status and address
+	cmd := fsm.Command{
+		Type:     fsm.CommandRegisterNode, // Use RegisterNode for heartbeats to update status/address
+		NodeID:   nodeID,
+		NodeAddr: address,
+		Payload:  json.RawMessage([]byte("active")),
+	}
+	c.applyCommand(cmd)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Heartbeat received"))
 }
 
-// startHTTPServer starts the HTTP server for API endpoints.
-func (c *Controller) startHTTPServer(httpAddr string) {
-	log.Printf("INFO: Starting HTTP server on %s", httpAddr)
-
-	http.HandleFunc("/join", func(w http.ResponseWriter, r *http.Request) {
-		peerID := r.URL.Query().Get("peerID")
-		peerAddr := r.URL.Query().Get("peerAddr")
-		if peerID == "" || peerAddr == "" {
-			http.Error(w, "peerID and peerAddr are required", http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("INFO: Received join request from peer %s at %s", peerID, peerAddr)
-
-		// Check if this node is the leader
-		if c.raft.State() != raft.Leader {
-			http.Error(w, "not leader", http.StatusServiceUnavailable)
-			return
-		}
-
-		// Add the peer to the Raft cluster configuration
-		f := c.raft.AddVoter(raft.ServerID(peerID), raft.ServerAddress(peerAddr), 0, 0)
-		if f.Error() != nil {
-			http.Error(w, fmt.Sprintf("failed to add voter: %v", f.Error()), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Successfully joined cluster")
-	})
-
-	http.HandleFunc("/metadata", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			// Set metadata
-			key := r.URL.Query().Get("key")
-			value := r.URL.Query().Get("value")
-			if key == "" || value == "" {
-				http.Error(w, "key and value are required", http.StatusBadRequest)
-				return
-			}
-
-			// Apply the command through Raft
-			cmd := fsm.LogCommand{
-				Op:    fsm.OpSetMetadata,
-				Key:   key,
-				Value: value,
-			}
-			cmdBytes, err := json.Marshal(cmd)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to marshal command: %v", err), http.StatusInternalServerError)
-				return
-			}
-
-			f := c.raft.Apply(cmdBytes, 5*time.Second) // Apply with a timeout
-			if f.Error() != nil {
-				http.Error(w, fmt.Sprintf("failed to apply command: %v", f.Error()), http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "Metadata set successfully")
-
-		} else if r.Method == http.MethodGet {
-			// Get metadata
-			key := r.URL.Query().Get("key")
-			if key == "" {
-				http.Error(w, "key is required", http.StatusBadRequest)
-				return
-			}
-			val, found := c.fsm.GetMetadata(key)
-			if !found {
-				http.Error(w, "metadata not found", http.StatusNotFound)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "Metadata: %s", val)
-		} else {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	// Endpoint to check Raft leader status and Storage Node status
-	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		state := c.raft.State().String()
-		leaderAddr := c.raft.Leader()
-
-		// Get Storage Node status from FSM (replicated state)
-		storageNodes := c.fsm.GetStorageNodes()
-		storageNodeCount := c.fsm.GetStorageNodeCount()
-
-		// Get Slot Assignments from FSM (replicated state)
-		slotAssignments := c.fsm.GetAllSlotAssignments()
-
-		response := fmt.Sprintf("Node ID: %s\nState: %s\nLeader: %s\n\nRegistered Storage Nodes (%d):\n", c.nodeID, state, leaderAddr, storageNodeCount)
-		if storageNodeCount == 0 {
-			response += "  (None)\n"
-		} else {
-			for id, addr := range storageNodes {
-				response += fmt.Sprintf("  - ID: %s, Addr: %s\n", id, addr)
-			}
-		}
-
-		response += "\nSlot Assignments:\n"
-		if len(slotAssignments) == 0 {
-			response += "  (None)\n"
-		} else {
-			// Sort slot ranges for consistent output
-			var sortedRanges []fsm.SlotRangeInfo
-			for _, sr := range slotAssignments {
-				sortedRanges = append(sortedRanges, sr)
-			}
-			sort.Slice(sortedRanges, func(i, j int) bool {
-				return sortedRanges[i].StartSlot < sortedRanges[j].StartSlot
-			})
-
-			for _, sr := range sortedRanges {
-				response += fmt.Sprintf("  - RangeID: %s (%d-%d), Assigned To: %s, Status: %s\n",
-					sr.RangeID, sr.StartSlot, sr.EndSlot, sr.AssignedNodeID, sr.Status)
-
-				response += fmt.Sprintf("  		- Primary Node: %s , Replica Nodes: %s\n",
-					sr.PrimaryNodeID, strings.Join(sr.ReplicaNodeIDs, ","))
-			}
-		}
-
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, response)
-	})
-
-	// Endpoint to get all slot assignments
-	http.HandleFunc("/admin/get_all_slot_assignments", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		slotAssignments := c.fsm.GetAllSlotAssignments()
-		respBytes, err := json.Marshal(slotAssignments)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to marshal slot assignments: %v", err), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(respBytes)
-	})
-
-	// --- Sharding Endpoints ---
-	// Endpoint to assign a range of slots to a Storage Node
-	http.HandleFunc("/admin/assign_slot_range", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		startSlotStr := r.URL.Query().Get("startSlot")
-		endSlotStr := r.URL.Query().Get("endSlot")
-		assignedNodeID := r.URL.Query().Get("assignedNodeID")
-		replicaNodes := r.URL.Query().Get("replicaNodes")
-		replicaNodeIDs := strings.Split(replicaNodes, ",")
-
-		if startSlotStr == "" || endSlotStr == "" || assignedNodeID == "" {
-			http.Error(w, "startSlot, endSlot, and assignedNodeID are required", http.StatusBadRequest)
-			return
-		}
-
-		startSlot, err := strconv.Atoi(startSlotStr)
-		if err != nil {
-			http.Error(w, "invalid startSlot format", http.StatusBadRequest)
-			return
-		}
-		endSlot, err := strconv.Atoi(endSlotStr)
-		if err != nil {
-			http.Error(w, "invalid endSlot format", http.StatusBadRequest)
-			return
-		}
-
-		if startSlot < 0 || endSlot >= fsm.TotalHashSlots || startSlot > endSlot {
-			http.Error(w, fmt.Sprintf("invalid slot range [%d, %d). Must be within [0, %d) and start <= end.", startSlot, endSlot, fsm.TotalHashSlots), http.StatusBadRequest)
-			return
-		}
-
-		// Create the SlotRangeInfo
-		slotInfo := fsm.SlotRangeInfo{
-			RangeID:        fmt.Sprintf("%d-%d", startSlot, endSlot),
-			StartSlot:      startSlot,
-			EndSlot:        endSlot,
-			AssignedNodeID: assignedNodeID,
-			Status:         "active", // Default status
-			LastUpdated:    time.Now(),
-			PrimaryNodeID:  assignedNodeID,
-			ReplicaNodeIDs: replicaNodeIDs,
-		}
-
-		slotInfoBytes, err := json.Marshal(slotInfo)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to marshal SlotRangeInfo: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		cmd := fsm.LogCommand{
-			Op:    fsm.OpAssignSlotRange,
-			Key:   slotInfo.RangeID, // Key is the RangeID
-			Value: string(slotInfoBytes),
-		}
-		cmdBytes, err := json.Marshal(cmd)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to marshal command: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		applyFuture := c.raft.Apply(cmdBytes, 5*time.Second)
-		if applyFuture.Error() != nil {
-			http.Error(w, fmt.Sprintf("failed to apply command: %v", applyFuture.Error()), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Slot range %s assigned to %s successfully.", slotInfo.RangeID, assignedNodeID)
-	})
-
-	// In controller/main.go, inside startHTTPServer function:
-	http.HandleFunc("/admin/get_storage_node_address", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		nodeID := r.URL.Query().Get("nodeID")
-		if nodeID == "" {
-			http.Error(w, "nodeID is required", http.StatusBadRequest)
-			return
-		}
-
-		// Check if this node is the leader
-		if c.raft.State() != raft.Leader {
-			http.Error(w, "not leader", http.StatusServiceUnavailable)
-			return
-		}
-
-		// Get Storage Node address from FSM
-		storageNodes := c.fsm.GetStorageNodes() // This is the replicated map
-		addr, found := storageNodes[nodeID]
-		if !found {
-			http.Error(w, fmt.Sprintf("Storage Node %s not found.", nodeID), http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, addr) // Return just the address string
-	})
-
-	// Endpoint to get the assigned node for a specific key
-	http.HandleFunc("/admin/get_node_for_key", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		key := r.URL.Query().Get("key")
-		if key == "" {
-			http.Error(w, "key is required", http.StatusBadRequest)
-			return
-		}
-
-		nodeID, found := c.fsm.GetNodeForHashKey(key)
-		if !found {
-			http.Error(w, fmt.Sprintf("No storage node found for key '%s' (slot %d).", key, fsm.GetSlotForHashKey(key)), http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Key '%s' (slot %d) is assigned to Storage Node: %s", key, fsm.GetSlotForHashKey(key), nodeID)
-	})
-	// --- End Sharding Endpoints ---
-
-	log.Fatal(http.ListenAndServe(httpAddr, nil))
-}
-
-// startHeartbeatListener starts a UDP listener for Storage Node heartbeats.
-func (c *Controller) startHeartbeatListener() {
-	// addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(c.heartbeatListenPort))
-	// if err != nil {
-	// 	log.Fatalf("FATAL: Failed to resolve UDP address for heartbeat listener: %v", err)
-	// }
-	listener, err := net.Listen("tcp", c.heartbeatListenAddress)
-	if err != nil {
-		log.Fatalf("FATAL: Failed to start UDP heartbeat listener: %v", err)
-	}
-	c.heartbeatListener = &listener
-	log.Printf("INFO: Heartbeat listener started on UDP %s", listener.Addr().String())
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("ERROR: Error reading heartbeat: %v", err)
-			continue
-		}
-		scanner := bufio.NewScanner(conn)
-		for scanner.Scan() {
-			heartbeatMessage := scanner.Text()
-			if strings.TrimSpace(heartbeatMessage) == "" {
-				continue
-			}
-			parts := strings.SplitN(heartbeatMessage, ":", 2)
-			if len(parts) != 2 {
-				log.Printf("WARNING: Invalid heartbeat format from %s: '%s'", conn.RemoteAddr().String(), heartbeatMessage)
-				continue
-			}
-			storageNodeID := parts[0]
-			storageNodeAddr := parts[1]
-			log.Println("Received heartbeat: ", parts)
-			c.recordHeartbeat(storageNodeID, storageNodeAddr)
-			log.Printf("Received heartbeat from %s: %s", conn.RemoteAddr().String(), heartbeatMessage)
-		}
-
-		if err := scanner.Err(); err != nil {
-			log.Printf("Connection error from %s: %v", conn.RemoteAddr().String(), err)
-		} else {
-			log.Printf("Connection closed from %s", conn.RemoteAddr().String())
-		}
-
-	}
-}
-
-// recordHeartbeat updates the last heartbeat time for a Storage Node locally,
-// and if this Controller is the leader, it applies the state change via Raft.
-func (c *Controller) recordHeartbeat(nodeID string, addr string) {
-	c.storageNodesMu.Lock()
-	c.localHeartbeatMap[nodeID] = time.Now() // Update local heartbeat time
-	c.storageNodesMu.Unlock()
-
-	// If this Controller node is the Raft leader, apply the state change to the FSM.
-	if c.raft.State() == raft.Leader {
-		cmd := fsm.LogCommand{
-			Op:    fsm.OpUpdateNodeStatus, // Use OpUpdateNodeStatus to add or update
-			Key:   nodeID,
-			Value: addr, // Store the address or a more complex status object
-		}
-		cmdBytes, err := json.Marshal(cmd)
-		if err != nil {
-			log.Printf("ERROR: Failed to marshal heartbeat command for %s: %v", nodeID, err)
-			return
-		}
-
-		// Apply the command through Raft. This will replicate to all followers.
-		applyFuture := c.raft.Apply(cmdBytes, 5*time.Second)
-		if applyFuture.Error() != nil {
-			log.Printf("ERROR: Failed to apply heartbeat command for %s to Raft: %v", nodeID, applyFuture.Error())
-		} else {
-			log.Printf("DEBUG: Applied heartbeat for Storage Node %s (%s) to Raft FSM.", nodeID, addr)
-		}
-	} else {
-		// log.Printf("DEBUG: Received heartbeat from Storage Node %s (%s) but not leader. Not applying to Raft.", nodeID, addr)
-	}
-}
-
-// ReceiveHeartbeatsTCP listens for incoming heartbeat messages on a given TCP address.
-// It updates a map of active nodes and removes nodes that haven't sent heartbeats recently.
-// The context allows for graceful shutdown.
-func (c *Controller) ReceiveHeartbeatsTCP(ctx context.Context, listenAddr string, timeout time.Duration) {
-	log.Printf("Starting TCP heartbeat receiver on %s", listenAddr)
-
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("Failed to start TCP listener on %s: %v", listenAddr, err)
-	}
-	defer listener.Close()
-
-	// Map to store last heartbeat time for each node
-	activeNodes := make(map[string]HeartbeatMessage)
-	var mu sync.RWMutex // Mutex to protect activeNodes map
-
-	// Goroutine to periodically clean up timed-out nodes
-	go func() {
-		cleanupTicker := time.NewTicker(timeout / 2) // Check more frequently than timeout
-		defer cleanupTicker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("Heartbeat receiver cleanup routine stopped.")
-				return
-			case <-cleanupTicker.C:
-				mu.Lock()
-				for nodeID, msg := range activeNodes {
-					// Check if the last heartbeat is older than the timeout
-					if time.Now().UnixNano()-msg.Timestamp > int64(timeout) {
-						log.Printf("Node %s (%s) timed out. Removing from active nodes.", nodeID, msg.Address)
-						delete(activeNodes, nodeID)
-					}
-				}
-				mu.Unlock()
-			}
-		}
-	}()
-
-	// Goroutine to accept incoming connections
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("Heartbeat receiver stopping connection acceptance.")
-				return
-			default:
-				// Set a deadline for accepting new connections
-				conn, err := listener.Accept()
-				if err != nil {
-					if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-						continue // Timeout, try again
-					}
-					log.Printf("Failed to accept connection: %v", err)
-					continue
-				}
-				//conn.SetDeadline(time.Now().Add(time.Second))
-
-				// Handle each connection in a new goroutine
-				go func(conn net.Conn) {
-					defer conn.Close()
-					reader := bufio.NewReader(conn)
-					for {
-						// Read until newline delimiter
-						data, err := reader.ReadBytes('\n')
-						if err != nil {
-							if err.Error() == "EOF" {
-								// Connection closed by sender
-								// log.Printf("Connection from %s closed.", c.RemoteAddr())
-							} else {
-								log.Printf("Error reading heartbeat from %s: %v", conn.RemoteAddr(), err)
-							}
-							return
-						}
-
-						var msg HeartbeatMessage
-						if err := json.Unmarshal(data, &msg); err != nil {
-							log.Printf("Failed to unmarshal heartbeat message from %s: %v", conn.RemoteAddr(), err)
-							continue
-						}
-
-						mu.Lock()
-						activeNodes[msg.NodeID] = msg
-						mu.Unlock()
-						// log.Printf("Received heartbeat from NodeID: %s, Address: %s (Last seen: %s)",
-						// 	msg.NodeID, msg.Address, time.Unix(0, msg.Timestamp).Format(time.StampMilli))
-						c.recordHeartbeat(msg.NodeID, msg.Address)
-					}
-				}(conn)
-			}
-		}
-	}()
-
-	<-ctx.Done() // Block until context is cancelled
-	log.Println("Heartbeat receiver fully stopped.")
-}
-
-// monitorStorageNodes periodically checks the health of registered Storage Nodes.
-// It relies on the localHeartbeatMap for timeouts and applies removal commands to Raft if a node times out.
+// monitorStorageNodes periodically checks for expired heartbeats and updates node status.
 func (c *Controller) monitorStorageNodes() {
-	ticker := time.NewTicker(heartbeatInterval)
+	ticker := time.NewTicker(HeartbeatTimeout / 2) // Check more frequently than timeout
 	defer ticker.Stop()
 
-	for range ticker.C {
-		c.storageNodesMu.Lock()
-		nodesToCheck := make(map[string]time.Time)
-		for nodeID, lastHeartbeat := range c.localHeartbeatMap {
-			nodesToCheck[nodeID] = lastHeartbeat
-		}
-		c.storageNodesMu.Unlock()
-
-		for nodeID, lastHeartbeat := range nodesToCheck {
-			if time.Since(lastHeartbeat) > heartbeatTimeout {
-				log.Printf("WARNING: Storage Node %s timed out (last heartbeat: %v ago). Marking as unhealthy.", nodeID, time.Since(lastHeartbeat))
-
-				// If this Controller is the leader, apply a state change to remove the node.
-				if c.raft.State() == raft.Leader {
-					cmd := fsm.LogCommand{
-						Op:  fsm.OpRemoveStorageNode,
-						Key: nodeID,
+	for {
+		select {
+		case <-ticker.C:
+			c.storageNodeInfoMutex.Lock()
+			for nodeID, lastHeartbeat := range c.lastHeartbeatReceived {
+				if time.Since(lastHeartbeat) > HeartbeatTimeout {
+					log.Printf("Storage node %s heartbeat expired. Marking as down.", nodeID)
+					// Submit Raft command to mark node as down
+					cmd := fsm.Command{
+						Type:    fsm.CommandUpdateNodeStatus,
+						NodeID:  nodeID,
+						Payload: json.RawMessage([]byte("down")),
 					}
-					cmdBytes, err := json.Marshal(cmd)
-					if err != nil {
-						log.Printf("ERROR: Failed to marshal remove node command for %s: %v", nodeID, err)
-						continue
-					}
-					applyFuture := c.raft.Apply(cmdBytes, 5*time.Second)
-					if applyFuture.Error() != nil {
-						log.Printf("ERROR: Failed to apply remove node command for %s to Raft: %v", nodeID, applyFuture.Error())
-					} else {
-						log.Printf("DEBUG: Applied removal command for Storage Node %s to Raft FSM.", nodeID)
-					}
+					c.applyCommand(cmd)
 				} else {
-					log.Printf("DEBUG: Storage Node %s timed out, but not leader. Not applying removal to Raft.", nodeID)
+					// Mark as active if it was previously down and now heartbeating
+					nodeStatus, found := c.fsm.GetNodeStatus(nodeID)
+					if nodeStatus != "active" && found {
+						cmd := fsm.Command{
+							Type:    fsm.CommandUpdateNodeStatus,
+							NodeID:  nodeID,
+							Payload: json.RawMessage([]byte("active")),
+						}
+						c.applyCommand(cmd)
+					}
 				}
-
-				// Remove from local map regardless of leader status (it's just a local cache)
-				c.storageNodesMu.Lock()
-				delete(c.localHeartbeatMap, nodeID)
-				c.storageNodesMu.Unlock()
 			}
+			c.storageNodeInfoMutex.Unlock()
+		case <-make(chan struct{}): // Use a real quit channel from Controller struct if available
+			return
 		}
 	}
 }
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	// Command-line arguments for node configuration
-	// Example usage:
-	// Controller Node 1 (Leader):
-	// NODE_ID=node1 RAFT_BIND_ADDR=localhost:8081 HTTP_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8086 go run controller/main.go
-	//
-	// Controller Node 2 (Follower, joins node1):
-	// NODE_ID=node2 RAFT_BIND_ADDR=localhost:8082 HTTP_ADDR=localhost:8083 JOIN_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8087 go run controller/main.go
-	//
-	// Controller Node 3 (Follower, joins node1):
-	// NODE_ID=node3 RAFT_BIND_ADDR=localhost:8084 HTTP_ADDR=localhost:8085 JOIN_ADDR=localhost:8080 HEARTBEAT_LISTEN_PORT=8088 go run controller/main.go
-	//
-	// Simulated Storage Node client (sends heartbeats to Controller heartbeat port 8086):
-	// STORAGE_NODE_ID=storage_alpha STORAGE_NODE_ADDR=localhost:9000 HEARTBEAT_TARGET_PORT=8086 go run controller/main.go
-
-	nodeID := os.Getenv("NODE_ID")
-	if nodeID == "" {
-		log.Fatal("NODE_ID is not set in environmnet")
-	}
-	raftBindAddr := os.Getenv("RAFT_BIND_ADDR")
-	if raftBindAddr == "" {
-		log.Fatal("RAFT_BIND_ADDR is not set in environmnet")
-	}
-	httpAddr := os.Getenv("HTTP_ADDR")
-	if httpAddr == "" {
-		log.Fatal("HTTP_ADDR is not set in environmnet")
-	}
-	joinAddr := os.Getenv("JOIN_ADDR") // Optional: address of an existing node to join
-
-	// Configurable Heartbeat Listen Port for Controller
-	heartbeatListenAddress := os.Getenv("HEARTBEAT_LISTEN_ADDR")
-	if heartbeatListenAddress == "" {
-		log.Fatal("HEARTBEAT_LISTEN_ADDR is not set in environmnet")
+// applyCommand submits a command to the Raft leader.
+func (c *Controller) applyCommand(cmd fsm.Command) error {
+	if c.raft.State() != raft.Leader {
+		return fmt.Errorf("not leader, cannot apply command")
 	}
 
-	// Simulated Storage Node parameters (for testing heartbeat integration)
-	storageNodeID := os.Getenv("STORAGE_NODE_ID")
-	storageNodeAddr := os.Getenv("STORAGE_NODE_ADDR") // e.g., "localhost:9000"
-
-	// Configurable Heartbeat Target Port for Simulated Storage Node
-	heartbeatTargetPortStr := os.Getenv("HEARTBEAT_TARGET_PORT")
-	heartbeatTargetPort := defaultHeartbeatListenPort // Default to Controller's default if not specified
-	if heartbeatTargetPortStr != "" {
-		parsedPort, err := strconv.Atoi(heartbeatTargetPortStr)
-		if err != nil {
-			log.Fatalf("FATAL: Invalid HEARTBEAT_TARGET_PORT: %v", err)
-		}
-		heartbeatTargetPort = parsedPort
-	}
-
-	// Clean up old Raft data for a fresh start (for testing purposes)
-	raftDataPath := filepath.Join(defaultRaftDir, nodeID)
-	if err := os.RemoveAll(raftDataPath); err != nil {
-		log.Printf("WARNING: Failed to clean up old Raft data for %s: %v", nodeID, err)
-	}
-	log.Printf("INFO: Raft data directory for %s: %s", nodeID, raftDataPath)
-
-	_, err := NewController(nodeID, raftBindAddr, httpAddr, raftDataPath, joinAddr, heartbeatListenAddress) // Pass heartbeatListenPort
+	cmdBytes, err := json.Marshal(cmd)
 	if err != nil {
-		log.Fatalf("FATAL: Failed to create controller: %v", err)
+		return fmt.Errorf("failed to marshal command: %v", err)
 	}
 
-	// If this Controller is also simulating a Storage Node, start sending heartbeats
-	if storageNodeID != "" && storageNodeAddr != "" {
-		go func() {
-			log.Printf("INFO: Simulating Storage Node %s sending heartbeats to Controller heartbeat listener on port %d", storageNodeID, heartbeatTargetPort)
-			conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: heartbeatTargetPort}) // Use heartbeatTargetPort
-			if err != nil {
-				log.Fatalf("FATAL: Failed to dial UDP for simulated Storage Node heartbeat: %v", err)
-			}
-			defer conn.Close()
-
-			ticker := time.NewTicker(heartbeatInterval)
-			defer ticker.Stop()
-
-			heartbeatMessage := fmt.Sprintf("%s:%s", storageNodeID, storageNodeAddr)
-
-			for range ticker.C {
-				_, err := conn.Write([]byte(heartbeatMessage))
-				if err != nil {
-					log.Printf("ERROR: Failed to send heartbeat from simulated Storage Node %s: %v", storageNodeID, err)
-				} else {
-					log.Printf("DEBUG: Simulated Storage Node %s sent heartbeat.", storageNodeID)
-				}
-			}
-		}()
+	future := c.raft.Apply(cmdBytes, 5*time.Second) // Apply with a timeout
+	if err := future.Error(); err != nil {
+		return fmt.Errorf("failed to apply command to Raft: %v", err)
 	}
-
-	// Keep the main goroutine alive
-	select {}
+	// Check if the FSM application itself returned an error
+	if response := future.Response(); response != nil {
+		if applyErr, ok := response.(error); ok {
+			return fmt.Errorf("FSM apply returned error: %v", applyErr)
+		}
+	}
+	return nil
 }
+
+// --- HTTP Handlers for Admin API ---
+
+func (c *Controller) RegisterHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("/join", c.handleJoin)
+	mux.HandleFunc("/remove_peer", c.handleRemovePeer)
+	// mux.HandleFunc("/metadata", c.handleMetadata)
+	mux.HandleFunc("/status", c.handleStatus) // Corresponds to GetClusterStatus
+
+	mux.HandleFunc("/admin/assign_slot_range", c.handleAdminAssignSlotRange)              // Corresponds to AssignShardSlot
+	mux.HandleFunc("/admin/get_all_slot_assignments", c.handleAdminGetAllSlotAssignments) // Corresponds to GetShardMap
+	mux.HandleFunc("/admin/get_node_for_key", c.handleAdminGetNodeForKey)
+	mux.HandleFunc("/admin/set_slot_primary", c.handleAdminSetSlotPrimary) // Renamed for clarity
+
+	// New handlers for cluster management (receiving from Gateway)
+	mux.HandleFunc("/admin/register_storage_node", c.handleAdminRegisterStorageNode) // Corresponds to AddStorageNode
+	mux.HandleFunc("/admin/remove_storage_node", c.handleAdminRemoveStorageNode)     // Corresponds to RemoveStorageNode
+	mux.HandleFunc("/admin/initiate_replica_onboarding", c.handleAdminInitiateReplicaOnboarding)
+	mux.HandleFunc("/admin/update_replica_onboarding_state", c.handleAdminUpdateReplicaOnboardingState)
+	mux.HandleFunc("/admin/initiate_shard_migration", c.handleAdminInitiateShardMigration)
+	mux.HandleFunc("/admin/commit_shard_migration", c.handleAdminCommitShardMigration)
+}
+
+// handleJoin handles requests to join a new Raft peer.
+func (c *Controller) handleJoin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	peerAddress := r.URL.Query().Get("peerAddress")
+	nodeID := r.URL.Query().Get("nodeId")
+
+	if peerAddress == "" || nodeID == "" {
+		http.Error(w, "peerAddress and nodeId are required", http.StatusBadRequest)
+		return
+	}
+
+	if c.raft.State() != raft.Leader {
+		http.Error(w, "Not the Raft leader", http.StatusForbidden)
+		return
+	}
+
+	future := c.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(peerAddress), 0, 0)
+	if err := future.Error(); err != nil {
+		log.Printf("Failed to add voter %s (%s): %v", nodeID, peerAddress, err)
+		http.Error(w, fmt.Sprintf("Failed to add voter: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Node %s (%s) joined the Raft cluster", nodeID, peerAddress)))
+}
+
+// handleRemovePeer handles requests to remove a Raft peer.
+func (c *Controller) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	nodeID := r.URL.Query().Get("nodeId")
+	if nodeID == "" {
+		http.Error(w, "nodeId is required", http.StatusBadRequest)
+		return
+	}
+
+	if c.raft.State() != raft.Leader {
+		http.Error(w, "Not the Raft leader", http.StatusForbidden)
+		return
+	}
+
+	future := c.raft.RemoveServer(raft.ServerID(nodeID), 0, 0)
+	if err := future.Error(); err != nil {
+		log.Printf("Failed to remove peer %s: %v", nodeID, err)
+		http.Error(w, fmt.Sprintf("Failed to remove peer: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Node %s removed from the Raft cluster", nodeID)))
+}
+
+// handleMetadata handles requests to set or get generic cluster metadata.
+// func (c *Controller) handleMetadata(w http.ResponseWriter, r *http.Request) {
+// 	if r.Method == http.MethodPost {
+// 		var data struct {
+// 			Key   string `json:"key"`
+// 			Value string `json:"value"`
+// 		}
+// 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+// 			http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+// 			return
+// 		}
+// 		cmd := fsm.Command{
+// 			Type:  fsm.CommandUpdateMetadata,
+// 			Key:   data.Key,
+// 			Value: data.Value,
+// 		}
+// 		if err := c.applyCommand(cmd); err != nil {
+// 			http.Error(w, fmt.Sprintf("Failed to update metadata: %v", err), http.StatusInternalServerError)
+// 			return
+// 		}
+// 		w.WriteHeader(http.StatusOK)
+// 		w.Write([]byte("Metadata updated"))
+// 	} else if r.Method == http.MethodGet {
+// 		key := r.URL.Query().Get("key")
+// 		if key == "" {
+// 			// Return all metadata
+// 			json.NewEncoder(w).Encode(c.fsm.GetMetadata())
+// 		} else {
+// 			// Return specific key
+// 			metadata := c.fsm.GetMetadata()
+// 			if val, ok := metadata[key]; ok {
+// 				json.NewEncoder(w).Encode(map[string]string{key: val})
+// 			} else {
+// 				http.Error(w, "Key not found", http.StatusNotFound)
+// 			}
+// 		}
+// 	} else {
+// 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+// 	}
+// }
+
+// handleStatus provides a comprehensive overview of the cluster state.
+// This handles the GetClusterStatus request from the Gateway.
+func (c *Controller) handleStatus(w http.ResponseWriter, r *http.Request) {
+	nodeStatuses := c.fsm.GetNodeStatuses()
+	nodeAddresses := c.fsm.GetNodeAddresses()
+	slotAssignments := c.fsm.GetSlotAssignments()
+	onboardingStates := c.fsm.GetReplicaOnboardingStates()
+	migrationStates := c.fsm.GetShardMigrationStates()
+
+	activeNodesInfo := make(map[string]struct {
+		Address       string `json:"address"`
+		Status        string `json:"status"`
+		LastHeartbeat string `json:"last_heartbeat"`
+	})
+
+	c.storageNodeInfoMutex.RLock()
+	for nodeID, lastHeartbeat := range c.lastHeartbeatReceived {
+		activeNodesInfo[nodeID] = struct {
+			Address       string `json:"address"`
+			Status        string `json:"status"`
+			LastHeartbeat string `json:"last_heartbeat"`
+		}{
+			Address:       nodeAddresses[nodeID], // Get the actual gRPC address from FSM
+			Status:        nodeStatuses[nodeID],
+			LastHeartbeat: lastHeartbeat.Format(time.RFC3339),
+		}
+	}
+	c.storageNodeInfoMutex.RUnlock()
+
+	// Convert slotAssignments from map[uint64] to map[string] for JSON serialization
+	// This is because JSON keys must be strings.
+	serializableSlotAssignments := make(map[string]fsm.SlotAssignment)
+	for slotID, assign := range slotAssignments {
+		serializableSlotAssignments[strconv.FormatUint(uint64(slotID), 10)] = assign
+	}
+
+	// Convert migrationStates from map[uint64] to map[string] for JSON serialization
+	serializableMigrationStates := make(map[string]fsm.ShardMigrationState)
+	for slotID, mig := range migrationStates {
+		serializableMigrationStates[slotID] = mig
+	}
+
+	status := struct {
+		RaftState   string        `json:"raft_state"`
+		RaftLeader  string        `json:"raft_leader"`
+		RaftPeers   []raft.Server `json:"raft_peers"`
+		ActiveNodes map[string]struct {
+			Address       string `json:"address"`
+			Status        string `json:"status"`
+			LastHeartbeat string `json:"last_heartbeat"`
+		} `json:"active_nodes"`
+		SlotAssignments  map[string]fsm.SlotAssignment         `json:"slot_assignments"`
+		OnboardingStates map[string]fsm.ReplicaOnboardingState `json:"onboarding_states"`
+		MigrationStates  map[string]fsm.ShardMigrationState    `json:"migration_states"`
+	}{
+		RaftState:        c.raft.State().String(),
+		RaftLeader:       string(c.raft.Leader()),
+		RaftPeers:        c.raft.GetConfiguration().Configuration().Servers,
+		ActiveNodes:      activeNodesInfo,
+		SlotAssignments:  serializableSlotAssignments,
+		OnboardingStates: onboardingStates,
+		MigrationStates:  serializableMigrationStates,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// handleAdminAssignSlotRange handles requests to assign a slot range to a primary and replicas.
+// This handles the AssignShardSlot request from the Gateway.
+func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SlotID         uint64   `json:"slotId"`
+		PrimaryNodeID  string   `json:"primaryNodeId"`
+		ReplicaNodeIDs []string `json:"replicaNodeIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	cmd := fsm.Command{
+		Type:           fsm.CommandAssignSlot,
+		SlotID:         uint64(req.SlotID),
+		PrimaryNodeID:  req.PrimaryNodeID,
+		ReplicaNodeIDs: req.ReplicaNodeIDs,
+	}
+
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to assign slot: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Slot %d assigned to primary %s with replicas %v", req.SlotID, req.PrimaryNodeID, req.ReplicaNodeIDs)))
+}
+
+// handleAdminGetAllSlotAssignments returns the current shard slot assignments.
+// This handles the GetShardMap request from the Gateway.
+func (c *Controller) handleAdminGetAllSlotAssignments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	assignments := c.fsm.GetSlotAssignments()
+	// Convert map[uint64] to map[string] for JSON serialization
+	serializableAssignments := make(map[string]fsm.SlotAssignment)
+	for slotID, assign := range assignments {
+		serializableAssignments[strconv.FormatUint(uint64(slotID), 10)] = assign
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(serializableAssignments)
+}
+
+// handleAdminGetNodeForKey returns the node responsible for a given key.
+func (c *Controller) handleAdminGetNodeForKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "key is required", http.StatusBadRequest)
+		return
+	}
+
+	slotID := fsm.GetSlotForHashKey(key)
+	assignments := c.fsm.GetSlotAssignments()
+
+	assignment, found := assignments[uint64(slotID)]
+	if !found {
+		http.Error(w, fmt.Sprintf("No assignment found for key's slot %d", slotID), http.StatusNotFound)
+		return
+	}
+
+	// For simplicity, return the primary node for queries. A real system might return a replica for reads.
+	respData := map[string]string{
+		"slotId":        strconv.FormatUint(uint64(slotID), 10),
+		"primaryNodeId": assignment.PrimaryNodeID,
+	}
+	if len(assignment.ReplicaNodes) > 0 {
+		respData["replicaNodeIds"] = fmt.Sprintf("%v", assignment.ReplicaNodes)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(respData)
+}
+
+// handleAdminSetSlotPrimary handles requests to change the primary for a slot.
+func (c *Controller) handleAdminSetSlotPrimary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SlotID           uint64   `json:"slotId"`
+		NewPrimaryNodeID string   `json:"newPrimaryNodeId"`
+		ReplicaNodeIDs   []string `json:"replicaNodeIds"` // Optional: provide updated replicas
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	cmd := fsm.Command{
+		Type:           fsm.CommandSetSlotPrimary,
+		SlotID:         req.SlotID,
+		PrimaryNodeID:  req.NewPrimaryNodeID,
+		ReplicaNodeIDs: req.ReplicaNodeIDs, // Pass through new replicas
+	}
+
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to set slot primary: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Slot %d primary set to %s", req.SlotID, req.NewPrimaryNodeID)))
+}
+
+// handleAdminRegisterStorageNode allows explicit registration of a storage node.
+// This handles the AddStorageNode request from the Gateway.
+func (c *Controller) handleAdminRegisterStorageNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		NodeID  string `json:"nodeId"`
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	cmd := fsm.Command{
+		Type:     fsm.CommandRegisterNode,
+		NodeID:   req.NodeID,
+		NodeAddr: req.Address,
+		Payload:  json.RawMessage("registered"), // Initial status
+	}
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to register storage node: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Storage node %s registered with address %s", req.NodeID, req.Address)))
+}
+
+// handleAdminRemoveStorageNode allows explicit removal of a storage node.
+// This handles the RemoveStorageNode request from the Gateway.
+func (c *Controller) handleAdminRemoveStorageNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		NodeID string `json:"nodeId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	cmd := fsm.Command{
+		Type:   fsm.CommandDeregisterNode,
+		NodeID: req.NodeID,
+	}
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to remove storage node: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Storage node %s removed", req.NodeID)))
+}
+
+// handleAdminInitiateReplicaOnboarding initiates a replica onboarding process.
+// This handles the InitiateReplicaOnboarding request from the Gateway.
+func (c *Controller) handleAdminInitiateReplicaOnboarding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SlotID         uint64 `json:"slotId"`
+		ReplicaNodeID  string `json:"replicaNodeId"`
+		PrimaryNodeID  string `json:"primaryNodeId"`
+		ReplicaAddress string `json:"replicaAddress"`
+		PrimaryAddress string `json:"primaryAddress"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+	replicas := make(map[string]string)
+	replicas[req.ReplicaNodeID] = req.ReplicaAddress
+
+	onboardingID := fmt.Sprintf("%d-%s", req.SlotID, req.ReplicaNodeID)
+
+	cmd := fsm.Command{
+		Type:          fsm.CommandInitiateReplicaOnboarding,
+		SlotID:        req.SlotID,
+		PrimaryNodeID: req.PrimaryNodeID,
+		Replicas:      replicas,
+		NodeAddr:      req.PrimaryAddress,
+		OperationID:   onboardingID,
+	}
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to initiate replica onboarding: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message":      "Replica onboarding initiated",
+		"onboardingId": onboardingID,
+	})
+}
+
+// handleAdminUpdateReplicaOnboardingState updates the state of an ongoing replica onboarding.
+// This handles the UpdateReplicaOnboardingState request from the Gateway.
+func (c *Controller) handleAdminUpdateReplicaOnboardingState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		OnboardingID string `json:"onboardingId"`
+		Status       string `json:"status"`
+		CurrentLSN   uint64 `json:"currentLsn"`
+		TargetLSN    uint64 `json:"targetLsn"`
+		ErrorMessage string `json:"errorMessage"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	payload := map[string]string{
+		"status":     req.Status,
+		"currentLSN": strconv.FormatUint(req.CurrentLSN, 10),
+		"targetLSN":  strconv.FormatUint(req.TargetLSN, 10),
+		"error":      req.ErrorMessage,
+	}
+
+	b, _ := json.Marshal(payload)
+
+	cmd := fsm.Command{
+		Type:        fsm.CommandUpdateReplicaOnboardingState,
+		OperationID: req.OnboardingID,
+		Payload:     json.RawMessage(b),
+	}
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update replica onboarding state: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Replica onboarding state updated"))
+}
+
+// handleAdminInitiateShardMigration initiates a shard migration process.
+// This handles the InitiateShardMigration request from the Gateway.
+func (c *Controller) handleAdminInitiateShardMigration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SlotID        uint64 `json:"slotId"`
+		SourceNodeID  string `json:"sourceNodeId"`
+		TargetNodeID  string `json:"targetNodeId"`
+		SourceAddress string `json:"sourceAddress"`
+		TargetAddress string `json:"targetAddress"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	migrationID := fmt.Sprintf("%d-%s-%s", req.SlotID, req.SourceNodeID, req.TargetNodeID)
+
+	cmd := fsm.Command{
+		Type:         fsm.CommandInitiateShardMigration,
+		SlotID:       req.SlotID,
+		NodeID:       req.SourceNodeID,
+		TargetNodeID: req.TargetNodeID,
+		NodeAddr:     req.SourceAddress,
+		OperationID:  migrationID,
+	}
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to initiate shard migration: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message":     "Shard migration initiated",
+		"migrationId": migrationID,
+	})
+}
+
+// handleAdminCommitShardMigration commits a pending shard migration.
+// This handles the CommitShardMigration request from the Gateway.
+func (c *Controller) handleAdminCommitShardMigration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SlotID            uint64   `json:"slotId"`
+		NewPrimaryNodeID  string   `json:"newPrimaryNodeId"`
+		NewReplicaNodeIDs []string `json:"newReplicaNodeIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	cmd := fsm.Command{
+		Type:           fsm.CommandCommitShardMigration,
+		SlotID:         req.SlotID,
+		NodeID:         req.NewPrimaryNodeID,
+		ReplicaNodeIDs: req.NewReplicaNodeIDs,
+	}
+	if err := c.applyCommand(cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to commit shard migration: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Shard migration committed"))
+}
+
+// // Main function to start the Controller.
+// func main() {
+// 	c, err := NewController(NodeID, RaftBindAddr, RaftDir)
+// 	if err != nil {
+// 		log.Fatalf("Failed to create controller: %v", err)
+// 	}
+
+// 	c.registerHandlers()
+
+// 	log.Printf("GojoDB Controller server listening on %s", HTTPListenAddr)
+// 	go func() {
+// 		if err := http.ListenAndServe(HTTPListenAddr, nil); err != nil && err != http.ErrServerClosed {
+// 			log.Fatalf("HTTP server failed: %v", err)
+// 		}
+// 	}()
+
+// 	// Handle graceful shutdown
+// 	sigCh := make(chan os.Signal, 1)
+// 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+// 	<-sigCh
+// 	log.Println("Shutting down Controller...")
+
+// 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// 	defer cancel()
+// 	if err := c.httpServer.Shutdown(ctx); err != nil {
+// 		log.Printf("HTTP server shutdown error: %v", err)
+// 	}
+// 	if c.raft != nil {
+// 		// Attempt to gracefully shutdown Raft
+// 		shutdownFuture := c.raft.Shutdown()
+// 		if err := shutdownFuture.Error(); err != nil {
+// 			log.Printf("Error shutting down Raft: %v", err)
+// 		} else {
+// 			log.Println("Raft gracefully shut down.")
+// 		}
+// 	}
+// 	log.Println("Controller gracefully shut down.")
+// }
