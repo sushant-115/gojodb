@@ -450,11 +450,10 @@ func (r *mutationResolver) AdminSetPrimaryReplica(ctx context.Context, input mod
 
 	// The API service expects a JSON marshaled SlotRangeInfo in the 'value' query param.
 	// We need to construct a fsm.SlotRangeInfo to marshal.
-	slotInfo := fsm.SlotAssignment{
-		SlotID:        input.RangeID,
-		PrimaryNodeID: input.PrimaryNodeID,
-		ReplicaNodes:  input.ReplicaNodeIDs,
-		Version:       "active", // Assuming active status for this operation
+	slotInfo := fsm.SlotRangeInfo{
+		SlotRange:      input.RangeID,
+		PrimaryNodeID:  input.PrimaryNodeID,
+		ReplicaNodeIDs: input.ReplicaNodeIDs,
 	}
 	slotInfoBytes, err := json.Marshal(slotInfo)
 	if err != nil {

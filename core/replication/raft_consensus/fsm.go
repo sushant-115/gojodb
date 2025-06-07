@@ -104,9 +104,10 @@ type NodeCapacityInfo struct { /* ... */
 }
 
 type SlotRangeInfo struct {
-	SlotRange     string            `json:"slot_range"`
-	PrimaryNodeID string            `json:"primary_node_id"`
-	ReplicaNodes  map[string]string `json:"replica_nodes"` // map[ReplicaNodeID]ReplicaNodeAddr
+	SlotRange      string            `json:"slot_range"`
+	PrimaryNodeID  string            `json:"primary_node_id"`
+	ReplicaNodeIDs []string          `json:"replica_node_ids"`
+	ReplicaNodes   map[string]string `json:"replica_nodes"` // map[ReplicaNodeID]ReplicaNodeAddr
 }
 
 // SlotAssignment defines the primary and replicas for a given slot.
