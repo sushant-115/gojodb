@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -207,17 +208,22 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 		}
 		return assignment.PrimaryNodeID, nil
 	} else {
-		// For reads, try primary first, then replicas
+		targetNodes := []string{}
 		if assignment.PrimaryNodeID != "" {
-			return assignment.PrimaryNodeID, nil // Simple read preference: primary
+			targetNodes = append(targetNodes, assignment.PrimaryNodeID)
 		}
 		if len(assignment.ReplicaNodes) > 0 {
-			// For simplicity, pick the first replica. In a real system, you'd
-			// implement health checks and load balancing.
 			keys := fsm.Keys(assignment.ReplicaNodes)
-			return assignment.ReplicaNodes[keys[0]], nil
+			targetNodes = append(targetNodes, keys...)
+
 		}
-		return "", fmt.Errorf("no primary or replica assigned for slot %d", slotID)
+		if len(targetNodes) == 0 {
+			return "", fmt.Errorf("no primary or replica assigned for slot %d", slotID)
+
+		}
+		index := rand.Intn(len(targetNodes))
+		targetNodeId := targetNodes[index]
+		return targetNodeId, nil
 	}
 }
 
@@ -729,6 +735,7 @@ func (gs *GatewayService) GetShardMap(ctx context.Context, req *pb.GetShardMapRe
 
 // Main function to start the gateway service.
 func main() {
+	rand.Seed(time.Now().UnixNano())
 	lis, err := net.Listen("tcp", DefaultGatewayPort)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)

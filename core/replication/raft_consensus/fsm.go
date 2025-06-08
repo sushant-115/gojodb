@@ -509,7 +509,7 @@ func (f *FSM) applyUpdateNodeStatus(cmd Command) error {
 
 func (f *FSM) applyAssignSlot(cmd Command) error {
 	if cmd.SlotID > 1023 || cmd.PrimaryNodeID == "" { // NodeID is the new primary
-		return fmt.Errorf("AssignSlot command missing SlotID or NodeID (primary)", cmd.PrimaryNodeID, cmd.NodeID)
+		return fmt.Errorf("AssignSlot command missing SlotID or NodeID (primary)")
 	}
 	if _, nodeExists := f.storageNodes[cmd.PrimaryNodeID]; !nodeExists {
 		return fmt.Errorf("cannot assign slot to unknown node %s", cmd.PrimaryNodeID)
@@ -534,9 +534,16 @@ func (f *FSM) applyAssignSlot(cmd Command) error {
 		assignment = &SlotAssignment{SlotID: cmd.SlotID}
 		f.slotAssignments[cmd.SlotID] = assignment
 	}
-
+	replicas := make(map[string]string)
+	for _, r := range cmd.ReplicaNodeIDs {
+		info, found := f.storageNodes[r]
+		if !found {
+			return fmt.Errorf("cannot assign slot to unknown replica node %s", r)
+		}
+		replicas[r] = info.RaftAddr
+	}
 	assignment.PrimaryNodeID = cmd.PrimaryNodeID
-	assignment.ReplicaNodes = cmd.Replicas // cmd.Replicas should be map[ReplicaNodeID]ReplicaNodeAddr
+	assignment.ReplicaNodes = replicas // cmd.Replicas should be map[ReplicaNodeID]ReplicaNodeAddr
 	if assignment.ReplicaNodes == nil {
 		assignment.ReplicaNodes = make(map[string]string)
 	}

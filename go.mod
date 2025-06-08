@@ -6,6 +6,7 @@ require (
 	github.com/99designs/gqlgen v0.17.73
 	github.com/chzyer/readline v1.5.1
 	github.com/google/uuid v1.6.0
+	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb v0.0.0-20250528070419-144f8b0a1edb
 	github.com/vektah/gqlparser/v2 v2.5.26
@@ -21,7 +22,6 @@ require (
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.2.1 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
-	github.com/hashicorp/go-hclog v1.6.2 // indirect
 	github.com/hashicorp/go-immutable-radix v1.0.0 // indirect
 	github.com/hashicorp/go-metrics v0.5.4 // indirect
 	github.com/hashicorp/go-msgpack v0.5.5 // indirect
