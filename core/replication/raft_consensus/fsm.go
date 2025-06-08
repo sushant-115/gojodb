@@ -219,7 +219,7 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return fmt.Errorf("unmarshal command failed: %w", err)
 	}
 
-	f.logger.Debug("Applying FSM command", zap.Uint8("type", uint8(cmd.Type)), zap.Any("command", cmd)) // Be careful logging full command if it contains sensitive data
+	//f.logger.Debug("Applying FSM command", zap.Uint8("type", uint8(cmd.Type)), zap.Any("command", cmd)) // Be careful logging full command if it contains sensitive data
 
 	switch cmd.Type {
 	case CommandRegisterNode:
@@ -450,7 +450,7 @@ func (f *FSM) applyRegisterNode(cmd Command) error {
 		return fmt.Errorf("RegisterNode command missing NodeID or RaftAddr")
 	}
 	if _, exists := f.storageNodes[cmd.NodeID]; exists {
-		f.logger.Warn("Node already registered, updating info", zap.String("nodeID", cmd.NodeID))
+		//f.logger.Warn("Node already registered, updating info", zap.String("nodeID", cmd.NodeID))
 		// Update existing node info (e.g. if address changed or for re-registration)
 		f.storageNodes[cmd.NodeID].RaftAddr = cmd.NodeAddr
 		f.storageNodes[cmd.NodeID].APIAddr = cmd.PayloadGet("api_addr")                 // Assuming API addr is in payload
@@ -503,7 +503,7 @@ func (f *FSM) applyUpdateNodeStatus(cmd Command) error {
 		node.Status = newStatus
 	}
 	// Update capacity, etc. from payload if provided
-	f.logger.Debug("Updated node status", zap.String("nodeID", cmd.NodeID), zap.String("status", node.Status))
+	//f.logger.Debug("Updated node status", zap.String("nodeID", cmd.NodeID), zap.String("status", node.Status))
 	return nil
 }
 

@@ -1066,7 +1066,6 @@ func (x *RemoveStorageNodeResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-
 // Deprecated: Use RemoveStorageNodeResponse.ProtoReflect.Descriptor instead.
 func (*RemoveStorageNodeResponse) Descriptor() ([]byte, []int) {
 	return file_api_proto_rawDescGZIP(), []int{20}
@@ -2443,7 +2442,18 @@ const file_api_proto_rawDesc = "" +
 	"\x10GetClusterStatus\x12\x1e.proto.GetClusterStatusRequest\x1a\x1f.proto.GetClusterStatusResponse\x12D\n" +
 	"\vGetShardMap\x12\x19.proto.GetShardMapRequest\x1a\x1a.proto.GetShardMapResponse2b\n" +
 	"\x0fSnapshotService\x12O\n" +
-	"\x0eStreamSnapshot\x12\x1c.proto.StreamSnapshotRequest\x1a\x1d.proto.StreamSnapshotResponse0\x01B\n" +
+	"\x0eStreamSnapshot\x12\x1c.proto.StreamSnapshotRequest\x1a\x1d.proto.StreamSnapshotResponse0\x012\xf7\x01\n" +
+	"\x13IndexedWriteService\x12,\n" +
+	"\x03Put\x12\x11.proto.PutRequest\x1a\x12.proto.PutResponse\x125\n" +
+	"\x06Delete\x12\x14.proto.DeleteRequest\x1a\x15.proto.DeleteResponse\x128\n" +
+	"\aBulkPut\x12\x15.proto.BulkPutRequest\x1a\x16.proto.BulkPutResponse\x12A\n" +
+	"\n" +
+	"BulkDelete\x12\x18.proto.BulkDeleteRequest\x1a\x19.proto.BulkDeleteResponse2\xc2\x01\n" +
+	"\x12IndexedReadService\x12,\n" +
+	"\x03Get\x12\x11.proto.GetRequest\x1a\x12.proto.GetResponse\x12;\n" +
+	"\bGetRange\x12\x16.proto.GetRangeRequest\x1a\x17.proto.GetRangeResponse\x12A\n" +
+	"\n" +
+	"TextSearch\x12\x18.proto.TextSearchRequest\x1a\x19.proto.TextSearchResponseB\n" +
 	"Z\b./;protob\x06proto3"
 
 var (
@@ -2527,25 +2537,39 @@ var file_api_proto_depIdxs = []int32{
 	32, // 22: proto.GatewayService.GetClusterStatus:input_type -> proto.GetClusterStatusRequest
 	36, // 23: proto.GatewayService.GetShardMap:input_type -> proto.GetShardMapRequest
 	38, // 24: proto.SnapshotService.StreamSnapshot:input_type -> proto.StreamSnapshotRequest
-	1,  // 25: proto.GatewayService.Put:output_type -> proto.PutResponse
-	3,  // 26: proto.GatewayService.Get:output_type -> proto.GetResponse
-	5,  // 27: proto.GatewayService.Delete:output_type -> proto.DeleteResponse
-	8,  // 28: proto.GatewayService.GetRange:output_type -> proto.GetRangeResponse
-	11, // 29: proto.GatewayService.TextSearch:output_type -> proto.TextSearchResponse
-	13, // 30: proto.GatewayService.BulkPut:output_type -> proto.BulkPutResponse
-	15, // 31: proto.GatewayService.BulkDelete:output_type -> proto.BulkDeleteResponse
-	18, // 32: proto.GatewayService.AddStorageNode:output_type -> proto.AddStorageNodeResponse
-	20, // 33: proto.GatewayService.RemoveStorageNode:output_type -> proto.RemoveStorageNodeResponse
-	23, // 34: proto.GatewayService.AssignShardSlot:output_type -> proto.AssignShardSlotResponse
-	25, // 35: proto.GatewayService.InitiateReplicaOnboarding:output_type -> proto.InitiateReplicaOnboardingResponse
-	27, // 36: proto.GatewayService.UpdateReplicaOnboardingState:output_type -> proto.UpdateReplicaOnboardingStateResponse
-	29, // 37: proto.GatewayService.InitiateShardMigration:output_type -> proto.InitiateShardMigrationResponse
-	31, // 38: proto.GatewayService.CommitShardMigration:output_type -> proto.CommitShardMigrationResponse
-	33, // 39: proto.GatewayService.GetClusterStatus:output_type -> proto.GetClusterStatusResponse
-	37, // 40: proto.GatewayService.GetShardMap:output_type -> proto.GetShardMapResponse
-	39, // 41: proto.SnapshotService.StreamSnapshot:output_type -> proto.StreamSnapshotResponse
-	25, // [25:42] is the sub-list for method output_type
-	8,  // [8:25] is the sub-list for method input_type
+	0,  // 25: proto.IndexedWriteService.Put:input_type -> proto.PutRequest
+	4,  // 26: proto.IndexedWriteService.Delete:input_type -> proto.DeleteRequest
+	12, // 27: proto.IndexedWriteService.BulkPut:input_type -> proto.BulkPutRequest
+	14, // 28: proto.IndexedWriteService.BulkDelete:input_type -> proto.BulkDeleteRequest
+	2,  // 29: proto.IndexedReadService.Get:input_type -> proto.GetRequest
+	6,  // 30: proto.IndexedReadService.GetRange:input_type -> proto.GetRangeRequest
+	9,  // 31: proto.IndexedReadService.TextSearch:input_type -> proto.TextSearchRequest
+	1,  // 32: proto.GatewayService.Put:output_type -> proto.PutResponse
+	3,  // 33: proto.GatewayService.Get:output_type -> proto.GetResponse
+	5,  // 34: proto.GatewayService.Delete:output_type -> proto.DeleteResponse
+	8,  // 35: proto.GatewayService.GetRange:output_type -> proto.GetRangeResponse
+	11, // 36: proto.GatewayService.TextSearch:output_type -> proto.TextSearchResponse
+	13, // 37: proto.GatewayService.BulkPut:output_type -> proto.BulkPutResponse
+	15, // 38: proto.GatewayService.BulkDelete:output_type -> proto.BulkDeleteResponse
+	18, // 39: proto.GatewayService.AddStorageNode:output_type -> proto.AddStorageNodeResponse
+	20, // 40: proto.GatewayService.RemoveStorageNode:output_type -> proto.RemoveStorageNodeResponse
+	23, // 41: proto.GatewayService.AssignShardSlot:output_type -> proto.AssignShardSlotResponse
+	25, // 42: proto.GatewayService.InitiateReplicaOnboarding:output_type -> proto.InitiateReplicaOnboardingResponse
+	27, // 43: proto.GatewayService.UpdateReplicaOnboardingState:output_type -> proto.UpdateReplicaOnboardingStateResponse
+	29, // 44: proto.GatewayService.InitiateShardMigration:output_type -> proto.InitiateShardMigrationResponse
+	31, // 45: proto.GatewayService.CommitShardMigration:output_type -> proto.CommitShardMigrationResponse
+	33, // 46: proto.GatewayService.GetClusterStatus:output_type -> proto.GetClusterStatusResponse
+	37, // 47: proto.GatewayService.GetShardMap:output_type -> proto.GetShardMapResponse
+	39, // 48: proto.SnapshotService.StreamSnapshot:output_type -> proto.StreamSnapshotResponse
+	1,  // 49: proto.IndexedWriteService.Put:output_type -> proto.PutResponse
+	5,  // 50: proto.IndexedWriteService.Delete:output_type -> proto.DeleteResponse
+	13, // 51: proto.IndexedWriteService.BulkPut:output_type -> proto.BulkPutResponse
+	15, // 52: proto.IndexedWriteService.BulkDelete:output_type -> proto.BulkDeleteResponse
+	3,  // 53: proto.IndexedReadService.Get:output_type -> proto.GetResponse
+	8,  // 54: proto.IndexedReadService.GetRange:output_type -> proto.GetRangeResponse
+	11, // 55: proto.IndexedReadService.TextSearch:output_type -> proto.TextSearchResponse
+	32, // [32:56] is the sub-list for method output_type
+	8,  // [8:32] is the sub-list for method input_type
 	8,  // [8:8] is the sub-list for extension type_name
 	8,  // [8:8] is the sub-list for extension extendee
 	0,  // [0:8] is the sub-list for field type_name
@@ -2564,7 +2588,7 @@ func file_api_proto_init() {
 			NumEnums:      0,
 			NumMessages:   40,
 			NumExtensions: 0,
-			NumServices:   2,
+			NumServices:   4,
 		},
 		GoTypes:           file_api_proto_goTypes,
 		DependencyIndexes: file_api_proto_depIdxs,

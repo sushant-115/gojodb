@@ -1,85 +1,63 @@
-package main
+package indexedreadsservice
 
 import (
 	"context"
 	"log"
-	"time"
 
 	pb "github.com/sushant-115/gojodb/api/proto"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"github.com/sushant-115/gojodb/core/indexmanager"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-const (
-	DefaultGatewayAddress = "localhost:50051"
-)
+// IndexedReadService implements the gRPC IndexedReadService.
+type IndexedReadService struct {
+	pb.UnimplementedIndexedReadServiceServer
+	nodeID        string
+	slotID        uint32
+	indexManagers map[string]indexmanager.IndexManager
+}
 
-func main() {
-	conn, err := grpc.Dial(DefaultGatewayAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("did not connect to gateway: %v", err)
+// NewIndexedReadService creates a new IndexedReadService.
+func NewIndexedReadService(nodeID string, slotID uint32, indexManagers map[string]indexmanager.IndexManager) *IndexedReadService {
+	return &IndexedReadService{
+		nodeID:        nodeID,
+		slotID:        slotID,
+		indexManagers: indexManagers,
 	}
-	defer conn.Close()
+}
 
-	gatewayClient := pb.NewGatewayServiceClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// Get handles a single key-value get operation.
+func (s *IndexedReadService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	// Always get from the primary K/V store (B-tree)
+	val, found := s.indexManagers["btree"].Get(req.Key)
+	log.Printf("Node %s, Slot %d: Get key=%s, found=%t", s.nodeID, s.slotID, req.Key, found)
+	return &pb.GetResponse{Value: val, Found: found}, nil
+}
 
-	// First, put some data for reading
-	log.Println("--- Populating sample data for reads ---")
-	_, err = gatewayClient.Put(ctx, &pb.PutRequest{Key: "doc:1", Value: []byte("The quick brown fox jumps over the lazy dog.")})
+// GetRange handles a range query.
+func (s *IndexedReadService) GetRange(ctx context.Context, req *pb.GetRangeRequest) (*pb.GetRangeResponse, error) {
+	// Always get from the primary K/V store (B-tree)
+	entries, err := s.indexManagers["btree"].GetRange(req.StartKey, req.EndKey, req.Limit)
 	if err != nil {
-		log.Printf("Failed to put doc:1: %v", err)
+		log.Printf("Node %s, Slot %d: Failed to get range for start_key %s: %v", s.nodeID, s.slotID, req.StartKey, err)
+		return nil, status.Errorf(codes.Internal, "get range failed: %v", err)
 	}
-	_, err = gatewayClient.Put(ctx, &pb.PutRequest{Key: "doc:2", Value: []byte("Lazy cat sleeps on the mat.")})
-	if err != nil {
-		log.Printf("Failed to put doc:2: %v", err)
-	}
-	_, err = gatewayClient.Put(ctx, &pb.PutRequest{Key: "doc:3", Value: []byte("Fox is quick.")})
-	if err != nil {
-		log.Printf("Failed to put doc:3: %v", err)
-	}
-	log.Println("Sample data populated.")
-	time.Sleep(500 * time.Millisecond) // Give time for data to be indexed
+	log.Printf("Node %s, Slot %d: GetRange start=%s, end=%s, limit=%d, returned %d entries", s.nodeID, s.slotID, req.StartKey, req.EndKey, req.Limit, len(entries))
+	return &pb.GetRangeResponse{Entries: entries}, nil
+}
 
-	log.Println("\n--- Performing Get Operation via Gateway ---")
-	getResponse, err := gatewayClient.Get(ctx, &pb.GetRequest{Key: "doc:1"})
-	if err != nil {
-		log.Printf("could not get 'doc:1' via gateway: %v", err)
-	} else {
-		log.Printf("Get 'doc:1' Response: Found=%t, Value=%s", getResponse.GetFound(), string(getResponse.GetValue()))
-	}
-
-	log.Println("\n--- Performing GetRange Operation via Gateway ---")
-	getRangeResp, err := gatewayClient.GetRange(ctx, &pb.GetRangeRequest{
-		StartKey: "doc:1",
-		EndKey:   "doc:3",
-		Limit:    10,
-	})
-	if err != nil {
-		log.Printf("could not get range 'doc:1' to 'doc:3' via gateway: %v", err)
-	} else {
-		log.Printf("GetRange Response for 'doc:1' to 'doc:3': %d entries retrieved.", len(getRangeResp.GetEntries()))
-		for _, entry := range getRangeResp.GetEntries() {
-			log.Printf("  Key: %s, Value: %s", entry.GetKey(), string(entry.GetValue()))
+// TextSearch handles a text search query.
+func (s *IndexedReadService) TextSearch(ctx context.Context, req *pb.TextSearchRequest) (*pb.TextSearchResponse, error) {
+	// Delegate to the inverted index manager
+	if invIdxMgr, ok := s.indexManagers["inverted"].(*indexmanager.InvertedIndexManager); ok {
+		results, err := invIdxMgr.TextSearch(req.Query, req.IndexName, req.Limit)
+		if err != nil {
+			log.Printf("Node %s, Slot %d: Failed text search for query %s: %v", s.nodeID, s.slotID, req.Query, err)
+			return nil, status.Errorf(codes.Internal, "text search failed: %v", err)
 		}
+		log.Printf("Node %s, Slot %d: TextSearch query=%s, returned %d results", s.nodeID, s.slotID, req.Query, len(results))
+		return &pb.TextSearchResponse{Results: results}, nil
 	}
-
-	log.Println("\n--- Performing TextSearch Operation via Gateway ---")
-	// Note: The dummy index manager in gojodb_server performs a simple string contains check.
-	// In a real system, 'index_name' would specify which inverted index to use.
-	textSearchResp, err := gatewayClient.TextSearch(ctx, &pb.TextSearchRequest{
-		Query:     "fox",
-		IndexName: "content_index", // This would be the name of your inverted index
-		Limit:     5,
-	})
-	if err != nil {
-		log.Printf("could not text search 'fox' via gateway: %v", err)
-	} else {
-		log.Printf("TextSearch 'fox' Response: %d results.", len(textSearchResp.GetResults()))
-		for _, result := range textSearchResp.GetResults() {
-			log.Printf("  Key: %s, Score: %.2f", result.GetKey(), result.GetScore())
-		}
-	}
+	return nil, status.Errorf(codes.Unimplemented, "TextSearch not implemented or inverted index manager not found")
 }

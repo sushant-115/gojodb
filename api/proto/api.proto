@@ -270,3 +270,17 @@ service SnapshotService {
     // StreamSnapshot streams a prepared snapshot from a storage node.
     rpc StreamSnapshot (StreamSnapshotRequest) returns (stream StreamSnapshotResponse);
 }
+
+// In api/proto/api.proto
+service IndexedWriteService {
+    rpc Put (PutRequest) returns (PutResponse);
+    rpc Delete (DeleteRequest) returns (DeleteResponse);
+    rpc BulkPut (BulkPutRequest) returns (BulkPutResponse);
+    rpc BulkDelete (BulkDeleteRequest) returns (BulkDeleteResponse);
+}
+
+service IndexedReadService {
+    rpc Get (GetRequest) returns (GetResponse);
+    rpc GetRange (GetRangeRequest) returns (GetRangeResponse);
+    rpc TextSearch (TextSearchRequest) returns (TextSearchResponse);
+}

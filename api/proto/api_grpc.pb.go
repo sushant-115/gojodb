@@ -8,6 +8,8 @@ package proto
 
 import (
 	context "context"
+	"log"
+
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -65,14 +67,12 @@ type gatewayServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-
-func NewGatewayServiceClient(conn *grpc.ClientConn) *gatewayServiceClient {
-	return &gatewayServiceClient{
-		cc: conn,
-	}
+func NewGatewayServiceClient(cc grpc.ClientConnInterface) GatewayServiceClient {
+	return &gatewayServiceClient{cc}
 }
 
 func (c *gatewayServiceClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error) {
+	log.Println("Called Put method")
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PutResponse)
 	err := c.cc.Invoke(ctx, GatewayService_Put_FullMethodName, in, out, cOpts...)
@@ -713,6 +713,9 @@ type snapshotServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
+func NewSnapshotServiceClient(cc grpc.ClientConnInterface) SnapshotServiceClient {
+	return &snapshotServiceClient{cc}
+}
 
 func (c *snapshotServiceClient) StreamSnapshot(ctx context.Context, in *StreamSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamSnapshotResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -798,5 +801,403 @@ var SnapshotService_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
+	Metadata: "api.proto",
+}
+
+const (
+	IndexedWriteService_Put_FullMethodName        = "/proto.IndexedWriteService/Put"
+	IndexedWriteService_Delete_FullMethodName     = "/proto.IndexedWriteService/Delete"
+	IndexedWriteService_BulkPut_FullMethodName    = "/proto.IndexedWriteService/BulkPut"
+	IndexedWriteService_BulkDelete_FullMethodName = "/proto.IndexedWriteService/BulkDelete"
+)
+
+// IndexedWriteServiceClient is the client API for IndexedWriteService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// In api/proto/api.proto
+type IndexedWriteServiceClient interface {
+	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
+	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	BulkPut(ctx context.Context, in *BulkPutRequest, opts ...grpc.CallOption) (*BulkPutResponse, error)
+	BulkDelete(ctx context.Context, in *BulkDeleteRequest, opts ...grpc.CallOption) (*BulkDeleteResponse, error)
+}
+
+type indexedWriteServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewIndexedWriteServiceClient(cc grpc.ClientConnInterface) IndexedWriteServiceClient {
+	return &indexedWriteServiceClient{cc}
+}
+
+func (c *indexedWriteServiceClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PutResponse)
+	err := c.cc.Invoke(ctx, IndexedWriteService_Put_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *indexedWriteServiceClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteResponse)
+	err := c.cc.Invoke(ctx, IndexedWriteService_Delete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *indexedWriteServiceClient) BulkPut(ctx context.Context, in *BulkPutRequest, opts ...grpc.CallOption) (*BulkPutResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BulkPutResponse)
+	err := c.cc.Invoke(ctx, IndexedWriteService_BulkPut_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *indexedWriteServiceClient) BulkDelete(ctx context.Context, in *BulkDeleteRequest, opts ...grpc.CallOption) (*BulkDeleteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BulkDeleteResponse)
+	err := c.cc.Invoke(ctx, IndexedWriteService_BulkDelete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// IndexedWriteServiceServer is the server API for IndexedWriteService service.
+// All implementations must embed UnimplementedIndexedWriteServiceServer
+// for forward compatibility.
+//
+// In api/proto/api.proto
+type IndexedWriteServiceServer interface {
+	Put(context.Context, *PutRequest) (*PutResponse, error)
+	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	BulkPut(context.Context, *BulkPutRequest) (*BulkPutResponse, error)
+	BulkDelete(context.Context, *BulkDeleteRequest) (*BulkDeleteResponse, error)
+	mustEmbedUnimplementedIndexedWriteServiceServer()
+}
+
+// UnimplementedIndexedWriteServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedIndexedWriteServiceServer struct{}
+
+func (UnimplementedIndexedWriteServiceServer) Put(context.Context, *PutRequest) (*PutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
+}
+func (UnimplementedIndexedWriteServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedIndexedWriteServiceServer) BulkPut(context.Context, *BulkPutRequest) (*BulkPutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BulkPut not implemented")
+}
+func (UnimplementedIndexedWriteServiceServer) BulkDelete(context.Context, *BulkDeleteRequest) (*BulkDeleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BulkDelete not implemented")
+}
+func (UnimplementedIndexedWriteServiceServer) mustEmbedUnimplementedIndexedWriteServiceServer() {}
+func (UnimplementedIndexedWriteServiceServer) testEmbeddedByValue()                             {}
+
+// UnsafeIndexedWriteServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to IndexedWriteServiceServer will
+// result in compilation errors.
+type UnsafeIndexedWriteServiceServer interface {
+	mustEmbedUnimplementedIndexedWriteServiceServer()
+}
+
+func RegisterIndexedWriteServiceServer(s grpc.ServiceRegistrar, srv IndexedWriteServiceServer) {
+	// If the following call pancis, it indicates UnimplementedIndexedWriteServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&IndexedWriteService_ServiceDesc, srv)
+}
+
+func _IndexedWriteService_Put_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexedWriteServiceServer).Put(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexedWriteService_Put_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexedWriteServiceServer).Put(ctx, req.(*PutRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _IndexedWriteService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexedWriteServiceServer).Delete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexedWriteService_Delete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexedWriteServiceServer).Delete(ctx, req.(*DeleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _IndexedWriteService_BulkPut_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BulkPutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexedWriteServiceServer).BulkPut(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexedWriteService_BulkPut_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexedWriteServiceServer).BulkPut(ctx, req.(*BulkPutRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _IndexedWriteService_BulkDelete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BulkDeleteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexedWriteServiceServer).BulkDelete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexedWriteService_BulkDelete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexedWriteServiceServer).BulkDelete(ctx, req.(*BulkDeleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// IndexedWriteService_ServiceDesc is the grpc.ServiceDesc for IndexedWriteService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var IndexedWriteService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "proto.IndexedWriteService",
+	HandlerType: (*IndexedWriteServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Put",
+			Handler:    _IndexedWriteService_Put_Handler,
+		},
+		{
+			MethodName: "Delete",
+			Handler:    _IndexedWriteService_Delete_Handler,
+		},
+		{
+			MethodName: "BulkPut",
+			Handler:    _IndexedWriteService_BulkPut_Handler,
+		},
+		{
+			MethodName: "BulkDelete",
+			Handler:    _IndexedWriteService_BulkDelete_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "api.proto",
+}
+
+const (
+	IndexedReadService_Get_FullMethodName        = "/proto.IndexedReadService/Get"
+	IndexedReadService_GetRange_FullMethodName   = "/proto.IndexedReadService/GetRange"
+	IndexedReadService_TextSearch_FullMethodName = "/proto.IndexedReadService/TextSearch"
+)
+
+// IndexedReadServiceClient is the client API for IndexedReadService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type IndexedReadServiceClient interface {
+	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
+	GetRange(ctx context.Context, in *GetRangeRequest, opts ...grpc.CallOption) (*GetRangeResponse, error)
+	TextSearch(ctx context.Context, in *TextSearchRequest, opts ...grpc.CallOption) (*TextSearchResponse, error)
+}
+
+type indexedReadServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewIndexedReadServiceClient(cc grpc.ClientConnInterface) IndexedReadServiceClient {
+	return &indexedReadServiceClient{cc}
+}
+
+func (c *indexedReadServiceClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetResponse)
+	err := c.cc.Invoke(ctx, IndexedReadService_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *indexedReadServiceClient) GetRange(ctx context.Context, in *GetRangeRequest, opts ...grpc.CallOption) (*GetRangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRangeResponse)
+	err := c.cc.Invoke(ctx, IndexedReadService_GetRange_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *indexedReadServiceClient) TextSearch(ctx context.Context, in *TextSearchRequest, opts ...grpc.CallOption) (*TextSearchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TextSearchResponse)
+	err := c.cc.Invoke(ctx, IndexedReadService_TextSearch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// IndexedReadServiceServer is the server API for IndexedReadService service.
+// All implementations must embed UnimplementedIndexedReadServiceServer
+// for forward compatibility.
+type IndexedReadServiceServer interface {
+	Get(context.Context, *GetRequest) (*GetResponse, error)
+	GetRange(context.Context, *GetRangeRequest) (*GetRangeResponse, error)
+	TextSearch(context.Context, *TextSearchRequest) (*TextSearchResponse, error)
+	mustEmbedUnimplementedIndexedReadServiceServer()
+}
+
+// UnimplementedIndexedReadServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedIndexedReadServiceServer struct{}
+
+func (UnimplementedIndexedReadServiceServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedIndexedReadServiceServer) GetRange(context.Context, *GetRangeRequest) (*GetRangeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetRange not implemented")
+}
+func (UnimplementedIndexedReadServiceServer) TextSearch(context.Context, *TextSearchRequest) (*TextSearchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TextSearch not implemented")
+}
+func (UnimplementedIndexedReadServiceServer) mustEmbedUnimplementedIndexedReadServiceServer() {}
+func (UnimplementedIndexedReadServiceServer) testEmbeddedByValue()                            {}
+
+// UnsafeIndexedReadServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to IndexedReadServiceServer will
+// result in compilation errors.
+type UnsafeIndexedReadServiceServer interface {
+	mustEmbedUnimplementedIndexedReadServiceServer()
+}
+
+func RegisterIndexedReadServiceServer(s grpc.ServiceRegistrar, srv IndexedReadServiceServer) {
+	// If the following call pancis, it indicates UnimplementedIndexedReadServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&IndexedReadService_ServiceDesc, srv)
+}
+
+func _IndexedReadService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexedReadServiceServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexedReadService_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexedReadServiceServer).Get(ctx, req.(*GetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _IndexedReadService_GetRange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRangeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexedReadServiceServer).GetRange(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexedReadService_GetRange_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexedReadServiceServer).GetRange(ctx, req.(*GetRangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _IndexedReadService_TextSearch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TextSearchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexedReadServiceServer).TextSearch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexedReadService_TextSearch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexedReadServiceServer).TextSearch(ctx, req.(*TextSearchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// IndexedReadService_ServiceDesc is the grpc.ServiceDesc for IndexedReadService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var IndexedReadService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "proto.IndexedReadService",
+	HandlerType: (*IndexedReadServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Get",
+			Handler:    _IndexedReadService_Get_Handler,
+		},
+		{
+			MethodName: "GetRange",
+			Handler:    _IndexedReadService_GetRange_Handler,
+		},
+		{
+			MethodName: "TextSearch",
+			Handler:    _IndexedReadService_TextSearch_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "api.proto",
 }

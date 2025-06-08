@@ -20,10 +20,14 @@ import (
 	"time"
 
 	// GojoDB core packages
+	indexedreadsservice "github.com/sushant-115/gojodb/api/indexed_reads_service"
+	indexedwritesservice "github.com/sushant-115/gojodb/api/indexed_writes_service"
+	pb "github.com/sushant-115/gojodb/api/proto"
 	gojodbcontroller "github.com/sushant-115/gojodb/cmd/gojodb_controller"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
+	"github.com/sushant-115/gojodb/core/indexmanager"
 	logreplication "github.com/sushant-115/gojodb/core/replication/log_replication"
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 	"github.com/sushant-115/gojodb/core/storage_engine/tiered_storage"
@@ -50,6 +54,7 @@ var (
 	invertedIndexInstance *inverted_index.InvertedIndex
 	spatialIdx            *spatial.SpatialIndexManager
 	tieredStorageManager  *tiered_storage.TieredStorageManager // Corrected type name
+	indexManagers         map[string]indexmanager.IndexManager
 
 	// OLD: replicationManager    *logreplication.ReplicationManager
 	// NEW: Map of index type to its replication manager
@@ -304,7 +309,14 @@ func initStorageNode() error {
 		zlogger,
 	)
 	zlogger.Info("Raft FSM initialized")
-
+	zlogger.Info("Initializing IndexManager")
+	btreeIdxMgr := indexmanager.NewBTreeIndexManager(dbInstance)
+	spatialIdxMgr := indexmanager.NewSpatialIndexManager(spatialIdx)
+	invertedIdxMgr := indexmanager.NewInvertedIndexManager(invertedIndexInstance)
+	indexManagers = make(map[string]indexmanager.IndexManager)
+	indexManagers["btree"] = btreeIdxMgr
+	indexManagers["spatial"] = spatialIdxMgr
+	indexManagers["inverted"] = invertedIdxMgr
 	return nil
 }
 
@@ -729,12 +741,15 @@ func startGRPCServer() {
 	// Create gRPC server with interceptors for logging and recovery
 	grpcServer = grpc.NewServer(
 	// grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-	//  grpc_zap.UnaryServerInterceptor(zlogger),
-	//  // Add other interceptors like recovery, auth, etc.
+	// 	grpc_zap.UnaryServerInterceptor(zlogger),
+	// 	// Add other interceptors like recovery, auth, etc.
 	// )),
 	)
 
 	// Register services
+	pb.RegisterIndexedWriteServiceServer(grpcServer, indexedwritesservice.NewIndexedWriteService(myStorageNodeID, 0, indexManagers))
+	// Register the IndexedReadService to handle Get, GetRange, TextSearch
+	pb.RegisterIndexedReadServiceServer(grpcServer, indexedreadsservice.NewIndexedReadService(myStorageNodeID, 0, indexManagers))
 	// pb.RegisterBasicServiceServer(grpcServer, basic_api.NewBasicServer(dbInstance, zlogger))
 	// pb.RegisterGatewayServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
 	// pb.RegisterSnapshotServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))

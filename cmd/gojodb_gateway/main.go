@@ -175,7 +175,7 @@ func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn,
 
 	// No valid connection in pool, create a new one
 	log.Printf("Establishing new gRPC connection to storage node %s at %s", nodeID, addr)
-	conn, err := grpc.Dial(addr, grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
+	conn, err := grpc.NewClient("127.0.0.1:8000", grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
 	if err != nil {
 		gs.nodeConns.Put(nil) // Put nil back to signal it's unusable
 		return nil, fmt.Errorf("failed to dial storage node %s at %s: %v", nodeID, addr, err)
@@ -239,7 +239,7 @@ func (gs *GatewayService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutR
 	}
 	defer gs.returnStorageNodeClient(conn)
 
-	client := pb.NewGatewayServiceClient(conn)
+	client := pb.NewIndexedWriteServiceClient(conn)
 	putResp, err := client.Put(ctx, req)
 	if err != nil {
 		log.Printf("Error calling Put on node %s for key %s: %v", nodeID, req.Key, err)
@@ -264,7 +264,7 @@ func (gs *GatewayService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetR
 	}
 	defer gs.returnStorageNodeClient(conn)
 
-	client := pb.NewGatewayServiceClient(conn)
+	client := pb.NewIndexedReadServiceClient(conn)
 	getResp, err := client.Get(ctx, req)
 	if err != nil {
 		log.Printf("Error calling Get on node %s for key %s: %v", nodeID, req.Key, err)
@@ -289,7 +289,7 @@ func (gs *GatewayService) Delete(ctx context.Context, req *pb.DeleteRequest) (*p
 	}
 	defer gs.returnStorageNodeClient(conn)
 
-	client := pb.NewGatewayServiceClient(conn)
+	client := pb.NewIndexedWriteServiceClient(conn)
 	deleteResp, err := client.Delete(ctx, req)
 	if err != nil {
 		log.Printf("Error calling Delete on node %s for key %s: %v", nodeID, req.Key, err)
@@ -316,7 +316,7 @@ func (gs *GatewayService) GetRange(ctx context.Context, req *pb.GetRangeRequest)
 	}
 	defer gs.returnStorageNodeClient(conn)
 
-	client := pb.NewGatewayServiceClient(conn)
+	client := pb.NewIndexedReadServiceClient(conn)
 	getRangeResp, err := client.GetRange(ctx, req)
 	if err != nil {
 		log.Printf("Error calling GetRange on node %s for start_key %s: %v", nodeID, req.StartKey, err)
@@ -345,7 +345,7 @@ func (gs *GatewayService) TextSearch(ctx context.Context, req *pb.TextSearchRequ
 	}
 	defer gs.returnStorageNodeClient(conn)
 
-	client := pb.NewGatewayServiceClient(conn)
+	client := pb.NewIndexedReadServiceClient(conn)
 	textSearchResp, err := client.TextSearch(ctx, req)
 	if err != nil {
 		log.Printf("Error calling TextSearch on node %s for query %s: %v", nodeID, req.Query, err)
@@ -382,7 +382,7 @@ func (gs *GatewayService) BulkPut(ctx context.Context, req *pb.BulkPutRequest) (
 			}
 			defer gs.returnStorageNodeClient(conn)
 
-			client := pb.NewGatewayServiceClient(conn)
+			client := pb.NewIndexedWriteServiceClient(conn)
 			bulkReq := &pb.BulkPutRequest{Entries: entries}
 			_, err = client.BulkPut(ctx, bulkReq)
 			if err != nil {
@@ -434,7 +434,7 @@ func (gs *GatewayService) BulkDelete(ctx context.Context, req *pb.BulkDeleteRequ
 			}
 			defer gs.returnStorageNodeClient(conn)
 
-			client := pb.NewGatewayServiceClient(conn)
+			client := pb.NewIndexedWriteServiceClient(conn)
 			bulkReq := &pb.BulkDeleteRequest{Keys: keys}
 			_, err = client.BulkDelete(ctx, bulkReq)
 			if err != nil {
