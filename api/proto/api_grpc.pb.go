@@ -65,14 +65,10 @@ type gatewayServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-type GatewayServiceClientImpl struct {
-	gatewayServiceClient
-	conn *grpc.ClientConn
-}
 
-func NewGatewayServiceClient(conn *grpc.ClientConn) *GatewayServiceClientImpl {
-	return &GatewayServiceClientImpl{
-		conn: conn,
+func NewGatewayServiceClient(conn *grpc.ClientConn) *gatewayServiceClient {
+	return &gatewayServiceClient{
+		cc: conn,
 	}
 }
 

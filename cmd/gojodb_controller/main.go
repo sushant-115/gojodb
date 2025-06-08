@@ -423,7 +423,7 @@ func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.R
 	}
 
 	var req struct {
-		SlotRange      string   `json:"slotRange"`
+		SlotID         uint64   `json:"slotID"`
 		PrimaryNodeID  string   `json:"primaryNodeId"`
 		ReplicaNodeIDs []string `json:"replicaNodeIds"`
 	}
@@ -434,7 +434,7 @@ func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.R
 
 	cmd := fsm.Command{
 		Type:           fsm.CommandAssignSlot,
-		SlotRange:      req.SlotRange,
+		SlotID:         req.SlotID,
 		PrimaryNodeID:  req.PrimaryNodeID,
 		ReplicaNodeIDs: req.ReplicaNodeIDs,
 	}
@@ -445,7 +445,7 @@ func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.R
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf("Slot %d assigned to primary %s with replicas %v", req.SlotRange, req.PrimaryNodeID, req.ReplicaNodeIDs)))
+	w.Write([]byte(fmt.Sprintf("Slot %d assigned to primary %s with replicas %v", req.SlotID, req.PrimaryNodeID, req.ReplicaNodeIDs)))
 }
 
 // handleAdminGetAllSlotAssignments returns the current shard slot assignments.
