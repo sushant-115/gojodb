@@ -75,10 +75,10 @@ var (
 	httpAddr          = flag.String("http_addr", "127.0.0.1:8080", "HTTP bind address for GraphQL and health checks")
 	bootstrap         = flag.Bool("bootstrap", false, "Bootstrap the Raft cluster (only for the first node)")
 	controllerAddr    = flag.String("controller_addr", "127.0.0.1:9000", "Controller address for joining Raft cluster and fetching shard map")
-	replicationPort   = flag.String("repl_port", "6000", "Port for replication data exchange between storage nodes")                // Clarified purpose
-	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes") // Clarified purpose
-	myStorageNodeID   string                                                                                                        // Set from nodeID flag
-	myStorageNodeAddr string                                                                                                        // Address this node is reachable at by other storage nodes (e.g. for replication)
+	replicationAddr   = flag.String("replication_addr", "127.0.01:6000", "Port for replication data exchange between storage nodes") // Clarified purpose
+	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes")  // Clarified purpose
+	myStorageNodeID   string                                                                                                         // Set from nodeID flag
+	myStorageNodeAddr string                                                                                                         // Address this node is reachable at by other storage nodes (e.g. for replication)
 
 	// Global wait group to manage graceful shutdown of goroutines
 	globalWG sync.WaitGroup
@@ -101,7 +101,7 @@ func main() {
 	myStorageNodeID = *nodeID
 	// Construct the replication address (host from grpcAddr, port from replicationPort)
 	host := strings.Split(*grpcAddr, ":")[0]
-	myStorageNodeAddr = fmt.Sprintf("%s:%s", host, *replicationPort)
+	myStorageNodeAddr = fmt.Sprintf("%s:%s", host, *replicationAddr)
 
 	var err error
 	// Initialize logger
@@ -120,7 +120,7 @@ func main() {
 		zap.String("raftAddr", *raftAddr),
 		zap.String("grpcAddr", *grpcAddr),
 		zap.String("httpAddr", *httpAddr),
-		zap.String("replicationListenAddr", ":"+*replicationPort),
+		zap.String("replicationListenAddr", ":"+*replicationAddr),
 		zap.String("myStorageNodeAddrForReplication", myStorageNodeAddr),
 		zap.Bool("bootstrap", *bootstrap),
 		zap.String("controllerAddr", *controllerAddr),
@@ -405,8 +405,9 @@ func sendHeartBeats(stopChan chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	data := map[string]string{
-		"nodeId":  *nodeID,
-		"address": *httpAddr,
+		"nodeId":           *nodeID,
+		"address":          *httpAddr,
+		"replication_addr": *replicationAddr,
 	}
 
 	// Convert to JSON
@@ -414,7 +415,7 @@ func sendHeartBeats(stopChan chan struct{}) {
 	if err != nil {
 		panic(err)
 	}
-	heartbeatPath := fmt.Sprintf("http://%s/heartbeat?nodeId=%s&address=%s", *heartbeatAddr, *nodeID, *httpAddr)
+	heartbeatPath := fmt.Sprintf("http://%s/heartbeat?nodeId=%s&address=%s&replication_addr=%s", *heartbeatAddr, *nodeID, *httpAddr, *replicationAddr)
 
 	for {
 		select {
@@ -437,7 +438,7 @@ func sendHeartBeats(stopChan chan struct{}) {
 // listenForReplicationRequests handles incoming connections from primaries that want to stream logs.
 func listenForReplicationRequests() {
 	defer globalWG.Done()
-	listenAddress := ":" + *replicationPort // Listen on all interfaces on the replication port
+	listenAddress := *replicationAddr // Listen on all interfaces on the replication port
 	listener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		zlogger.Error("CRITICAL: Failed to start replication listener, node cannot receive replicated data", zap.Error(err), zap.String("address", listenAddress))
@@ -654,7 +655,7 @@ func closeStorageNode() {
 	// 3. Close FSM (if it has resources to release)
 	if raftFSM != nil {
 		zlogger.Info("Closing FSM...")
-		// raftFSM.Close() // Assuming FSM has a Close method
+		raftFSM.Close() // Assuming FSM has a Close method
 		// For now, FSM's resources are tied to index instances and log managers.
 	}
 
@@ -713,7 +714,14 @@ func closeStorageNode() {
 			zlogger.Error("Error during HTTP server shutdown", zap.Error(err))
 		}
 	}
-
+	if raftController != nil {
+		zlogger.Info("Attempting graceful shutdown of heartbeat server")
+		ctx, cancel := context.WithTimeout(context.Background(), HttpServerStopTimeout)
+		defer cancel()
+		if err := raftController.HeartbeatServer.Shutdown(ctx); err != nil {
+			zlogger.Error("Error during HTTP server shutdown", zap.Error(err))
+		}
+	}
 	zlogger.Info("Storage node components closed/stopped.")
 }
 

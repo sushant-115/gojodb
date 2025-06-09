@@ -37,6 +37,7 @@ type Controller struct {
 	storageNodeIDToAddress map[string]string // nodeID -> gRPC Address received via heartbeat/registration
 	lastHeartbeatReceived  map[string]time.Time
 	heartbeatAddress       string
+	HeartbeatServer        *http.Server
 }
 
 // NewController creates a new Controller instance.
@@ -72,7 +73,7 @@ func (c *Controller) startHeartbeatListener(heartbeatAddr string) {
 		Addr:    heartbeatAddr,
 		Handler: mux,
 	}
-
+	c.HeartbeatServer = heartbeatServer
 	log.Printf("Heartbeat listener starting on %s", heartbeatAddr)
 	if err := heartbeatServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Heartbeat listener failed: %v", err)
@@ -89,6 +90,7 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	nodeID := r.URL.Query().Get("nodeId")
 	address := r.URL.Query().Get("address") // gRPC address of the storage node
+	replicationAddr := r.URL.Query().Get("replication_addr")
 	log.Print("Received heartbeat: ", nodeID, address)
 	if nodeID == "" || address == "" {
 		http.Error(w, "nodeId and address are required", http.StatusBadRequest)
@@ -103,12 +105,14 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	c.storageNodeInfoMutex.Unlock()
 
+	rawMessage := fmt.Sprintf(`{"status":"active", "replication_addr": "%s"}`, replicationAddr)
+
 	// Submit a command to Raft FSM to update node status and address
 	cmd := fsm.Command{
 		Type:     fsm.CommandRegisterNode, // Use RegisterNode for heartbeats to update status/address
 		NodeID:   nodeID,
 		NodeAddr: address,
-		Payload:  json.RawMessage(`{"status":"active"}`),
+		Payload:  json.RawMessage(rawMessage),
 	}
 	err := c.applyCommand(cmd)
 	if err != nil {
@@ -544,19 +548,21 @@ func (c *Controller) handleAdminRegisterStorageNode(w http.ResponseWriter, r *ht
 	}
 
 	var req struct {
-		NodeID  string `json:"nodeId"`
-		Address string `json:"address"`
+		NodeID          string `json:"nodeId"`
+		Address         string `json:"address"`
+		ReplicationAddr string `json:"replication_addr"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
 		return
 	}
+	payload := fmt.Sprintf(`{"status": "registered", "replication_addr": "%s"}`, req.ReplicationAddr)
 
 	cmd := fsm.Command{
 		Type:     fsm.CommandRegisterNode,
 		NodeID:   req.NodeID,
 		NodeAddr: req.Address,
-		Payload:  json.RawMessage(`{"status": "registered"}`), // Initial status
+		Payload:  json.RawMessage(payload), // Initial status
 	}
 	if err := c.applyCommand(cmd); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to register storage node: %v", err), http.StatusInternalServerError)
