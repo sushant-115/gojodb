@@ -79,7 +79,7 @@ var (
 	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes")  // Clarified purpose
 	myStorageNodeID   string                                                                                                         // Set from nodeID flag
 	myStorageNodeAddr string                                                                                                         // Address this node is reachable at by other storage nodes (e.g. for replication)
-
+	raftTransport     *raft.NetworkTransport
 	// Global wait group to manage graceful shutdown of goroutines
 	globalWG sync.WaitGroup
 )
@@ -345,6 +345,8 @@ func initAndStartRaft() error {
 	if err != nil {
 		return fmt.Errorf("failed to create raft TCP transport: %w", err)
 	}
+
+	raftTransport = transport
 
 	// Create snapshot store
 	snapshots, err := raft.NewFileSnapshotStore(raftDataPath, RaftSnapShotRetain, config.LogOutput)
@@ -631,6 +633,13 @@ func closeStorageNode() {
 	zlogger.Info("Initiating shutdown of GojoDB storage node components...")
 
 	// 1. Stop Raft node first to prevent new FSM applications
+	if raftTransport != nil {
+		zlogger.Info("Closing Raft transport...")
+		if err := raftTransport.Close(); err != nil {
+			zlogger.Error("Error closing Raft transport", zap.Error(err))
+		}
+	}
+
 	if raftNode != nil {
 		zlogger.Info("Shutting down Raft node...")
 		shutdownFuture := raftNode.Shutdown() // This is async
