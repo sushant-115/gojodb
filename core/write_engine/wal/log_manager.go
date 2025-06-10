@@ -3,6 +3,8 @@ package wal
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"sync"
 	"time" // Added for LastHeartbeat
 
+	"github.com/sushant-115/gojodb/core/security/encryption"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"go.uber.org/zap"
 )
@@ -22,7 +25,12 @@ const (
 	walFileSuffix            = ".log"
 	defaultMaxWalSegmentSize = 16 * 1024 * 1024 // 16MB per WAL segment
 	defaultArchiveDir        = "archive"
+	slotsFileName            = "replication_slots.json"
 	defaultMinLSNToKeep      = LSN(0) // Default LSN to keep, can be updated by replication slots
+)
+
+var (
+	encryptionKey = []byte("SOMEKEY")
 )
 
 type LSN uint64
@@ -86,8 +94,9 @@ type ReplicationSlot struct {
 	IndexType      string    `json:"index_type"`       // Type of index this slot is for (e.g., "btree", "inverted_index")
 	RequiredLSN    LSN       `json:"required_lsn"`     // The oldest LSN this consumer still needs. WALs up to this LSN cannot be deleted.
 	SnapshotLSN    LSN       `json:"snapshot_lsn"`     // The LSN at which the consumer started (e.g., from a snapshot).
-	IsActive       bool      `json:"is_active"`        // Whether the slot is currently considered active for WAL retention.
-	LastHeartbeat  time.Time `json:"last_heartbeat"`   // Last time the consumer confirmed activity.
+	RestartLSN     LSN       `json:"restart_lsn"`
+	IsActive       bool      `json:"is_active"`      // Whether the slot is currently considered active for WAL retention.
+	LastHeartbeat  time.Time `json:"last_heartbeat"` // Last time the consumer confirmed activity.
 	CreationTime   time.Time `json:"creation_time"`
 }
 
@@ -100,9 +109,34 @@ type LogManager struct {
 	archiveDir         string
 	logger             *zap.Logger
 	mu                 sync.RWMutex // Protects currentLSN, segment switching, and replicationSlots
+	mtx                sync.Mutex
+	cond               *sync.Cond
+
+	slotsMtx         sync.RWMutex
+	slotsFilePath    string
+	segmentStartLSNs map[int]LSN // Maps segment ID to its starting LSN
+	segmentMetaMtx   sync.RWMutex
+
+	// WAL encryption fields
+	encryptionKey []byte
+	cryptoUtil    *encryption.CryptoUtils
 
 	// Replication Slots Management
 	replicationSlots map[string]*ReplicationSlot // Key: SlotName
+}
+
+// WALStreamReader provides an interface for reading from the WAL across multiple segments.
+type WALStreamReader struct {
+	logManager *LogManager
+	slotName   string
+
+	currentSegmentID int
+	currentFile      *os.File
+	decoder          *gob.Decoder
+
+	// Channel to signal the reader to stop
+	stopChan chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewLogManager creates or opens a LogManager for the given directory.
@@ -116,6 +150,15 @@ func NewLogManager(walDir string) (*LogManager, error) {
 		return nil, fmt.Errorf("failed to create WAL archive directory %s: %w", archivePath, err)
 	}
 
+	var crypto *encryption.CryptoUtils
+	if len(encryptionKey) > 0 {
+		var err error
+		crypto, err = encryption.NewCryptoUtils(encryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize crypto utils: %w", err)
+		}
+	}
+
 	// Initialize logger (ideally passed in, but creating a default one for now)
 	logger, _ := zap.NewDevelopment() // TODO: Pass logger as argument
 
@@ -123,22 +166,335 @@ func NewLogManager(walDir string) (*LogManager, error) {
 		walDir:           walDir,
 		maxSegmentSize:   defaultMaxWalSegmentSize,
 		archiveDir:       archivePath,
+		slotsFilePath:    filepath.Join(walDir, slotsFileName),
+		segmentStartLSNs: make(map[int]LSN),
 		logger:           logger.Named("log_manager"),
 		replicationSlots: make(map[string]*ReplicationSlot),
+		cryptoUtil:       crypto,
 	}
 
+	lm.cond = sync.NewCond(&lm.mtx)
 	if err := lm.recover(); err != nil {
 		return nil, fmt.Errorf("failed to recover log manager: %w", err)
 	}
-	// TODO: Load replication slots from a persistent store (e.g., a metadata file in walDir or via FSM)
-	// For now, they are in-memory and lost on restart.
-	// lm.loadReplicationSlots()
+	if err := lm.loadReplicationSlots(); err != nil {
+		lm.logger.Warn("Could not load replication slots, starting fresh", zap.Error(err))
+	}
+
+	// Start a background goroutine for periodic pruning
+	go lm.runPruningLoop()
 
 	return lm, nil
 }
 
 func (l *LogManager) GetCurrentLSN() LSN {
 	return l.currentLSN
+}
+
+func (lm *LogManager) runPruningLoop() {
+	// Prune shortly after startup and then periodically
+	time.Sleep(1 * time.Minute)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		lm.pruneOldSegments()
+		<-ticker.C
+	}
+}
+
+func (lm *LogManager) pruneOldSegments() {
+	lm.mtx.Lock()
+	checkpointLSN := lm.currentLSN
+	lm.mtx.Unlock()
+
+	if checkpointLSN == 0 {
+		lm.logger.Debug("Skipping WAL pruning, no checkpoint has been set.")
+		return
+	}
+
+	lm.slotsMtx.RLock()
+	minSlotLSN := LSN(0)
+	for _, slot := range lm.replicationSlots {
+		if slot.IsActive {
+			if minSlotLSN == 0 || slot.RestartLSN < minSlotLSN {
+				minSlotLSN = slot.RestartLSN
+			}
+		}
+	}
+	lm.slotsMtx.RUnlock()
+
+	// The safe LSN is the minimum of the checkpoint LSN and all active slot LSNs.
+	safeLSN := checkpointLSN
+	if minSlotLSN > 0 && minSlotLSN < safeLSN {
+		safeLSN = minSlotLSN
+	}
+
+	lm.logger.Info("Running WAL pruning",
+		zap.Uint64("safeLSN", uint64(safeLSN)),
+		zap.Uint64("checkpointLSN", uint64(checkpointLSN)),
+		zap.Uint64("minSlotLSN", uint64(minSlotLSN)))
+
+	lm.segmentMetaMtx.Lock()
+	defer lm.segmentMetaMtx.Unlock()
+
+	// Collect segment IDs to check for pruning
+	var segmentIDs []int
+	for id := range lm.segmentStartLSNs {
+		segmentIDs = append(segmentIDs, id)
+	}
+	sort.Ints(segmentIDs)
+
+	// We can prune a segment if the *next* segment starts before the safe LSN.
+	// We cannot prune the current active segment for writing.
+	for i := 0; i < len(segmentIDs)-1; i++ {
+		segmentID := segmentIDs[i]
+		nextSegmentID := segmentIDs[i+1]
+		nextSegmentStartLSN := lm.segmentStartLSNs[nextSegmentID]
+
+		if segmentID < int(lm.currentSegmentID) && nextSegmentStartLSN < safeLSN {
+			filePath := filepath.Join(lm.walDir, fmt.Sprintf("%s%d%s", walFilePrefix, segmentID, walFileSuffix))
+			lm.logger.Info("Pruning old WAL segment", zap.String("file", filePath), zap.Int("segmentID", segmentID))
+			err := os.Remove(filePath)
+			if err != nil {
+				lm.logger.Error("Failed to prune WAL segment", zap.String("file", filePath), zap.Error(err))
+			} else {
+				delete(lm.segmentStartLSNs, segmentID)
+			}
+		}
+	}
+}
+
+// GetWALReaderForStreaming creates a new WALStreamReader for a given replication slot.
+// It creates the slot if it doesn't exist.
+func (lm *LogManager) GetWALReaderForStreaming(fromLSN LSN, slotName string) (*WALStreamReader, error) {
+	lm.slotsMtx.Lock()
+	slot, exists := lm.replicationSlots[slotName]
+	if !exists {
+		lm.logger.Info("Creating new replication slot", zap.String("slotName", slotName), zap.Uint64("fromLSN", uint64(fromLSN)))
+		slot = &ReplicationSlot{
+			SlotName:      slotName,
+			RestartLSN:    fromLSN,
+			IsActive:      true,
+			LastHeartbeat: time.Now(),
+		}
+		lm.replicationSlots[slotName] = slot
+	} else {
+		slot.IsActive = true
+		slot.LastHeartbeat = time.Now()
+		// If the replica requests an LSN that is older than what we have, we respect it.
+		// A more advanced implementation might reject this.
+		if fromLSN < slot.RestartLSN {
+			lm.logger.Warn("Replica requested an older LSN than tracked.",
+				zap.String("slot", slotName),
+				zap.Uint64("requested", uint64(fromLSN)),
+				zap.Uint64("tracked", uint64(slot.RestartLSN)))
+			slot.RestartLSN = fromLSN
+		}
+	}
+	lm.slotsMtx.Unlock()
+
+	// Persist slot changes
+	if err := lm.persistReplicationSlots(); err != nil {
+		return nil, fmt.Errorf("failed to persist replication slot: %w", err)
+	}
+
+	reader := &WALStreamReader{
+		logManager: lm,
+		slotName:   slotName,
+		stopChan:   make(chan struct{}),
+	}
+	reader.wg.Add(1)
+
+	// Open the initial segment
+	if err := reader.openSegmentForLSN(slot.RestartLSN); err != nil {
+		return nil, err
+	}
+
+	return reader, nil
+}
+
+// Next reads the next log record from the stream. It blocks until a new record is available
+// or the reader is closed.
+func (r *WALStreamReader) Next(logRecord *LogRecord) error {
+	for {
+		select {
+		case <-r.stopChan:
+			return io.EOF // Or a more specific error like ErrReaderClosed
+		default:
+			// Attempt to decode the next record
+			err := r.decoder.Decode(logRecord)
+			if err == nil {
+				// Successfully decoded a record
+				// if r.logManager.cryptoUtil != nil {
+				// 	decryptedPayload, decryptErr := r.logManager.cryptoUtil.Decrypt(logRecord.Payload)
+				// 	if decryptErr != nil {
+				// 		r.logManager.logger.Error("Failed to decrypt log payload", zap.Error(decryptErr), zap.Uint64("lsn", uint64(logRecord.LSN)))
+				// 		return fmt.Errorf("failed to decrypt log record at LSN %d: %w", logRecord.LSN, decryptErr)
+				// 	}
+				// 	logRecord.Payload = decryptedPayload
+				// }
+
+				// Update slot progress
+				r.logManager.UpdateSlotLSN(r.slotName, logRecord.LSN+1)
+				return nil
+			}
+
+			if err != io.EOF {
+				// A real error occurred
+				r.logManager.logger.Error("Error decoding log record", zap.Error(err))
+				return err
+			}
+
+			// We reached the end of the current file (io.EOF)
+			nextSegmentID := r.currentSegmentID + 1
+			r.logManager.segmentMetaMtx.RLock()
+			_, nextSegmentExists := r.logManager.segmentStartLSNs[nextSegmentID]
+			r.logManager.segmentMetaMtx.RUnlock()
+
+			if nextSegmentExists {
+				// Switch to the next segment
+				r.logManager.logger.Debug("Switching to next WAL segment for streaming", zap.Int("nextSegmentID", nextSegmentID))
+				r.currentFile.Close()
+				err := r.openSegment(nextSegmentID)
+				if err != nil {
+					return err
+				}
+				continue // Retry reading from the new segment
+			}
+
+			// We've hit the end of the latest segment, wait for more data.
+			r.logManager.mtx.Lock()
+			select {
+			case <-r.stopChan: // Check again in case of race
+				r.logManager.mtx.Unlock()
+				return io.EOF
+			default:
+				r.logManager.cond.Wait()
+			}
+			r.logManager.mtx.Unlock()
+		}
+	}
+}
+
+// Close stops the reader and marks the replication slot as inactive.
+func (r *WALStreamReader) Close() error {
+	close(r.stopChan)
+	r.logManager.cond.Broadcast() // Wake up the reader if it's waiting, so it can exit
+	r.wg.Wait()
+
+	r.logManager.slotsMtx.Lock()
+	if slot, exists := r.logManager.replicationSlots[r.slotName]; exists {
+		slot.IsActive = false
+		slot.LastHeartbeat = time.Now()
+	}
+	r.logManager.slotsMtx.Unlock()
+
+	if err := r.logManager.persistReplicationSlots(); err != nil {
+		r.logManager.logger.Error("Failed to persist slot state on close", zap.Error(err))
+	}
+
+	if r.currentFile != nil {
+		return r.currentFile.Close()
+	}
+	return nil
+}
+
+func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
+	r.logManager.segmentMetaMtx.RLock()
+	defer r.logManager.segmentMetaMtx.RUnlock()
+
+	var targetSegmentID = -1
+	var latestSegmentID = -1
+	var latestSegmentStartLSN LSN = 0
+
+	// Find the segment containing the LSN
+	for id, startLSN := range r.logManager.segmentStartLSNs {
+		if id > latestSegmentID {
+			latestSegmentID = id
+			latestSegmentStartLSN = startLSN
+		}
+		if lsn >= startLSN {
+			if targetSegmentID == -1 || startLSN > r.logManager.segmentStartLSNs[targetSegmentID] {
+				targetSegmentID = id
+			}
+		}
+	}
+
+	if targetSegmentID == -1 {
+		// This can happen if the requested LSN is so old it belongs to a pruned segment,
+		// or if it's newer than any existing segment's start LSN (but should be in the latest).
+		if lsn >= latestSegmentStartLSN {
+			targetSegmentID = latestSegmentID
+		} else {
+			return fmt.Errorf("could not find WAL segment for LSN %d. It may have been pruned", lsn)
+		}
+	}
+
+	if err := r.openSegment(targetSegmentID); err != nil {
+		return err
+	}
+
+	// Scan from the beginning of the segment to find the exact record
+	for {
+		var tempRec LogRecord
+		err := r.decoder.Decode(&tempRec)
+		if err == io.EOF {
+			return fmt.Errorf("reached end of segment %d without finding LSN %d", targetSegmentID, lsn)
+		}
+		if err != nil {
+			return fmt.Errorf("error while seeking to LSN %d in segment %d: %w", lsn, targetSegmentID, err)
+		}
+		if tempRec.LSN >= lsn {
+			// We found it or passed it. We need to "unread" the last record.
+			// A simple way is to reopen and reread up to this point.
+			// For this implementation, we'll just start streaming from here.
+			r.logManager.logger.Info("Starting stream",
+				zap.String("slot", r.slotName),
+				zap.Uint64("requestedLSN", uint64(lsn)),
+				zap.Uint64("actualStartLSN", uint64(tempRec.LSN)))
+
+			// Decrypt the payload if needed
+			if r.logManager.cryptoUtil != nil {
+				// Since this is the first read, we just need to decrypt it before it gets handled by Next()
+				decryptedPayload, decryptErr := r.logManager.cryptoUtil.Decrypt(tempRec.Data)
+				if decryptErr != nil {
+					return fmt.Errorf("failed to decrypt log record at LSN %d: %w", tempRec.LSN, decryptErr)
+				}
+				tempRec.Data = decryptedPayload
+			}
+
+			// This approach is not perfect as the first call to Next() will re-read this record.
+			// A better solution would involve a more complex reader that can push back a read record.
+			// For now we will reopen the file and create a new decoder.
+			if err := r.openSegment(targetSegmentID); err != nil {
+				return err
+			}
+			for {
+				var rec LogRecord
+				if err := r.decoder.Decode(&rec); err != nil {
+					return fmt.Errorf("failed to re-read to LSN %d: %w", lsn, err)
+				}
+				if rec.LSN >= lsn {
+					break
+				}
+			}
+
+			return nil
+		}
+	}
+}
+
+func (r *WALStreamReader) openSegment(segmentID int) error {
+	filePath := filepath.Join(r.logManager.walDir, fmt.Sprintf("%s%d%s", walFilePrefix, segmentID, walFileSuffix))
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("could not open WAL segment %d for streaming: %w", segmentID, err)
+	}
+	r.currentFile = file
+	r.currentSegmentID = segmentID
+	r.decoder = gob.NewDecoder(file)
+	return nil
 }
 
 // recover attempts to restore the LogManager state from existing WAL files.
@@ -311,6 +667,18 @@ func (lm *LogManager) openNewSegment(segmentID uint64) error {
 	// If this is the very first segment (during initial recovery with no files), currentLSN is 0.
 	lm.logger.Info("Opened new WAL segment", zap.String("path", segmentPath), zap.Uint64("segmentID", lm.currentSegmentID))
 	return nil
+}
+
+func (lm *LogManager) persistReplicationSlots() error {
+	lm.slotsMtx.RLock()
+	defer lm.slotsMtx.RUnlock()
+
+	data, err := json.MarshalIndent(lm.replicationSlots, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(lm.slotsFilePath, data, 0644)
 }
 
 // AppendRecord appends a log record to the WAL.
@@ -638,6 +1006,18 @@ func (lm *LogManager) PruneWALSegments(checkpointLSN LSN) error {
 	return nil
 }
 
+// UpdateSlotLSN updates the restart LSN for a given slot.
+func (lm *LogManager) UpdateSlotLSN(slotName string, lsn LSN) {
+	lm.slotsMtx.Lock()
+	defer lm.slotsMtx.Unlock()
+	if slot, exists := lm.replicationSlots[slotName]; exists {
+		if lsn > slot.RestartLSN {
+			slot.RestartLSN = lsn
+			slot.LastHeartbeat = time.Now()
+		}
+	}
+}
+
 // archiveSegment moves a WAL segment to the archive directory.
 func (lm *LogManager) archiveSegment(segmentPath string) error {
 	if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
@@ -656,58 +1036,28 @@ func (lm *LogManager) archiveSegment(segmentPath string) error {
 	return nil
 }
 
-// GetWALReaderForStreaming returns an io.ReadCloser for streaming WAL records starting from a given LSN.
-// The caller is responsible for closing the reader.
-// This implementation needs to be ables to read across multiple segment files.
-func (lm *LogManager) GetWALReaderForStreaming(startLSN LSN, forSlotName string) (io.ReadCloser, error) {
-	lm.mu.RLock() // RLock as we are reading segments
-	defer lm.mu.RUnlock()
+func (lm *LogManager) loadReplicationSlots() error {
+	lm.slotsMtx.Lock()
+	defer lm.slotsMtx.Unlock()
 
-	slot, exists := lm.replicationSlots[forSlotName]
-	if !exists {
-		return nil, fmt.Errorf("replication slot %s not found for streaming", forSlotName)
-	}
-	if !slot.IsActive {
-		return nil, fmt.Errorf("replication slot %s is not active", forSlotName)
-	}
-	// Ensure startLSN is not older than what the slot itself requires (or its snapshot LSN)
-	// This check might be refined based on slot semantics.
-	if startLSN < slot.SnapshotLSN {
-		lm.logger.Warn("Requested stream LSN is older than slot's snapshot LSN",
-			zap.String("slot", forSlotName),
-			zap.Uint64("request_lsn", uint64(startLSN)),
-			zap.Uint64("slot_snapshot_lsn", uint64(slot.SnapshotLSN)))
-		// Depending on policy, either error out or start from slot.SnapshotLSN
-		// For now, let's allow it but log, assuming the caller knows what they're doing
-		// (e.g. a full resync after a problem).
+	data, err := os.ReadFile(lm.slotsFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // File doesn't exist yet, which is fine
+		}
+		return err
 	}
 
-	// Find the segment containing startLSN.
-	// This requires metadata about LSN ranges per segment or iterating.
-	// For now, placeholder. A real implementation needs to locate the correct starting segment and offset.
-	lm.logger.Info("WAL streaming request", zap.Uint64("startLSN", uint64(startLSN)), zap.String("slot", forSlotName))
-	// This would return a custom reader that can seamlessly transition across WAL segment files.
-	// return NewWALStreamReader(lm.walDir, startLSN, lm.logger) // Hypothetical constructor
-	return nil, fmt.Errorf("GetWALReaderForStreaming not fully implemented - requires multi-segment reading logic")
+	var slots map[string]*ReplicationSlot
+	if err := json.Unmarshal(data, &slots); err != nil {
+		return err
+	}
+
+	lm.replicationSlots = slots
+	// Mark all loaded slots as inactive initially. They become active when a replica connects.
+	for _, slot := range lm.replicationSlots {
+		slot.IsActive = false
+	}
+	lm.logger.Info("Successfully loaded replication slots", zap.Int("count", len(lm.replicationSlots)))
+	return nil
 }
-
-// Placeholder for ApplyLogRecord if LogManager itself is involved in applying replicated logs (unlikely)
-// Typically, consumers of WAL (like index managers) have their own ApplyLogRecord methods.
-// type LogType string // Already defined in your existing code, ensure it's used
-// const (
-// 	LogTypeBTree        LogType = "btree"
-// 	LogTypeInvertedIndex LogType = "inverted_index"
-// 	LogTypeSpatialIndex LogType = "spatial_index"
-// 	// ... other log types
-// )
-// func (lm *LogManager) ApplyLogRecord(lr LogRecord, logType LogType) error {
-//    return fmt.Errorf("ApplyLogRecord should be handled by specific index managers based on logType %s", logType)
-// }
-
-// TODO:
-// - Persist replication slot information.
-// - Implement robust WAL segment LSN tracking for efficient pruning and streaming.
-// - Implement WALStreamReader for multi-segment reading.
-// - Coordinate pruning with checkpointing mechanism (e.g., FSM tells LogManager about checkpoint LSNs).
-// - Add methods to query slot status for monitoring.
-// - Consider security if WAL files are directly exposed for streaming (encryption, access control).
