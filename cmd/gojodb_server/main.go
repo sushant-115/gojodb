@@ -74,7 +74,7 @@ var (
 	grpcAddr          = flag.String("grpc_addr", "127.0.0.1:8000", "gRPC bind address")
 	httpAddr          = flag.String("http_addr", "127.0.0.1:8080", "HTTP bind address for GraphQL and health checks")
 	bootstrap         = flag.Bool("bootstrap", false, "Bootstrap the Raft cluster (only for the first node)")
-	controllerAddr    = flag.String("controller_addr", "127.0.0.1:9000", "Controller address for joining Raft cluster and fetching shard map")
+	controllerAddr    = flag.String("controller_addr", "127.0.0.1:8080", "Controller address for joining Raft cluster and fetching shard map")
 	replicationAddr   = flag.String("replication_addr", "127.0.01:6000", "Port for replication data exchange between storage nodes") // Clarified purpose
 	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes")  // Clarified purpose
 	myStorageNodeID   string                                                                                                         // Set from nodeID flag

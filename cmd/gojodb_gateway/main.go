@@ -176,7 +176,7 @@ func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn,
 
 	// No valid connection in pool, create a new one
 	log.Printf("Establishing new gRPC connection to storage node %s at %s", nodeID, addr)
-	conn, err := grpc.NewClient("127.0.0.1:8000", grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
+	conn, err := grpc.NewClient("127.0.0.1:8001", grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
 	if err != nil {
 		gs.nodeConns.Put(nil) // Put nil back to signal it's unusable
 		return nil, fmt.Errorf("failed to dial storage node %s at %s: %v", nodeID, addr, err)

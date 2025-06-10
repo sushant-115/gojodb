@@ -519,7 +519,7 @@ func (f *FSM) applyAssignSlot(cmd Command) error {
 	assignment, exists := f.slotAssignments[cmd.SlotID]
 	if exists {
 		oldPrimaryNodeID = assignment.PrimaryNodeID
-		if oldPrimaryNodeID == cmd.PrimaryNodeID && mapsAreEqual(assignment.ReplicaNodes, cmd.Replicas) {
+		if oldPrimaryNodeID == cmd.PrimaryNodeID && mapContainKeys(assignment.ReplicaNodes, cmd.ReplicaNodeIDs) {
 			f.logger.Info("Slot assignment unchanged", zap.Uint64("slotID", cmd.SlotID))
 			assignment.Version++ // Still bump version for idempotency if needed, or just return
 			return nil
@@ -953,12 +953,12 @@ func (c Command) PayloadGet(key string) string {
 }
 
 // mapsAreEqual checks if two map[string]string are equal.
-func mapsAreEqual(m1, m2 map[string]string) bool {
-	if len(m1) != len(m2) {
+func mapContainKeys(m1 map[string]string, keys []string) bool {
+	if len(m1) != len(keys) {
 		return false
 	}
-	for k, v1 := range m1 {
-		if v2, ok := m2[k]; !ok || v1 != v2 {
+	for _, v := range keys {
+		if _, ok := m1[v]; !ok {
 			return false
 		}
 	}
