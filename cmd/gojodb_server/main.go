@@ -448,13 +448,18 @@ func listenForReplicationRequests() {
 	}
 	defer listener.Close()
 	zlogger.Info("Replication listener started, waiting for connections from primaries.", zap.String("address", listenAddress))
-
+	stopchan := raftFSM.ShutdownChan()
+	go func() {
+		<-stopchan
+		zlogger.Info("Shutdown signal received, closing listener...")
+		listener.Close() // This will unblock Accept()
+	}()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			// Check if the listener was closed, e.g., during shutdown
 			select {
-			case <-raftFSM.ShutdownChan(): // Assuming FSM has a shutdown channel or similar signal
+			case <-stopchan: // Assuming FSM has a shutdown channel or similar signal
 				zlogger.Info("Replication listener shutting down.")
 				return
 			default:

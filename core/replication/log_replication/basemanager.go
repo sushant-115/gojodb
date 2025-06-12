@@ -136,14 +136,14 @@ func (brm *BaseReplicationManager) streamLogs(conn net.Conn, fromLSN wal.LSN, st
 		zap.String("remoteNodeID", remoteNodeID),
 		zap.Uint64("fromLSN", uint64(fromLSN)),
 	)
-	// walReader, err := brm.LogManager.GetWALReaderForStreaming(fromLSN, remoteNodeID+"_"+string(brm.IndexType)) // Slot name convention
-	// if err != nil {
-	//  brm.Logger.Error("Failed to get WAL reader for streaming", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
-	//  conn.Close()
-	//  return
-	// }
-	// defer walReader.Close()
-	// encoder := gob.NewEncoder(conn) // Or your chosen serialization
+	walReader, err := brm.LogManager.GetWALReaderForStreaming(fromLSN, remoteNodeID+"_"+string(brm.IndexType)) // Slot name convention
+	if err != nil {
+		brm.Logger.Error("Failed to get WAL reader for streaming", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
+		conn.Close()
+		return
+	}
+	defer walReader.Close()
+	encoder := gob.NewEncoder(conn) // Or your chosen serialization
 
 	// Simulate streaming
 	ticker := time.NewTicker(1 * time.Second)
@@ -156,15 +156,18 @@ func (brm *BaseReplicationManager) streamLogs(conn net.Conn, fromLSN wal.LSN, st
 			return
 		case <-ticker.C:
 			// In a real scenario, read from walReader and send:
-			// var lr wal.LogRecord
-			// if err := gob.NewDecoder(walReader).Decode(&lr); err != nil { ... handle ... }
-			// if err := encoder.Encode(lr); err != nil { ... handle ... }
-			brm.Logger.Debug("Simulating sending a log record heartbeat", zap.String("remoteNodeID", remoteNodeID))
+			var lr wal.LogRecord
+			if err := walReader.Next(&lr); err != nil {
+				brm.Logger.Debug("Failed to get the log record from WAL stream", zap.String("remoteNodeID", remoteNodeID))
+			}
+			if err := encoder.Encode(lr); err != nil {
+				brm.Logger.Debug("Failed to get the log record from WAL stream", zap.String("remoteNodeID", remoteNodeID))
+			}
+			brm.Logger.Debug("sending a log record", zap.String("remoteNodeID", remoteNodeID))
 			// Send a heartbeat or NoOp if connection is idle for too long
-			encoder := gob.NewEncoder(conn)
-			heartbeatRecord := wal.LogRecord{Type: wal.LogRecordTypeNoOp, Timestamp: time.Now().UnixNano()}
-			if err := encoder.Encode(heartbeatRecord); err != nil {
-				brm.Logger.Error("Failed to send heartbeat log record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
+			// encoder := gob.NewEncoder(conn)
+			if err := encoder.Encode(lr); err != nil {
+				brm.Logger.Error("Failed to send log record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
 				conn.Close()
 				return
 			}

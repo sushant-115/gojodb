@@ -30,7 +30,7 @@ const (
 )
 
 var (
-	encryptionKey = []byte("SOMEKEY")
+	encryptionKey = []byte("SOMEKEY1SOMEKEY1")
 )
 
 type LSN uint64
@@ -123,6 +123,7 @@ type LogManager struct {
 
 	// Replication Slots Management
 	replicationSlots map[string]*ReplicationSlot // Key: SlotName
+	shutdownCh       chan struct{}
 }
 
 // WALStreamReader provides an interface for reading from the WAL across multiple segments.
@@ -171,6 +172,7 @@ func NewLogManager(walDir string) (*LogManager, error) {
 		logger:           logger.Named("log_manager"),
 		replicationSlots: make(map[string]*ReplicationSlot),
 		cryptoUtil:       crypto,
+		shutdownCh:       make(chan struct{}),
 	}
 
 	lm.cond = sync.NewCond(&lm.mtx)
@@ -196,10 +198,14 @@ func (lm *LogManager) runPruningLoop() {
 	time.Sleep(1 * time.Minute)
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-
+	lm.pruneOldSegments()
 	for {
-		lm.pruneOldSegments()
-		<-ticker.C
+		select {
+		case <-ticker.C:
+			lm.pruneOldSegments()
+		case <-lm.shutdownCh:
+			return
+		}
 	}
 }
 
@@ -326,14 +332,14 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 			err := r.decoder.Decode(logRecord)
 			if err == nil {
 				// Successfully decoded a record
-				// if r.logManager.cryptoUtil != nil {
-				// 	decryptedPayload, decryptErr := r.logManager.cryptoUtil.Decrypt(logRecord.Payload)
-				// 	if decryptErr != nil {
-				// 		r.logManager.logger.Error("Failed to decrypt log payload", zap.Error(decryptErr), zap.Uint64("lsn", uint64(logRecord.LSN)))
-				// 		return fmt.Errorf("failed to decrypt log record at LSN %d: %w", logRecord.LSN, decryptErr)
-				// 	}
-				// 	logRecord.Payload = decryptedPayload
-				// }
+				if r.logManager.cryptoUtil != nil {
+					decryptedPayload, decryptErr := r.logManager.cryptoUtil.Decrypt(logRecord.Data)
+					if decryptErr != nil {
+						r.logManager.logger.Error("Failed to decrypt log payload", zap.Error(decryptErr), zap.Uint64("lsn", uint64(logRecord.LSN)))
+						return fmt.Errorf("failed to decrypt log record at LSN %d: %w", logRecord.LSN, decryptErr)
+					}
+					logRecord.Data = decryptedPayload
+				}
 
 				// Update slot progress
 				r.logManager.UpdateSlotLSN(r.slotName, logRecord.LSN+1)
@@ -486,7 +492,7 @@ func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
 }
 
 func (r *WALStreamReader) openSegment(segmentID int) error {
-	filePath := filepath.Join(r.logManager.walDir, fmt.Sprintf("%s%d%s", walFilePrefix, segmentID, walFileSuffix))
+	filePath := filepath.Join(r.logManager.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segmentID, walFileSuffix))
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("could not open WAL segment %d for streaming: %w", segmentID, err)
