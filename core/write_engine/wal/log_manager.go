@@ -492,6 +492,7 @@ func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
 }
 
 func (r *WALStreamReader) openSegment(segmentID int) error {
+	segmentID = -1 * segmentID
 	filePath := filepath.Join(r.logManager.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segmentID, walFileSuffix))
 	file, err := os.Open(filePath)
 	if err != nil {

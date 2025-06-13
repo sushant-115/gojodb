@@ -99,6 +99,7 @@ type StorageNodeInfo struct {
 	ShardsReplicating map[uint64]string `json:"shards_replicating"` // Slots this node replicates, value is primaryNodeID
 	Capacity          NodeCapacityInfo  `json:"capacity"`           // Disk space, CPU, etc.
 	RegisteredAt      time.Time         `json:"registered_at"`
+	GrpcAddr          string            `json:"grpc_addr"`
 }
 type NodeCapacityInfo struct { /* ... */
 }
@@ -421,6 +422,14 @@ func (f *FSM) GetNodeAddresses() map[string]string {
 	return nodeAddresses
 }
 
+func (f *FSM) GetNodeGrpcAddresses() map[string]string {
+	nodeAddresses := make(map[string]string)
+	for node, nodeInfo := range f.storageNodes {
+		nodeAddresses[node] = nodeInfo.GrpcAddr
+	}
+	return nodeAddresses
+}
+
 func (f *FSM) GetSlotAssignments() map[uint64]SlotAssignment {
 	slotAssignments := make(map[uint64]SlotAssignment)
 	for slot, slotInfo := range f.slotAssignments {
@@ -455,6 +464,7 @@ func (f *FSM) applyRegisterNode(cmd Command) error {
 		f.storageNodes[cmd.NodeID].RaftAddr = cmd.NodeAddr
 		f.storageNodes[cmd.NodeID].APIAddr = cmd.PayloadGet("api_addr")                 // Assuming API addr is in payload
 		f.storageNodes[cmd.NodeID].ReplicationAddr = cmd.PayloadGet("replication_addr") // Assuming Replication addr is in payload
+		f.storageNodes[cmd.NodeID].GrpcAddr = cmd.PayloadGet("grpc_addr")               // Assuming Replication addr is in payload
 		f.storageNodes[cmd.NodeID].LastHeartbeat = time.Now()
 		f.storageNodes[cmd.NodeID].Status = "healthy" // Or from payload
 		return nil

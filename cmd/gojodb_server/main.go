@@ -264,7 +264,7 @@ func initStorageNode() error {
 	indexReplicationManagers = make(map[logreplication.IndexType]logreplication.ReplicationManagerInterface)
 
 	// B-tree Replication Manager (uses the main logManager)
-	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, dbPath)
+	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, baseDataDir)
 	indexReplicationManagers[logreplication.BTreeIndexType] = bTreeRepMgr
 	zlogger.Info("B-tree Replication Manager initialized")
 
@@ -410,6 +410,7 @@ func sendHeartBeats(stopChan chan struct{}) {
 		"nodeId":           *nodeID,
 		"address":          *httpAddr,
 		"replication_addr": *replicationAddr,
+		"grpc_addr":        *grpcAddr,
 	}
 
 	// Convert to JSON
@@ -417,7 +418,7 @@ func sendHeartBeats(stopChan chan struct{}) {
 	if err != nil {
 		panic(err)
 	}
-	heartbeatPath := fmt.Sprintf("http://%s/heartbeat?nodeId=%s&address=%s&replication_addr=%s", *heartbeatAddr, *nodeID, *httpAddr, *replicationAddr)
+	heartbeatPath := fmt.Sprintf("http://%s/heartbeat?nodeId=%s&address=%s&replication_addr=%s&grpc_addr=%s", *heartbeatAddr, *nodeID, *httpAddr, *replicationAddr, *grpcAddr)
 
 	for {
 		select {

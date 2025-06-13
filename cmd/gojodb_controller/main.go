@@ -91,6 +91,7 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("nodeId")
 	address := r.URL.Query().Get("address") // gRPC address of the storage node
 	replicationAddr := r.URL.Query().Get("replication_addr")
+	grpcAddr := r.URL.Query().Get("grpc_addr")
 	log.Print("Received heartbeat: ", nodeID, address)
 	if nodeID == "" || address == "" {
 		http.Error(w, "nodeId and address are required", http.StatusBadRequest)
@@ -105,7 +106,7 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	c.storageNodeInfoMutex.Unlock()
 
-	rawMessage := fmt.Sprintf(`{"status":"active", "replication_addr": "%s"}`, replicationAddr)
+	rawMessage := fmt.Sprintf(`{"status":"active", "replication_addr": "%s", "grpc_addr": "%s"}`, replicationAddr, grpcAddr)
 
 	// Submit a command to Raft FSM to update node status and address
 	cmd := fsm.Command{
@@ -345,12 +346,14 @@ func (c *Controller) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 func (c *Controller) handleStatus(w http.ResponseWriter, r *http.Request) {
 	nodeStatuses := c.fsm.GetNodeStatuses()
 	nodeAddresses := c.fsm.GetNodeAddresses()
+	nodeGrpcAddresses := c.fsm.GetNodeGrpcAddresses()
 	slotAssignments := c.fsm.GetSlotAssignments()
 	onboardingStates := c.fsm.GetReplicaOnboardingStates()
 	migrationStates := c.fsm.GetShardMigrationStates()
 
 	activeNodesInfo := make(map[string]struct {
 		Address       string `json:"address"`
+		GrpcAddress   string `json:"grpc_addr"`
 		Status        string `json:"status"`
 		LastHeartbeat string `json:"last_heartbeat"`
 	})
@@ -364,11 +367,13 @@ func (c *Controller) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 		activeNodesInfo[nodeID] = struct {
 			Address       string `json:"address"`
+			GrpcAddress   string `json:"grpc_addr"`
 			Status        string `json:"status"`
 			LastHeartbeat string `json:"last_heartbeat"`
 		}{
-			Address: address, // This is directly from FSM
-			Status:  status,  // This is directly from FSM
+			Address:     address, // This is directly from FSM
+			GrpcAddress: nodeGrpcAddresses[nodeID],
+			Status:      status, // This is directly from FSM
 			LastHeartbeat: func() string {
 				if heartbeatFound {
 					return lastHeartbeat.Format(time.RFC3339)
@@ -398,6 +403,7 @@ func (c *Controller) handleStatus(w http.ResponseWriter, r *http.Request) {
 		RaftPeers   []raft.Server `json:"raft_peers"`
 		ActiveNodes map[string]struct {
 			Address       string `json:"address"`
+			GrpcAddress   string `json:"grpc_addr"`
 			Status        string `json:"status"`
 			LastHeartbeat string `json:"last_heartbeat"`
 		} `json:"active_nodes"`
@@ -551,12 +557,13 @@ func (c *Controller) handleAdminRegisterStorageNode(w http.ResponseWriter, r *ht
 		NodeID          string `json:"nodeId"`
 		Address         string `json:"address"`
 		ReplicationAddr string `json:"replication_addr"`
+		GrpcAddr        string `json:"grpc_addr"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
 		return
 	}
-	payload := fmt.Sprintf(`{"status": "registered", "replication_addr": "%s"}`, req.ReplicationAddr)
+	payload := fmt.Sprintf(`{"status": "registered", "replication_addr": "%s", "grpc_addr", "%s"}`, req.ReplicationAddr, req.GrpcAddr)
 
 	cmd := fsm.Command{
 		Type:     fsm.CommandRegisterNode,

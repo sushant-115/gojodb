@@ -28,7 +28,7 @@ const (
 	// DefaultGatewayPort is the port on which the GojoDB Gateway listens.
 	DefaultGatewayPort = ":50051"
 	// DefaultControllerAddr is the default address of the GojoDB Controller.
-	DefaultControllerAddr = "localhost:8080"
+	DefaultControllerAddr = "localhost:8083"
 	// ShardMapUpdateInterval is the interval at which the gateway polls the controller for shard map updates.
 	ShardMapUpdateInterval = 5 * time.Second
 	// NumShardSlots defines the total number of hash slots for sharding.
@@ -128,7 +128,8 @@ func (gs *GatewayService) monitorControllerCluster() {
 
 			var clusterStatus struct {
 				ActiveNodes map[string]struct {
-					Address string `json:"address"`
+					Address  string `json:"address"`
+					GrpcAddr string `json:"grpc_addr"`
 					// ... other fields not used here
 				} `json:"active_nodes"`
 				// ... other fields not used here
@@ -140,7 +141,7 @@ func (gs *GatewayService) monitorControllerCluster() {
 
 			updatedNodeAddresses := make(map[string]string)
 			for nodeID, nodeInfo := range clusterStatus.ActiveNodes {
-				updatedNodeAddresses[nodeID] = nodeInfo.Address
+				updatedNodeAddresses[nodeID] = nodeInfo.GrpcAddr
 			}
 
 			gs.mu.Lock()
@@ -176,7 +177,7 @@ func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn,
 
 	// No valid connection in pool, create a new one
 	log.Printf("Establishing new gRPC connection to storage node %s at %s", nodeID, addr)
-	conn, err := grpc.NewClient("127.0.0.1:8001", grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
+	conn, err := grpc.NewClient(addr, grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
 	if err != nil {
 		gs.nodeConns.Put(nil) // Put nil back to signal it's unusable
 		return nil, fmt.Errorf("failed to dial storage node %s at %s: %v", nodeID, addr, err)
