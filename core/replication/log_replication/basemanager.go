@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"            // Added for file operations in snapshotting
 	"path/filepath" // Added for file path manipulation
+	"strings"
 	"sync"
 	"time"
 
@@ -128,92 +129,131 @@ func (brm *BaseReplicationManager) sendHandshake(conn net.Conn) error {
 }
 
 // streamLogs ... (existing method, ensure it's robust)
-func (brm *BaseReplicationManager) streamLogs(conn net.Conn, fromLSN wal.LSN, stopChan chan struct{}, wg *sync.WaitGroup, remoteNodeID string) {
-	// ... (ensure this uses a proper WALStreamReader from LogManager and handles errors gracefully) ...
-	// This function needs significant enhancement based on LogManager's GetWALReaderForStreaming
+func (brm *BaseReplicationManager) streamLogs(
+	conn net.Conn,
+	fromLSN wal.LSN,
+	stopChan chan struct{},
+	wg *sync.WaitGroup,
+	remoteNodeID string,
+) {
 	defer wg.Done()
-	brm.Logger.Info("Starting log stream (placeholder implementation)",
+
+	var closeOnce sync.Once
+	closeConn := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+		})
+	}
+	defer closeConn()
+
+	brm.Logger.Info("Starting log stream",
 		zap.String("remoteNodeID", remoteNodeID),
 		zap.Uint64("fromLSN", uint64(fromLSN)),
 	)
-	walReader, err := brm.LogManager.GetWALReaderForStreaming(fromLSN, remoteNodeID+"_"+string(brm.IndexType)) // Slot name convention
+
+	walReader, err := brm.LogManager.GetWALReaderForStreaming(fromLSN, remoteNodeID+"_"+string(brm.IndexType))
 	if err != nil {
 		brm.Logger.Error("Failed to get WAL reader for streaming", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
-		conn.Close()
 		return
 	}
 	defer walReader.Close()
-	encoder := gob.NewEncoder(conn) // Or your chosen serialization
 
-	// Simulate streaming
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	go func() {
+		<-stopChan
+		brm.Logger.Info("Stopping log stream due to stop signal", zap.String("remoteNodeID", remoteNodeID))
+		walReader.Close()
+		closeConn()
+	}()
+
+	encoder := gob.NewEncoder(conn)
+
 	for {
-		select {
-		case <-stopChan:
-			brm.Logger.Info("Stopping log stream due to stop signal", zap.String("remoteNodeID", remoteNodeID))
-			conn.Close()
+		var lr wal.LogRecord
+		err := walReader.Next(&lr)
+		if err != nil {
+			if err != io.EOF {
+				brm.Logger.Error("Failed to get next log record from WAL stream", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
+			}
 			return
-		case <-ticker.C:
-			// In a real scenario, read from walReader and send:
-			var lr wal.LogRecord
-			if err := walReader.Next(&lr); err != nil {
-				brm.Logger.Debug("Failed to get the log record from WAL stream", zap.String("remoteNodeID", remoteNodeID))
-			}
-			if err := encoder.Encode(lr); err != nil {
-				brm.Logger.Debug("Failed to get the log record from WAL stream", zap.String("remoteNodeID", remoteNodeID))
-			}
-			brm.Logger.Debug("sending a log record", zap.String("remoteNodeID", remoteNodeID))
-			// Send a heartbeat or NoOp if connection is idle for too long
-			// encoder := gob.NewEncoder(conn)
-			if err := encoder.Encode(lr); err != nil {
-				brm.Logger.Error("Failed to send log record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
-				conn.Close()
-				return
-			}
+		}
 
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		err = encoder.Encode(lr)
+		conn.SetWriteDeadline(time.Time{}) // Clear deadline
+
+		if err != nil {
+			brm.Logger.Error("Failed to send log record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
+			return
 		}
 	}
 }
 
-// receiveAndApplyLogs ... (existing method, ensure it's robust)
-func (brm *BaseReplicationManager) receiveAndApplyLogs(conn net.Conn, stopChan chan struct{}, wg *sync.WaitGroup, applyFn func(wal.LogRecord) error) {
-	// ... (ensure robust error handling, read deadlines, etc.) ...
+func (brm *BaseReplicationManager) receiveAndApplyLogs(
+	conn net.Conn,
+	stopChan chan struct{},
+	wg *sync.WaitGroup,
+	applyFn func(wal.LogRecord) error,
+) {
 	defer wg.Done()
+
+	var closeOnce sync.Once
+	closeConn := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+		})
+	}
+	defer closeConn()
+
 	decoder := gob.NewDecoder(conn)
-	brm.Logger.Info("Starting to receive logs (placeholder implementation)",
-		zap.String("fromPrimary", conn.RemoteAddr().String()),
-	)
+	brm.Logger.Info("Starting to receive logs", zap.String("fromPrimary", conn.RemoteAddr().String()))
+
+	type decodeResult struct {
+		lr  wal.LogRecord
+		err error
+	}
+	decodeChan := make(chan decodeResult)
+
+	// Start decoding in a separate goroutine
+	go func() {
+		for {
+			var lr wal.LogRecord
+			err := decoder.Decode(&lr)
+
+			select {
+			case <-stopChan:
+				return
+			case decodeChan <- decodeResult{lr, err}:
+			}
+
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-stopChan:
 			brm.Logger.Info("Stopping log reception due to stop signal", zap.String("fromPrimary", conn.RemoteAddr().String()))
-			conn.Close()
 			return
-		default:
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second)) // Read deadline
-			var lr wal.LogRecord
-			err := decoder.Decode(&lr)
-			conn.SetReadDeadline(time.Time{}) // Clear deadline
 
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue // Timeout, check stopChan
-				}
-				if err == io.EOF {
+		case result := <-decodeChan:
+			if result.err != nil {
+				if result.err == io.EOF {
 					brm.Logger.Info("Primary closed replication connection (EOF)", zap.String("fromPrimary", conn.RemoteAddr().String()))
-				} else {
-					brm.Logger.Error("Failed to decode log record from primary", zap.Error(err), zap.String("fromPrimary", conn.RemoteAddr().String()))
+				} else if !strings.Contains(result.err.Error(), "use of closed network connection") {
+					brm.Logger.Error("Failed to decode log record from primary", zap.Error(result.err), zap.String("fromPrimary", conn.RemoteAddr().String()))
 				}
-				conn.Close()
 				return
 			}
-			if lr.Type == wal.LogRecordTypeNoOp { // Handle heartbeats
+
+			if result.lr.Type == wal.LogRecordTypeNoOp {
 				brm.Logger.Debug("Received heartbeat log record", zap.String("fromPrimary", conn.RemoteAddr().String()))
 				continue
 			}
-			if applyErr := applyFn(lr); applyErr != nil {
-				brm.Logger.Error("Failed to apply log record", zap.Error(applyErr), zap.Any("logRecordLSN", lr.LSN))
+
+			if err := applyFn(result.lr); err != nil {
+				brm.Logger.Error("Failed to apply log record", zap.Error(err), zap.Any("logRecordLSN", result.lr.LSN))
 			}
 		}
 	}

@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log" // Standard log, consider replacing all with zap eventually
 	"net"
 	"net/http"
@@ -425,13 +424,13 @@ func sendHeartBeats(stopChan chan struct{}) {
 		case <-stopChan:
 			return
 		case <-ticker.C:
-			resp, err := http.Post(heartbeatPath, "application/json", bytes.NewBuffer(jsonData))
+			_, err := http.Post(heartbeatPath, "application/json", bytes.NewBuffer(jsonData))
 			if err != nil {
 				zlogger.Warn("Failed to send heartbeat: ", zap.Error(err), zap.String("heartbeartAddr", *heartbeatAddr))
 				continue
 			}
-			body, _ := ioutil.ReadAll(resp.Body)
-			log.Println("Heartbeat response: ", string(body), heartbeatPath)
+			//body, _ := ioutil.ReadAll(resp.Body)
+			//log.Println("Heartbeat response: ", string(body), heartbeatPath)
 			//zlogger.Warn("Sent heartbeat: ", zap.String("heartbeartAddr", *heartbeatAddr))
 		}
 	}
