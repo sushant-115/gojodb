@@ -6,7 +6,6 @@ import (
 	"encoding/hex" // For checksums
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"            // Added for file operations in snapshotting
 	"path/filepath" // Added for file path manipulation
@@ -250,7 +249,7 @@ func (brm *BaseReplicationManager) receiveAndApplyLogs(
 			return
 
 		case result := <-decodeChan:
-			log.Println("DECODE RESULT: ", result)
+			//log.Println("DECODE RESULT: ", result)
 			if result.err != nil {
 				if result.err == io.EOF {
 					brm.Logger.Info("Primary closed replication connection (EOF)", zap.String("fromPrimary", conn.RemoteAddr().String()))
