@@ -485,29 +485,45 @@ func handleReplicationConnection(conn net.Conn) {
 	defer conn.Close()    // Ensure connection is closed
 
 	// Read the first message to determine the IndexType for handshake
-	if err := conn.SetReadDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
-		zlogger.Warn("Failed to set read deadline for handshake", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
-		// Continue, but handshake might fail due to other reasons
+	// Set a deadline for the entire handshake process to prevent connections from hanging.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		zlogger.Error("Failed to set read deadline for handshake", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
+		return
 	}
 
-	buffer := make([]byte, 128) // Buffer for IndexType string
-	n, err := conn.Read(buffer)
-	if err != nil {
-		if err == io.EOF {
-			zlogger.Info("Replication connection closed by remote before handshake", zap.String("remoteAddr", conn.RemoteAddr().String()))
+	// 1. Read the length of the handshake message (1 byte).
+	//    This tells us how many bytes to read for the index type string.
+	lenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			zlogger.Info("Replication connection closed by remote during handshake (reading length)", zap.String("remoteAddr", conn.RemoteAddr().String()))
 		} else {
-			zlogger.Error("Failed to read handshake from replication connection", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
+			zlogger.Error("Failed to read handshake length from replication connection", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
 		}
 		return
 	}
-	if err := conn.SetReadDeadline(time.Time{}); err != nil { // Clear the deadline
+	handshakeLen := int(lenBuf[0])
+
+	// 2. Read the handshake message body based on the received length.
+	//    Using io.ReadFull ensures we get the exact number of bytes or an error.
+	handshakeBuf := make([]byte, handshakeLen)
+	if _, err := io.ReadFull(conn, handshakeBuf); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			zlogger.Info("Replication connection closed by remote during handshake (reading body)", zap.String("remoteAddr", conn.RemoteAddr().String()))
+		} else {
+			zlogger.Error("Failed to read handshake body from replication connection", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
+		}
+		return
+	}
+
+	// 3. Clear the read deadline as the handshake is complete and we move to streaming.
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		zlogger.Warn("Failed to clear read deadline after handshake", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
 	}
 
-	indexTypeStr := string(buffer[:n])
+	indexTypeStr := string(handshakeBuf)
 	indexType := logreplication.IndexType(indexTypeStr)
-	zlogger.Info("Received replication handshake", zap.String("indexType", indexTypeStr), zap.String("from", conn.RemoteAddr().String()))
-
+	log.Println("INDEXTYPE: ", indexTypeStr, indexType)
 	// Find the appropriate replication manager
 	repMgr, ok := indexReplicationManagers[indexType]
 	if !ok {

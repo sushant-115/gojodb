@@ -6,6 +6,7 @@ import (
 	"encoding/hex" // For checksums
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"            // Added for file operations in snapshotting
 	"path/filepath" // Added for file path manipulation
@@ -117,12 +118,23 @@ func (brm *BaseReplicationManager) GetIndexType() IndexType {
 
 // sendHandshake ... (existing method)
 func (brm *BaseReplicationManager) sendHandshake(conn net.Conn) error {
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second)) // Add deadline for handshake
-	_, err := conn.Write([]byte(brm.IndexType))
-	conn.SetWriteDeadline(time.Time{}) // Clear deadline
-	if err != nil {
-		brm.Logger.Error("Failed to send handshake", zap.Error(err), zap.String("remoteAddr", conn.RemoteAddr().String()))
-		return err
+	brm.Logger.Debug("Sending handshake", zap.String("indexType", string(brm.IndexType)))
+	indexTypeBytes := []byte(brm.IndexType)
+
+	// Ensure index type name is not too long for a single byte length prefix
+	if len(indexTypeBytes) > 255 {
+		return fmt.Errorf("index type name is too long for handshake: %d bytes", len(indexTypeBytes))
+	}
+
+	// 1. Write the length of the upcoming indexType string as a single byte.
+	lenByte := byte(len(indexTypeBytes))
+	if _, err := conn.Write([]byte{lenByte}); err != nil {
+		return fmt.Errorf("failed to write handshake length: %w", err)
+	}
+
+	// 2. Write the actual indexType string.
+	if _, err := conn.Write(indexTypeBytes); err != nil {
+		return fmt.Errorf("failed to write handshake body: %w", err)
 	}
 	brm.Logger.Info("Sent handshake", zap.String("indexType", string(brm.IndexType)), zap.String("remoteAddr", conn.RemoteAddr().String()))
 	return nil
@@ -238,6 +250,7 @@ func (brm *BaseReplicationManager) receiveAndApplyLogs(
 			return
 
 		case result := <-decodeChan:
+			log.Println("DECODE RESULT: ", result)
 			if result.err != nil {
 				if result.err == io.EOF {
 					brm.Logger.Info("Primary closed replication connection (EOF)", zap.String("fromPrimary", conn.RemoteAddr().String()))

@@ -118,7 +118,7 @@ func (brm *BTreeReplicationManager) HandleInboundStream(conn net.Conn) error {
 	// The BaseReplicationManager's receiveAndApplyLogs can be used if it's generic enough.
 	// We pass brm.ApplyLogRecord as the function to apply decoded logs.
 	brm.wg.Add(1)
-	go brm.receiveAndApplyLogs(conn, brm.stopChan, &brm.wg, brm.ApplyLogRecord) // stopChan from BaseReplicationManager
+	brm.receiveAndApplyLogs(conn, brm.stopChan, &brm.wg, brm.ApplyLogRecord) // stopChan from BaseReplicationManager
 
 	// Note: The ReplicaConnectionInfo for this primary connection should be managed
 	// by BecomeReplicaForSlot method when the FSM dictates this node is a replica.

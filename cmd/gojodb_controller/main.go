@@ -192,7 +192,7 @@ func (c *Controller) forwardRaftCommandToLeader(cmd fsm.Command) error {
 // applyCommand submits a command to the Raft leader.
 func (c *Controller) applyCommand(cmd fsm.Command) error {
 	if c.raft.State() != raft.Leader {
-		log.Println("Can't apply command not leader, forwarding it to leader: ", c.leaderControllerAddr)
+		//log.Println("Can't apply command not leader, forwarding it to leader: ", c.leaderControllerAddr)
 		if err := c.forwardRaftCommandToLeader(cmd); err != nil {
 			return fmt.Errorf("failed to forward the apply command to leader %s , error: %v", c.leaderControllerAddr, err)
 		}
