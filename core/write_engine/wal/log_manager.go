@@ -412,14 +412,14 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 			// TODO: Optionally validate CRC here against recordData[:offset]
 
 			// Step 4: Decrypt payload if encryption is enabled.
-			if r.logManager.cryptoUtil != nil {
-				decryptedPayload, decryptErr := r.logManager.cryptoUtil.Decrypt(logRecord.Data)
-				if decryptErr != nil {
-					r.logManager.logger.Error("Failed to decrypt log payload", zap.Error(decryptErr), zap.Uint64("lsn", uint64(logRecord.LSN)))
-					return fmt.Errorf("failed to decrypt log record at LSN %d: %w", logRecord.LSN, decryptErr)
-				}
-				logRecord.Data = decryptedPayload
-			}
+			// if r.logManager.cryptoUtil != nil {
+			// 	decryptedPayload, decryptErr := r.logManager.cryptoUtil.Decrypt(logRecord.Data)
+			// 	if decryptErr != nil {
+			// 		r.logManager.logger.Error("Failed to decrypt log payload", zap.Error(decryptErr), zap.Uint64("lsn", uint64(logRecord.LSN)))
+			// 		return fmt.Errorf("failed to decrypt log record at LSN %d: %w", logRecord.LSN, decryptErr)
+			// 	}
+			// 	logRecord.Data = decryptedPayload
+			// }
 			log.Println("LOG RECORD: ", logRecord)
 			// Step 5: Update the replication slot's progress.
 			r.logManager.UpdateSlotLSN(r.slotName, logRecord.LSN+1)

@@ -28,7 +28,7 @@ const (
 	// DefaultGatewayPort is the port on which the GojoDB Gateway listens.
 	DefaultGatewayPort = ":50051"
 	// DefaultControllerAddr is the default address of the GojoDB Controller.
-	DefaultControllerAddr = "localhost:8083"
+	DefaultControllerAddr = "localhost:8080"
 	// ShardMapUpdateInterval is the interval at which the gateway polls the controller for shard map updates.
 	ShardMapUpdateInterval = 5 * time.Second
 	// NumShardSlots defines the total number of hash slots for sharding.
