@@ -3,7 +3,6 @@ package wal
 import (
 	"bufio"
 	"encoding/binary"
-	"log"
 
 	// "encoding/gob" // No longer needed for WALStreamReader
 	"encoding/json"
@@ -144,7 +143,7 @@ type WALStreamReader struct {
 }
 
 // NewLogManager creates or opens a LogManager for the given directory.
-func NewLogManager(walDir string) (*LogManager, error) {
+func NewLogManager(walDir string, logger *zap.Logger) (*LogManager, error) {
 	if err := os.MkdirAll(walDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory %s: %w", walDir, err)
 	}
@@ -164,7 +163,7 @@ func NewLogManager(walDir string) (*LogManager, error) {
 	}
 
 	// Initialize logger (ideally passed in, but creating a default one for now)
-	logger, _ := zap.NewDevelopment() // TODO: Pass logger as argument
+	//logger, _ := zap.NewDevelopment() // TODO: Pass logger as argument
 
 	lm := &LogManager{
 		walDir:           walDir,
@@ -277,7 +276,6 @@ func (lm *LogManager) pruneOldSegments() {
 // GetWALReaderForStreaming creates a new WALStreamReader for a given replication slot.
 // It creates the slot if it doesn't exist.
 func (lm *LogManager) GetWALReaderForStreaming(fromLSN LSN, slotName string) (*WALStreamReader, error) {
-	log.Println("GETWAL: ", fromLSN, slotName)
 	lm.slotsMtx.Lock()
 	slot, exists := lm.replicationSlots[slotName]
 
@@ -420,7 +418,6 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 			// 	}
 			// 	logRecord.Data = decryptedPayload
 			// }
-			log.Println("LOG RECORD: ", logRecord)
 			// Step 5: Update the replication slot's progress.
 			r.logManager.UpdateSlotLSN(r.slotName, logRecord.LSN+1)
 			return nil
@@ -518,7 +515,6 @@ func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
 		}
 
 		currentLSN := LSN(binary.LittleEndian.Uint64(recordData[0:8]))
-		log.Println("CURRENT LSN: ", currentLSN, lsn)
 		if currentLSN >= lsn {
 			// We found the record we need to start at (or the one just after it).
 			// Seek back to the beginning of this record so Next() can read it.

@@ -42,6 +42,7 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	// Protobufs (ensure these paths are correct for your project structure)
 	// Assuming a common proto package
@@ -104,7 +105,8 @@ func main() {
 
 	var err error
 	// Initialize logger
-	zlogger, err = zap.NewDevelopment() // Or zap.NewProduction() for structured logging
+
+	zlogger = NewErrorLevelLogger() // Or zap.NewProduction() for structured logging
 	if err != nil {
 		log.Fatalf("CRITICAL: Can't initialize zap logger: %v", err)
 	}
@@ -126,7 +128,7 @@ func main() {
 	)
 
 	// Initialize database components
-	if err := initStorageNode(); err != nil {
+	if err := initStorageNode(zlogger); err != nil {
 		zlogger.Fatal("CRITICAL: Failed to initialize storage node", zap.Error(err))
 	}
 
@@ -159,7 +161,26 @@ func main() {
 	zlogger.Info("GojoDB storage node shut down gracefully.")
 }
 
-func initStorageNode() error {
+func NewErrorLevelLogger() *zap.Logger {
+	// Set log level to ERROR
+	level := zap.NewAtomicLevelAt(zapcore.ErrorLevel)
+
+	// Configure encoder (console or JSON)
+	encoderCfg := zap.NewProductionEncoderConfig()
+	encoderCfg.TimeKey = "timestamp"
+	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+
+	// Create core with stderr output and error level
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(encoderCfg), // or zapcore.NewJSONEncoder
+		zapcore.Lock(zapcore.AddSync(os.Stderr)),
+		level,
+	)
+
+	return zap.New(core, zap.AddCaller())
+}
+
+func initStorageNode(logger *zap.Logger) error {
 	zlogger.Info("Initializing storage components...")
 	var err error
 
@@ -174,7 +195,7 @@ func initStorageNode() error {
 	if err := os.MkdirAll(walPath, 0750); err != nil {
 		return fmt.Errorf("failed to create WAL directory %s: %w", walPath, err)
 	}
-	logManager, err = wal.NewLogManager(walPath)
+	logManager, err = wal.NewLogManager(walPath, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create main log manager: %w", err)
 	}
@@ -219,7 +240,7 @@ func initStorageNode() error {
 	// For replication, it should ideally manage its own WAL file stream or use distinct log types in a shared WAL.
 	// Assuming it uses the main logManager for now for its WAL records relevant to replication.
 	// If it has its OWN WAL that needs replicating, its GetLogManager() should return that.
-	invertedIndexInstance, err = inverted_index.NewInvertedIndex(invertedIndexDBPath, invertedIndexLogPath, invertedIndexArchiveLogPath) // Pass main logManager
+	invertedIndexInstance, err = inverted_index.NewInvertedIndex(invertedIndexDBPath, invertedIndexLogPath, invertedIndexArchiveLogPath, logger.Named("inverted_index")) // Pass main logManager
 	if err != nil {
 		return fmt.Errorf("failed to create inverted index instance: %w", err)
 	}
@@ -237,11 +258,11 @@ func initStorageNode() error {
 	if err := os.MkdirAll(spatialLogManagerPath, 0750); err != nil {
 		return fmt.Errorf("failed to create spatial WAL directory %s: %w", spatialLogManagerPath, err)
 	}
-	spatialLm, err := wal.NewLogManager(spatialLogManagerPath) // Spatial index gets its own WAL
+	spatialLm, err := wal.NewLogManager(spatialLogManagerPath, logger) // Spatial index gets its own WAL
 	if err != nil {
 		return fmt.Errorf("failed to create spatial log manager: %w", err)
 	}
-	spatialIdx, err = spatial.NewSpatialIndexManager(spatialLogManagerPath, spatialIndexDBPath, 10, 4096) // Pass path and its own LM
+	spatialIdx, err = spatial.NewSpatialIndexManager(spatialLogManagerPath, spatialIndexDBPath, 10, 4096, logger.Named("spatial_index")) // Pass path and its own LM
 	if err != nil {
 		return fmt.Errorf("failed to create spatial index instance: %w", err)
 	}

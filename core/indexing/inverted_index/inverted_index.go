@@ -17,6 +17,7 @@ import (
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"go.uber.org/zap"
 )
 
 const (
@@ -80,7 +81,7 @@ type InvertedIndex struct {
 
 // NewInvertedIndex creates and initializes a new InvertedIndex.
 // It sets up disk-backed storage for postings lists and a term dictionary.
-func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, error) {
+func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (*InvertedIndex, error) {
 	idx := &InvertedIndex{
 		termDictionary: make(map[string]PostingsListMetadata),
 		filePath:       filePath,
@@ -90,7 +91,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string) (*InvertedIndex, erro
 
 	// 1. Initialize LogManager for the inverted index
 	var err error
-	idx.lm, err = wal.NewLogManager(logDir)
+	idx.lm, err = wal.NewLogManager(logDir, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for inverted index: %w", err)
 	}

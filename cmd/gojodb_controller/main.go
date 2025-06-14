@@ -120,7 +120,7 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to apply raft command: "+err.Error(), http.StatusBadRequest)
 	}
 
-	w.WriteHeader(http.StatusOK)
+	//w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Heartbeat received"))
 }
 

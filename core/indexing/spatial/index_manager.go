@@ -13,6 +13,7 @@ import (
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"go.uber.org/zap"
 )
 
 const (
@@ -100,10 +101,10 @@ type SpatialIndexManager struct {
 // }
 
 func NewSpatialIndexManager(uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath string,
-	logBufferSize, dbPageSize int,
+	logBufferSize, dbPageSize int, logger *zap.Logger,
 ) (*SpatialIndexManager, error) {
 
-	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir)
+	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for spatial index: %w", err)
 	}
