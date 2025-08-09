@@ -247,7 +247,6 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 		return nil, pagemanager.InvalidPageID, fmt.Errorf("failed to get frame for new page %d: %w", newPageID, err)
 	}
 	victimPage := bpm.pages[frameIdx]
-	log.Printf("DEBUG: New page %d getting frame %d (old page %d)", newPageID, frameIdx, victimPage.GetPageID())
 
 	// 3. If victim page is dirty, flush it before reuse
 	if victimPage.IsDirty() && victimPage.GetPageID() != pagemanager.InvalidPageID {
@@ -285,7 +284,6 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 	bpm.pageTable[newPageID] = frameIdx
 	victimPage.SetLruElement(bpm.lruList.PushFront(frameIdx)) // Add to front of LRU
 	bpm.lruMap[frameIdx] = victimPage.GetLruElement()
-	log.Printf("DEBUG: New page %d loaded into frame %d, pinCount: %d, isDirty: %t", newPageID, frameIdx, victimPage.GetPinCount(), victimPage.IsDirty())
 
 	// WAL INTEGRATION: Append a log record for the allocation of this new page.
 	if bpm.logManager != nil {

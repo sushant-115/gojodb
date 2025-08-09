@@ -131,10 +131,6 @@ func (n *Node[K, V]) serialize(page *pagemanager.Page, keySerializer func(K) ([]
 	binary.LittleEndian.PutUint32(pageData[pageSize-checksumSize:], checksum)
 
 	// Logging for debugging serialization (can be extensive)
-	log.Printf("SER: PageID %d, numKeys %d, isLeaf %v, serializedLen: %d, calculatedChecksum: 0x%x",
-		n.pageID, len(n.keys), n.isLeaf, len(serializedData), checksum)
-	// log.Printf("SER: Page %d data (first 64 bytes): %x", n.pageID, page.GetData()[:64])
-	// log.Printf("SER: Page %d data (last %d bytes, includes checksum): %x", n.pageID, checksumSize+32, page.GetData()[pageSize-checksumSize-32:])
 
 	// Mark the page as dirty, so it will be flushed to disk by the BufferPoolManager
 	page.SetDirty(true)
@@ -172,11 +168,6 @@ func (n *Node[K, V]) deserialize(page *pagemanager.Page, keyDeserializer func([]
 
 	// Calculate checksum from the rest of the page data
 	calculatedChecksum := crc32.ChecksumIEEE(pageData[:pageSize-checksumSize])
-
-	log.Printf("DESER: PageID %d. Stored Checksum: 0x%x, Calculated Checksum: 0x%x",
-		page.GetPageID(), storedChecksum, calculatedChecksum)
-	// log.Printf("DESER: Page %d data (first 64 bytes for checksum): %x", page.GetPageID(), pageData[:64])
-	// log.Printf("DESER: Page %d data (last %d bytes, includes checksum): %x", page.GetPageID(), checksumSize+32, pageData[pageSize-checksumSize-32:])
 
 	if storedChecksum != calculatedChecksum {
 		log.Printf("ERROR: CHECKSUM MISMATCH DETECTED for PageID %d: Stored=0x%x, Calculated=0x%x. Raw page data (first 64 bytes for debug): %x",
@@ -258,6 +249,6 @@ func (n *Node[K, V]) deserialize(page *pagemanager.Page, keyDeserializer func([]
 	}
 
 	n.pageID = page.GetPageID() // Set the node's page ID from the page object
-	log.Printf("DESER: Successfully deserialized PageID %d, isLeaf: %v, numKeys: %d", n.pageID, n.isLeaf, len(n.keys))
+
 	return nil
 }

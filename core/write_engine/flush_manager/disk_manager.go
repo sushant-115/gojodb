@@ -213,7 +213,6 @@ func (dm *DiskManager) writeHeader(header *DBFileHeader) error {
 	padding := make([]byte, dbFileHeaderSize-buf.Len())
 	buf.Write(padding)
 
-	log.Printf("DEBUG: Writing header of %d bytes to offset 0", buf.Len())
 	if _, err := dm.file.WriteAt(buf.Bytes(), 0); err != nil {
 		return fmt.Errorf("%w: writing header to disk: %v", ErrIO, err)
 	}
@@ -255,8 +254,6 @@ func (dm *DiskManager) readHeader(header *DBFileHeader) error {
 	if err := binary.Read(buf, binary.LittleEndian, header); err != nil {
 		return fmt.Errorf("%w: deserializing header: %v", ErrDeserialization, err)
 	}
-	log.Printf("DEBUG: Read header from disk. Magic: 0x%x, Version: %d, PageSize: %d",
-		header.Magic, header.Version, header.PageSize)
 	return nil
 }
 

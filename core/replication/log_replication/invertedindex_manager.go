@@ -5,24 +5,26 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"github.com/sushant-115/gojodb/pkg/connection"
 	"go.uber.org/zap"
 )
 
 // InvertedIndexReplicationManager handles replication for Inverted Indexes.
 type InvertedIndexReplicationManager struct {
 	BaseReplicationManager
-	InvertedIndex *inverted_index.InvertedIndex
+	InvertedIndex   *inverted_index.InvertedIndex
+	replicaConnPool *connection.ConnectionPoolManager
 }
 
 // NewInvertedIndexReplicationManager creates a new InvertedIndexReplicationManager.
-func NewInvertedIndexReplicationManager(nodeID string, ii *inverted_index.InvertedIndex, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *InvertedIndexReplicationManager {
+func NewInvertedIndexReplicationManager(nodeID string, ii *inverted_index.InvertedIndex, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, replicaConnPool *connection.ConnectionPoolManager) *InvertedIndexReplicationManager {
 	return &InvertedIndexReplicationManager{
 		BaseReplicationManager: NewBaseReplicationManager(nodeID, InvertedIndexType, lm, logger, nodeDataDir),
 		InvertedIndex:          ii,
+		replicaConnPool:        replicaConnPool,
 	}
 }
 
@@ -88,7 +90,8 @@ func (iirm *InvertedIndexReplicationManager) BecomePrimaryForSlot(slotID uint64,
 			continue
 		}
 
-		conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
+		// conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
+		conn, err := iirm.replicaConnPool.Get(replicaAddress)
 		if err != nil {
 			iirm.Logger.Error("Failed to connect to Inverted Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
 			continue

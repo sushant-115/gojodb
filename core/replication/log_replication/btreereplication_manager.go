@@ -5,26 +5,28 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"github.com/sushant-115/gojodb/pkg/connection"
 	"go.uber.org/zap"
 )
 
 // BTreeReplicationManager handles replication specifically for B-tree indexes.
 type BTreeReplicationManager struct {
 	BaseReplicationManager
-	DbInstance *btree.BTree[string, string] // The actual B-tree instance
+	DbInstance      *btree.BTree[string, string] // The actual B-tree instance
+	replicaConnPool *connection.ConnectionPoolManager
 }
 
 // NewBTreeReplicationManager creates a new BTreeReplicationManager.
-func NewBTreeReplicationManager(nodeID string, db *btree.BTree[string, string], lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *BTreeReplicationManager {
+func NewBTreeReplicationManager(nodeID string, db *btree.BTree[string, string], lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, replicaConnPool *connection.ConnectionPoolManager) *BTreeReplicationManager {
 	return &BTreeReplicationManager{
 		BaseReplicationManager: NewBaseReplicationManager(nodeID, BTreeIndexType, lm, logger, nodeDataDir),
 		DbInstance:             db,
+		replicaConnPool:        replicaConnPool,
 	}
 }
 
@@ -146,7 +148,8 @@ func (brm *BTreeReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas
 		}
 
 		brm.Logger.Info("Attempting to connect to B-tree replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
-		conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second) // TODO: Make timeout configurable
+		conn, err := brm.replicaConnPool.Get(replicaAddress)
+		// conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second) // TODO: Make timeout configurable
 		if err != nil {
 			brm.Logger.Error("Failed to connect to B-tree replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
 			continue // Try next replica
@@ -164,7 +167,7 @@ func (brm *BTreeReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas
 		connInfo := &ReplicaConnectionInfo{
 			NodeID:     replicaNodeID,
 			Address:    replicaAddress,
-			Conn:       conn,
+			Conn:       conn.Conn,
 			StopChan:   make(chan struct{}),
 			IsActive:   true,
 			LastAckLSN: 0, // TODO: This should be fetched, e.g., from persisted state or an initial sync with replica
@@ -172,7 +175,7 @@ func (brm *BTreeReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas
 		brm.PrimarySlotReplicas[slotID][replicaNodeID] = connInfo
 
 		brm.wg.Add(1)
-		go brm.streamLogs(conn, connInfo.LastAckLSN, connInfo.StopChan, &brm.wg, replicaNodeID)
+		go brm.streamLogs(conn.Conn, connInfo.LastAckLSN, connInfo.StopChan, &brm.wg, replicaNodeID)
 	}
 	return nil
 }

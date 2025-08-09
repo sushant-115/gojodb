@@ -149,13 +149,13 @@ func (brm *BaseReplicationManager) streamLogs(
 ) {
 	defer wg.Done()
 
-	var closeOnce sync.Once
-	closeConn := func() {
-		closeOnce.Do(func() {
-			conn.Close()
-		})
-	}
-	defer closeConn()
+	// var closeOnce sync.Once
+	// closeConn := func() {
+	// 	closeOnce.Do(func() {
+	// 		conn.Close()
+	// 	})
+	// }
+	// defer closeConn()
 
 	brm.Logger.Info("Starting log stream",
 		zap.String("remoteNodeID", remoteNodeID),
@@ -173,7 +173,7 @@ func (brm *BaseReplicationManager) streamLogs(
 		<-stopChan
 		brm.Logger.Info("Stopping log stream due to stop signal", zap.String("remoteNodeID", remoteNodeID))
 		walReader.Close()
-		closeConn()
+		//closeConn()
 	}()
 
 	encoder := gob.NewEncoder(conn)
@@ -207,13 +207,13 @@ func (brm *BaseReplicationManager) receiveAndApplyLogs(
 ) {
 	defer wg.Done()
 
-	var closeOnce sync.Once
-	closeConn := func() {
-		closeOnce.Do(func() {
-			conn.Close()
-		})
-	}
-	defer closeConn()
+	// var closeOnce sync.Once
+	// closeConn := func() {
+	// 	closeOnce.Do(func() {
+	// 		conn.Close()
+	// 	})
+	// }
+	// defer closeConn()
 
 	decoder := gob.NewDecoder(conn)
 	brm.Logger.Info("Starting to receive logs", zap.String("fromPrimary", conn.RemoteAddr().String()))

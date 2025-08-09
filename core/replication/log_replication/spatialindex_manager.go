@@ -3,26 +3,28 @@ package logreplication
 import (
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"github.com/sushant-115/gojodb/pkg/connection"
 	"go.uber.org/zap"
 )
 
 // SpatialReplicationManager handles replication for Spatial Indexes.
 type SpatialReplicationManager struct {
 	BaseReplicationManager
-	SpatialIndex *spatial.SpatialIndexManager // The actual Spatial Index manager instance
+	SpatialIndex    *spatial.SpatialIndexManager // The actual Spatial Index manager instance
+	replicaConnPool *connection.ConnectionPoolManager
 }
 
 // NewSpatialReplicationManager creates a new SpatialReplicationManager.
-func NewSpatialReplicationManager(nodeID string, sim *spatial.SpatialIndexManager, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *SpatialReplicationManager {
+func NewSpatialReplicationManager(nodeID string, sim *spatial.SpatialIndexManager, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, replicaConnPool *connection.ConnectionPoolManager) *SpatialReplicationManager {
 	// NOTE: spatial.IndexManager does not currently have GetLogManager() or an obvious LogManager field.
 	// We are passing the 'lm' parameter, assuming it's the correct one or spatial.IndexManager will be adapted.
 	return &SpatialReplicationManager{
 		BaseReplicationManager: NewBaseReplicationManager(nodeID, SpatialIndexType, lm, logger, nodeDataDir),
 		SpatialIndex:           sim,
+		replicaConnPool:        replicaConnPool,
 	}
 }
 
@@ -86,7 +88,8 @@ func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replic
 			continue // Already streaming
 		}
 
-		conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
+		// conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
+		conn, err := srm.replicaConnPool.Get(replicaAddress)
 		if err != nil {
 			srm.Logger.Error("Failed to connect to Spatial Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
 			continue

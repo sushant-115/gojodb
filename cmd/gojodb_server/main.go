@@ -31,6 +31,7 @@ import (
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 	"github.com/sushant-115/gojodb/core/storage_engine/tiered_storage"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"github.com/sushant-115/gojodb/pkg/connection"
 
 	// GojoDB API services
 	// basic_api "github.com/sushant-115/gojodb/api/basic"
@@ -59,13 +60,13 @@ var (
 	// OLD: replicationManager    *logreplication.ReplicationManager
 	// NEW: Map of index type to its replication manager
 	indexReplicationManagers map[logreplication.IndexType]logreplication.ReplicationManagerInterface
-
-	raftNode       *raft.Raft
-	raftFSM        *fsm.FSM
-	grpcServer     *grpc.Server
-	raftController *gojodbcontroller.Controller
-	httpServer     *http.Server
-	zlogger        *zap.Logger // Changed from logger to zlogger to avoid conflict with standard log package
+	replicaConnPool          *connection.ConnectionPoolManager
+	raftNode                 *raft.Raft
+	raftFSM                  *fsm.FSM
+	grpcServer               *grpc.Server
+	raftController           *gojodbcontroller.Controller
+	httpServer               *http.Server
+	zlogger                  *zap.Logger // Changed from logger to zlogger to avoid conflict with standard log package
 
 	// Command-line flags
 	nodeID            = flag.String("node_id", "node1", "Unique ID for the node")
@@ -103,13 +104,8 @@ func main() {
 	host := strings.Split(*grpcAddr, ":")[0]
 	myStorageNodeAddr = fmt.Sprintf("%s:%s", host, *replicationAddr)
 
-	var err error
-	// Initialize logger
-
 	zlogger = NewErrorLevelLogger() // Or zap.NewProduction() for structured logging
-	if err != nil {
-		log.Fatalf("CRITICAL: Can't initialize zap logger: %v", err)
-	}
+
 	defer func() {
 		// if err := zlogger.Sync(); err != nil && !strings.Contains(err.Error(), "inappropriate ioctl for device") {
 		// 	log.Printf("Failed to sync logger: %v", err)
@@ -282,9 +278,9 @@ func initStorageNode(logger *zap.Logger) error {
 
 	// --- Initialize Index Replication Managers ---
 	indexReplicationManagers = make(map[logreplication.IndexType]logreplication.ReplicationManagerInterface)
-
+	replicaConnPool = connection.NewConnectionPoolManager(15, 5*time.Second)
 	// B-tree Replication Manager (uses the main logManager)
-	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, baseDataDir)
+	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, baseDataDir, replicaConnPool)
 	indexReplicationManagers[logreplication.BTreeIndexType] = bTreeRepMgr
 	zlogger.Info("B-tree Replication Manager initialized")
 
@@ -296,12 +292,12 @@ func initStorageNode(logger *zap.Logger) error {
 		zlogger.Warn("InvertedIndex GetLogManager returned nil, using main logManager for its replication. Review InvertedIndex WAL strategy.")
 		iiLogManager = logManager // Fallback, ensure this is correct for how Inverted Index logs its changes.
 	}
-	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger, invertedIndexPath)
+	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger, invertedIndexPath, replicaConnPool)
 	indexReplicationManagers[logreplication.InvertedIndexType] = invertedIndexRepMgr
 	zlogger.Info("Inverted Index Replication Manager initialized")
 
 	// Spatial Index Replication Manager (uses its own `spatialLm`)
-	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger, spatialIndexPath)
+	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger, spatialIndexPath, replicaConnPool)
 	indexReplicationManagers[logreplication.SpatialIndexType] = spatialRepMgr
 	zlogger.Info("Spatial Index Replication Manager initialized")
 
