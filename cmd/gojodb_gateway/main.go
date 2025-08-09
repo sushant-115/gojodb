@@ -160,9 +160,9 @@ func (gs *GatewayService) monitorControllerCluster() {
 // getStorageNodeClient gets a gRPC client connection for a given node ID.
 // It tries to reuse from the pool or creates a new one.
 func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn, error) {
-	gs.mu.RLock()
+	gs.mu.Lock()
 	addr, ok := gs.storageNodeAddresses[nodeID]
-	gs.mu.RUnlock()
+	gs.mu.Unlock()
 	if !ok || addr == "" {
 		return nil, fmt.Errorf("address for storage node %s not found", nodeID)
 	}
@@ -195,9 +195,9 @@ func (gs *GatewayService) returnStorageNodeClient(conn *grpc.ClientConn) {
 // resolveResponsibleNode finds the primary or a replica for a given slot.
 // For writes, it always returns the primary. For reads, it can return primary or replica.
 func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (string, error) {
-	gs.mu.RLock()
+	gs.mu.Lock()
 	assignment, ok := gs.slotAssignments[slotID]
-	gs.mu.RUnlock()
+	gs.mu.Unlock()
 
 	if !ok || assignment == nil {
 		return "", fmt.Errorf("no assignment found for slot %d", slotID)
@@ -224,6 +224,7 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 		}
 		index := rand.Intn(len(targetNodes))
 		targetNodeId := targetNodes[index]
+		log.Println("Picked for get: ", targetNodeId)
 		return targetNodeId, nil
 	}
 }
@@ -238,7 +239,7 @@ func (gs *GatewayService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutR
 		log.Printf("Error resolving node for Put key %s: %v", req.Key, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Unavailable, "node resolution failed: %v", err)
 	}
-
+	log.Println("Node picked for PUT:", nodeID)
 	conn, err := gs.getStorageNodeClient(nodeID)
 	if err != nil {
 		log.Printf("Error getting client for node %s: %v", nodeID, err)

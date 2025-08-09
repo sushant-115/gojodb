@@ -48,7 +48,7 @@ const (
 	// TODO: Add other command types as needed (e.g., for cluster config changes)
 )
 
-var TotalHashSlots uint32 = 1024
+var TotalHashSlots uint32 = 8
 
 // var sample string = `
 // {
