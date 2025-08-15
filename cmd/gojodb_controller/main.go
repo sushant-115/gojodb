@@ -38,6 +38,7 @@ type Controller struct {
 	lastHeartbeatReceived  map[string]time.Time
 	heartbeatAddress       string
 	HeartbeatServer        *http.Server
+	mu                     sync.Mutex
 }
 
 // NewController creates a new Controller instance.
@@ -746,6 +747,7 @@ func (c *Controller) handleAdminInitiateShardMigration(w http.ResponseWriter, r 
 		TargetNodeID  string `json:"targetNodeId"`
 		SourceAddress string `json:"sourceAddress"`
 		TargetAddress string `json:"targetAddress"`
+		OperationID   string `json:"operation_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
@@ -757,10 +759,18 @@ func (c *Controller) handleAdminInitiateShardMigration(w http.ResponseWriter, r 
 	cmd := fsm.Command{
 		Type:         fsm.CommandInitiateShardMigration,
 		SlotID:       req.SlotID,
+		ShardID:      strconv.Itoa(int(req.SlotID)),
 		NodeID:       req.SourceNodeID,
 		TargetNodeID: req.TargetNodeID,
 		NodeAddr:     req.SourceAddress,
 		OperationID:  migrationID,
+		MigrationState: &fsm.ShardMigrationState{
+			OperationID:  migrationID,
+			SlotID:       req.SlotID,
+			SourceNodeID: req.SourceNodeID,
+			TargetNodeID: req.TargetNodeID,
+			CurrentPhase: "PREPARING",
+		},
 	}
 	if err := c.applyCommand(cmd); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to initiate shard migration: %v", err), http.StatusInternalServerError)

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	// "github.com/sushant-115/gojodb/core/replication/raft_consensus/fsm" // Keep if fsm types are used
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
@@ -17,15 +18,15 @@ type ReplicaDetail struct {
 
 // SnapshotManifest contains metadata about a shard snapshot.
 type SnapshotManifest struct {
-	SnapshotID        string            `json:"snapshot_id"`         // Unique ID for this snapshot instance
-	ShardID           string            `json:"shard_id"`            // The shard this snapshot is for
-	IndexType         IndexType         `json:"index_type"`          // The specific index type this snapshot is for
-	SourceNodeID      string            `json:"source_node_id"`      // Node that created the snapshot
-	SnapshotLSN       wal.LSN           `json:"snapshot_lsn"`        // WAL LSN up to which this snapshot is consistent (after WAL replay)
-	Files             []SnapshotFile    `json:"files"`               // List of files in the snapshot
-	CreatedAt         time.Time         `json:"created_at"`          // Timestamp of snapshot creation
-	IndexSpecificMeta map[string]string `json:"index_specific_meta"` // e.g., B-tree rootPageID
-	GojoDBVersion     string            `json:"gojodb_version"`      // Version of GojoDB that created snapshot
+	SnapshotID        string             `json:"snapshot_id"`         // Unique ID for this snapshot instance
+	ShardID           string             `json:"shard_id"`            // The shard this snapshot is for
+	IndexType         indexing.IndexType `json:"index_type"`          // The specific index type this snapshot is for
+	SourceNodeID      string             `json:"source_node_id"`      // Node that created the snapshot
+	SnapshotLSN       wal.LSN            `json:"snapshot_lsn"`        // WAL LSN up to which this snapshot is consistent (after WAL replay)
+	Files             []SnapshotFile     `json:"files"`               // List of files in the snapshot
+	CreatedAt         time.Time          `json:"created_at"`          // Timestamp of snapshot creation
+	IndexSpecificMeta map[string]string  `json:"index_specific_meta"` // e.g., B-tree rootPageID
+	GojoDBVersion     string             `json:"gojodb_version"`      // Version of GojoDB that created snapshot
 }
 
 // SnapshotFile describes a single file within a snapshot.
@@ -47,9 +48,7 @@ type ReplicationManagerInterface interface {
 	CeasePrimaryForSlot(slotID uint64) error
 	BecomeReplicaForSlot(slotID uint64, primaryNodeID string, primaryAddress string) error
 	CeaseReplicaForSlot(slotID uint64) error
-	GetIndexType() IndexType
-
-	// --- New Snapshotting Methods ---
+	GetIndexType() indexing.IndexType
 
 	// PrepareSnapshot is called on a source node (primary or replica) to prepare a snapshot for a given shard and index type.
 	// It should perform a fuzzy copy of necessary files and return a manifest.

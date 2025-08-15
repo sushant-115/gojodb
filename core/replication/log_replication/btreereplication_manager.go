@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
@@ -23,7 +24,7 @@ type BTreeReplicationManager struct {
 // NewBTreeReplicationManager creates a new BTreeReplicationManager.
 func NewBTreeReplicationManager(nodeID string, db *btree.BTree[string, string], lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *BTreeReplicationManager {
 	return &BTreeReplicationManager{
-		BaseReplicationManager: NewBaseReplicationManager(nodeID, BTreeIndexType, lm, logger, nodeDataDir),
+		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.BTreeIndexType, lm, logger, nodeDataDir),
 		DbInstance:             db,
 	}
 }

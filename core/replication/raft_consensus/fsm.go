@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/sushant-115/gojodb/core/indexing"
 	logreplication "github.com/sushant-115/gojodb/core/replication/log_replication"
 	"github.com/sushant-115/gojodb/core/storage_engine/tiered_storage" // For TieredDataMetadata
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
@@ -167,9 +168,9 @@ type FSM struct {
 
 	// Local (non-Raft replicated) state/dependencies for this FSM instance
 	logger               *zap.Logger
-	localNodeID          string                                                                  // ID of the node this FSM instance is running on
-	localNodeReplAddr    string                                                                  // Replication address of the local node
-	indexReplicationMgrs map[logreplication.IndexType]logreplication.ReplicationManagerInterface // For triggering replication changes on this node
+	localNodeID          string                                                            // ID of the node this FSM instance is running on
+	localNodeReplAddr    string                                                            // Replication address of the local node
+	indexReplicationMgrs map[indexing.IndexType]logreplication.ReplicationManagerInterface // For triggering replication changes on this node
 
 	// DB instances (if FSM needs direct access for some reason, typically not for pure state)
 	// dbInstance            *btree.BTree[string, string]
@@ -183,7 +184,7 @@ func NewFSM(
 	// db *btree.BTree[string, string], lm *wal.LogManager, ii *inverted_index.InvertedIndex, si *spatial.IndexManager, // Pass if needed
 	localNodeID string,
 	localNodeReplAddr string,
-	replMgrs map[logreplication.IndexType]logreplication.ReplicationManagerInterface,
+	replMgrs map[indexing.IndexType]logreplication.ReplicationManagerInterface,
 	logger *zap.Logger,
 ) *FSM {
 	return &FSM{
@@ -314,6 +315,13 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		f.activeShardMigrations[cmd.MigrationState.OperationID] = cmd.MigrationState
 		f.logger.Info("Applied InitiateShardMigration", zap.String("opID", cmd.MigrationState.OperationID), zap.String("shard", cmd.MigrationState.ShardID))
 		// Controller logic (outside FSM Apply) would then RPC source/target to begin.
+		for index, replMgr := range f.indexReplicationMgrs {
+			manifest, err := replMgr.PrepareSnapshot(cmd.ShardID)
+			if err != nil {
+				f.logger.Error("Error while creating snapshot", zap.String("opID", cmd.MigrationState.OperationID), zap.String("shard", cmd.MigrationState.ShardID), zap.String("indexType", string(index)))
+			}
+			replMgr.GetSnapshotDataStream(cmd.ShardID, manifest.SnapshotID, manifest.Path)
+		}
 		return nil
 	case CommandUpdateShardMigrationState:
 		if cmd.MigrationState == nil || cmd.MigrationState.OperationID == "" {

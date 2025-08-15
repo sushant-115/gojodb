@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
@@ -21,7 +22,7 @@ func NewSpatialReplicationManager(nodeID string, sim *spatial.SpatialIndexManage
 	// NOTE: spatial.IndexManager does not currently have GetLogManager() or an obvious LogManager field.
 	// We are passing the 'lm' parameter, assuming it's the correct one or spatial.IndexManager will be adapted.
 	return &SpatialReplicationManager{
-		BaseReplicationManager: NewBaseReplicationManager(nodeID, SpatialIndexType, lm, logger, nodeDataDir),
+		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.SpatialIndexType, lm, logger, nodeDataDir),
 		SpatialIndex:           sim,
 	}
 }

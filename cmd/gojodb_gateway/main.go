@@ -224,7 +224,7 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 		}
 		index := rand.Intn(len(targetNodes))
 		targetNodeId := targetNodes[index]
-		log.Println("Picked for get: ", targetNodeId)
+		log.Println("Picked for get: ", targetNodeId, slotID)
 		return targetNodeId, nil
 	}
 }
@@ -239,7 +239,7 @@ func (gs *GatewayService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutR
 		log.Printf("Error resolving node for Put key %s: %v", req.Key, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Unavailable, "node resolution failed: %v", err)
 	}
-	log.Println("Node picked for PUT:", nodeID)
+	log.Println("Node picked for PUT:", nodeID, slotID)
 	conn, err := gs.getStorageNodeClient(nodeID)
 	if err != nil {
 		log.Printf("Error getting client for node %s: %v", nodeID, err)

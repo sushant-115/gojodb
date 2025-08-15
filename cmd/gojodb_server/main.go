@@ -23,6 +23,7 @@ import (
 	indexedwritesservice "github.com/sushant-115/gojodb/api/indexed_writes_service"
 	pb "github.com/sushant-115/gojodb/api/proto"
 	gojodbcontroller "github.com/sushant-115/gojodb/cmd/gojodb_controller"
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
@@ -58,7 +59,7 @@ var (
 
 	// OLD: replicationManager    *logreplication.ReplicationManager
 	// NEW: Map of index type to its replication manager
-	indexReplicationManagers map[logreplication.IndexType]logreplication.ReplicationManagerInterface
+	indexReplicationManagers map[indexing.IndexType]logreplication.ReplicationManagerInterface
 
 	raftNode       *raft.Raft
 	raftFSM        *fsm.FSM
@@ -281,11 +282,11 @@ func initStorageNode(logger *zap.Logger) error {
 	zlogger.Info("Tiered Storage Manager initialized")
 
 	// --- Initialize Index Replication Managers ---
-	indexReplicationManagers = make(map[logreplication.IndexType]logreplication.ReplicationManagerInterface)
+	indexReplicationManagers = make(map[indexing.IndexType]logreplication.ReplicationManagerInterface)
 
 	// B-tree Replication Manager (uses the main logManager)
 	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, baseDataDir)
-	indexReplicationManagers[logreplication.BTreeIndexType] = bTreeRepMgr
+	indexReplicationManagers[indexing.BTreeIndexType] = bTreeRepMgr
 	zlogger.Info("B-tree Replication Manager initialized")
 
 	// Inverted Index Replication Manager
@@ -297,12 +298,12 @@ func initStorageNode(logger *zap.Logger) error {
 		iiLogManager = logManager // Fallback, ensure this is correct for how Inverted Index logs its changes.
 	}
 	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger, invertedIndexPath)
-	indexReplicationManagers[logreplication.InvertedIndexType] = invertedIndexRepMgr
+	indexReplicationManagers[indexing.InvertedIndexType] = invertedIndexRepMgr
 	zlogger.Info("Inverted Index Replication Manager initialized")
 
 	// Spatial Index Replication Manager (uses its own `spatialLm`)
 	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger, spatialIndexPath)
-	indexReplicationManagers[logreplication.SpatialIndexType] = spatialRepMgr
+	indexReplicationManagers[indexing.SpatialIndexType] = spatialRepMgr
 	zlogger.Info("Spatial Index Replication Manager initialized")
 
 	// Start all replication managers
@@ -318,10 +319,10 @@ func initStorageNode(logger *zap.Logger) error {
 
 	// Initialize FSM, passing the map of replication managers.
 	// The FSM uses these managers to react to shard assignment changes from Raft log.
-	var replMgrs = make(map[logreplication.IndexType]logreplication.ReplicationManagerInterface)
-	replMgrs[logreplication.BTreeIndexType] = bTreeRepMgr
-	replMgrs[logreplication.InvertedIndexType] = invertedIndexRepMgr
-	replMgrs[logreplication.SpatialIndexType] = spatialRepMgr
+	var replMgrs = make(map[indexing.IndexType]logreplication.ReplicationManagerInterface)
+	replMgrs[indexing.BTreeIndexType] = bTreeRepMgr
+	replMgrs[indexing.InvertedIndexType] = invertedIndexRepMgr
+	replMgrs[indexing.SpatialIndexType] = spatialRepMgr
 	raftFSM = fsm.NewFSM(
 		myStorageNodeID,
 		myStorageNodeAddr,
@@ -543,7 +544,7 @@ func handleReplicationConnection(conn net.Conn) {
 	}
 
 	indexTypeStr := string(handshakeBuf)
-	indexType := logreplication.IndexType(indexTypeStr)
+	indexType := indexing.IndexType(indexTypeStr)
 	log.Println("INDEXTYPE: ", indexTypeStr, indexType)
 	// Find the appropriate replication manager
 	repMgr, ok := indexReplicationManagers[indexType]

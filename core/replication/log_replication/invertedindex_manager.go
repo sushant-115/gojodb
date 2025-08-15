@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
@@ -21,7 +22,7 @@ type InvertedIndexReplicationManager struct {
 // NewInvertedIndexReplicationManager creates a new InvertedIndexReplicationManager.
 func NewInvertedIndexReplicationManager(nodeID string, ii *inverted_index.InvertedIndex, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *InvertedIndexReplicationManager {
 	return &InvertedIndexReplicationManager{
-		BaseReplicationManager: NewBaseReplicationManager(nodeID, InvertedIndexType, lm, logger, nodeDataDir),
+		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.InvertedIndexType, lm, logger, nodeDataDir),
 		InvertedIndex:          ii,
 	}
 }

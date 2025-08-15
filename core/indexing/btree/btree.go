@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync" // For sync.RWMutex and sync.Map
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
@@ -312,10 +313,11 @@ func (bt *BTree[K, V]) SetRootPageID(newRootPageID pagemanager.PageID, txnID uin
 	binary.LittleEndian.PutUint64(newRootPageIDBytes, uint64(newRootPageID))
 
 	logRecord := &wal.LogRecord{
-		TxnID:  txnID,
-		Type:   wal.LogRecordTypeRootChange,
-		PageID: newRootPageID, // New root page ID
-		Data:   newRootPageIDBytes,
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypeRootChange,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    newRootPageID, // New root page ID
+		Data:      newRootPageIDBytes,
 	}
 	// binary.LittleEndian.PutUint64(logRecord.Data, uint64(oldRootPageID))
 
@@ -1638,9 +1640,10 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 	// For V1, we'll log a generic PREPARE record. Full operations would be serialized into NewData.
 	// For now, we assume the Coordinator will re-send operations on COMMIT/ABORT.
 	_, err = bt.logManager.AppendRecord(&wal.LogRecord{
-		TxnID:  txnID,
-		Type:   wal.LogRecordTypePrepare,
-		PageID: InvalidPageID, // Not specific to a page, but to the transaction
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypePrepare,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    InvalidPageID, // Not specific to a page, but to the transaction
 	}, wal.LogTypeBtree)
 	if err != nil {
 		bt.releaseAllLocksForTxn(txnID)
@@ -1678,9 +1681,10 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 
 	// Log the COMMIT record
 	_, err := bt.logManager.AppendRecord(&wal.LogRecord{
-		TxnID:  txnID,
-		Type:   wal.LogRecordTypeCommitTxn,
-		PageID: InvalidPageID,
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypeCommitTxn,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    InvalidPageID,
 	}, wal.LogTypeBtree)
 	if err != nil {
 		return fmt.Errorf("failed to log COMMIT record for txn %d: %w", txnID, err)
@@ -1716,9 +1720,10 @@ func (bt *BTree[K, V]) Abort(txnID uint64) error {
 
 	// Log the ABORT record
 	_, err := bt.logManager.AppendRecord(&wal.LogRecord{
-		TxnID:  txnID,
-		Type:   wal.LogRecordTypeAbortTxn,
-		PageID: InvalidPageID,
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypeAbortTxn,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    InvalidPageID,
 	}, wal.LogTypeBtree)
 	if err != nil {
 		return fmt.Errorf("failed to log ABORT record for txn %d: %w", txnID, err)

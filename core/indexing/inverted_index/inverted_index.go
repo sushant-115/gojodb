@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree" // Reusing btree's page, disk, buffer managers
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
@@ -400,10 +401,11 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 		logData.Write(metadataBytes)
 
 		lr := &wal.LogRecord{
-			TxnID:  0,                         // Not part of a 2PC transaction for now
-			Type:   wal.LogRecordTypeUpdate,   // Using generic update type
-			PageID: pagemanager.InvalidPageID, // Not a specific page, but a logical update to the term dictionary
-			Data:   logData.Bytes(),
+			TxnID:     0, // Not part of a 2PC transaction for now
+			Type:      wal.LogRecordTypeUpdate,
+			IndexType: indexing.InvertedIndexType, // Using generic update type
+			PageID:    pagemanager.InvalidPageID,  // Not a specific page, but a logical update to the term dictionary
+			Data:      logData.Bytes(),
 		}
 		if _, err := idx.lm.AppendRecord(lr, wal.LogTypeInvertedIndex); err != nil {
 			log.Printf("WARNING: Failed to log inverted index update for term '%s': %v", term, err)

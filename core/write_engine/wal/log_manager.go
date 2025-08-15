@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time" // Added for LastHeartbeat
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/security/encryption"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"go.uber.org/zap"
@@ -77,6 +78,7 @@ const (
 type LogRecord struct {
 	LSN        LSN
 	Type       LogRecordType
+	IndexType  indexing.IndexType
 	Timestamp  int64              // Unix Nano
 	TxnID      uint64             // Transaction ID, 0 if not part of a transaction
 	PageID     pagemanager.PageID // Page ID, relevant for page-level operations

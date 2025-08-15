@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
@@ -403,10 +404,11 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 
 		// Log the new root creation
 		logRecord := &wal.LogRecord{
-			Type:   wal.LogTypeRTreeNewRoot,
-			PageID: newRootPageID,
-			Data:   page.GetData(), // Store new root ID
-			LSN:    rt.lm.GetCurrentLSN(),
+			Type:      wal.LogTypeRTreeNewRoot,
+			PageID:    newRootPageID,
+			IndexType: indexing.SpatialIndexType,
+			Data:      page.GetData(), // Store new root ID
+			LSN:       rt.lm.GetCurrentLSN(),
 		}
 		if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
 			return fmt.Errorf("failed to log R-tree new root: %w", err)
@@ -466,10 +468,11 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 	}
 	// Log the insert operation before serialization
 	logRecord := &wal.LogRecord{
-		Type:   wal.LogTypeRTreeInsert,
-		PageID: leafNode.pageID,
-		Data:   page.GetData(),
-		LSN:    rt.lm.GetCurrentLSN(),
+		Type:      wal.LogTypeRTreeInsert,
+		IndexType: indexing.SpatialIndexType,
+		PageID:    leafNode.pageID,
+		Data:      page.GetData(),
+		LSN:       rt.lm.GetCurrentLSN(),
 	}
 	if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
 		//leafNode.mu.Unlock()
@@ -600,8 +603,9 @@ func (rt *RTree) splitNode(oldNode *Node) (*Node, error) {
 
 	// Log the split operation
 	logRecord := &wal.LogRecord{
-		Type:   wal.LogTypeRTreeSplit,
-		PageID: oldNode.pageID, // Original node page ID
+		Type:      wal.LogTypeRTreeSplit,
+		IndexType: indexing.SpatialIndexType,
+		PageID:    oldNode.pageID, // Original node page ID
 		Data: []byte(fmt.Sprintf(`{"OldNodePageID":%d,"NewNodePageID":%d,"OldNodeEntries":%d,"NewNodeEntries":%d}`,
 			oldNode.pageID, newNode.pageID, len(oldNode.entries), len(newNode.entries))),
 		LSN: rt.lm.GetCurrentLSN(),
@@ -694,10 +698,11 @@ func (rt *RTree) adjustTree(node *Node, newNode *Node) error {
 
 				// Log the new root creation
 				logRecord := &wal.LogRecord{
-					Type:   wal.LogTypeRTreeNewRoot,
-					PageID: newRootPageID,
-					Data:   binary.LittleEndian.AppendUint64(nil, uint64(newRootPageID)), // Store new root ID
-					LSN:    rt.lm.GetCurrentLSN(),
+					Type:      wal.LogTypeRTreeNewRoot,
+					IndexType: indexing.SpatialIndexType,
+					PageID:    newRootPageID,
+					Data:      binary.LittleEndian.AppendUint64(nil, uint64(newRootPageID)), // Store new root ID
+					LSN:       rt.lm.GetCurrentLSN(),
 				}
 				if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
 					return fmt.Errorf("failed to log R-tree new root after root split: %w", err)
@@ -770,10 +775,11 @@ func (rt *RTree) adjustTree(node *Node, newNode *Node) error {
 
 		// Log the node update
 		logRecord := &wal.LogRecord{
-			Type:   wal.LogTypeRTreeUpdate, // Or a more specific log type for MBR updates
-			PageID: parentNode.pageID,
-			Data:   parentPage.GetData(), // Store the full page data for replay
-			LSN:    rt.lm.GetCurrentLSN(),
+			Type:      wal.LogTypeRTreeUpdate, // Or a more specific log type for MBR updates
+			IndexType: indexing.SpatialIndexType,
+			PageID:    parentNode.pageID,
+			Data:      parentPage.GetData(), // Store the full page data for replay
+			LSN:       rt.lm.GetCurrentLSN(),
 		}
 		if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
 			parentNode.mu.Unlock()
@@ -875,10 +881,11 @@ func (rt *RTree) Delete(rect Rect, data SpatialData) error {
 
 		// Log the root change
 		logRecord := &wal.LogRecord{
-			Type:   wal.LogTypeRTreeNewRoot, // Using NewRoot to signify a change to InvalidPageID
-			PageID: pagemanager.InvalidPageID,
-			Data:   binary.LittleEndian.AppendUint64(nil, uint64(pagemanager.InvalidPageID)),
-			LSN:    rt.lm.GetCurrentLSN(),
+			Type:      wal.LogTypeRTreeNewRoot, // Using NewRoot to signify a change to InvalidPageID
+			IndexType: indexing.SpatialIndexType,
+			PageID:    pagemanager.InvalidPageID,
+			Data:      binary.LittleEndian.AppendUint64(nil, uint64(pagemanager.InvalidPageID)),
+			LSN:       rt.lm.GetCurrentLSN(),
 		}
 		if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
 			return fmt.Errorf("failed to log R-tree empty root: %w", err)
@@ -918,10 +925,11 @@ func (rt *RTree) deleteRecursive(currentPageID pagemanager.PageID, targetRect Re
 				log.Printf("DEBUG: Deleted entry Rect=%v, Data.ID=%s from leaf node %d", targetRect, targetData.ID, node.pageID)
 				// Log the deletion
 				logRecord := &wal.LogRecord{
-					Type:   wal.LogTypeRTreeDelete, // Use specific R-tree delete log type
-					PageID: node.pageID,
-					Data:   []byte(fmt.Sprintf(`{"Rect":{"MinX":%f,"MinY":%f,"MaxX":%f,"MaxY":%f},"Data":{"ID":"%s"}}`, targetRect.MinX, targetRect.MinY, targetRect.MaxX, targetRect.MaxY, targetData.ID)), // Serialize entry for WAL
-					LSN:    rt.lm.GetCurrentLSN(),
+					Type:      wal.LogTypeRTreeDelete, // Use specific R-tree delete log type
+					IndexType: indexing.SpatialIndexType,
+					PageID:    node.pageID,
+					Data:      []byte(fmt.Sprintf(`{"Rect":{"MinX":%f,"MinY":%f,"MaxX":%f,"MaxY":%f},"Data":{"ID":"%s"}}`, targetRect.MinX, targetRect.MinY, targetRect.MaxX, targetRect.MaxY, targetData.ID)), // Serialize entry for WAL
+					LSN:       rt.lm.GetCurrentLSN(),
 				}
 				if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
 					return false, fmt.Errorf("failed to log R-tree delete: %w", err)

@@ -14,25 +14,29 @@ import (
 	"time"
 
 	"github.com/google/uuid" // For snapshot IDs
+	"github.com/sushant-115/gojodb/core/indexing"
+	"github.com/sushant-115/gojodb/core/replication/eventsender"
+	storagecommon "github.com/sushant-115/gojodb/core/storage_engine/common"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
 )
 
 // ReplicaConnectionInfo ... (existing struct)
 type ReplicaConnectionInfo struct {
-	NodeID     string
-	Address    string
-	Conn       net.Conn
-	StopChan   chan struct{}
-	Wg         sync.WaitGroup
-	LastAckLSN wal.LSN
-	IsActive   bool
+	NodeID      string
+	Address     string
+	Conn        net.Conn
+	EventSender eventsender.EventSender
+	StopChan    chan struct{}
+	Wg          sync.WaitGroup
+	LastAckLSN  wal.LSN
+	IsActive    bool
 }
 
 // BaseReplicationManager provides common fields and potentially methods for specific replication managers.
 type BaseReplicationManager struct {
 	NodeID     string
-	IndexType  IndexType
+	IndexType  indexing.IndexType
 	LogManager *wal.LogManager
 	Logger     *zap.Logger
 	mu         sync.RWMutex // Changed to RWMutex for finer-grained locking if needed
@@ -50,7 +54,7 @@ type BaseReplicationManager struct {
 
 // NewBaseReplicationManager initializes a new BaseReplicationManager.
 // dataDir is the base data directory for the GojoDB node.
-func NewBaseReplicationManager(nodeID string, indexType IndexType, logManager *wal.LogManager, logger *zap.Logger, nodeDataDir string) BaseReplicationManager {
+func NewBaseReplicationManager(nodeID string, indexType indexing.IndexType, logManager *wal.LogManager, logger *zap.Logger, nodeDataDir string) BaseReplicationManager {
 	snapDir := filepath.Join(nodeDataDir, "snapshots", string(indexType))
 	if err := os.MkdirAll(snapDir, 0750); err != nil {
 		// Log error but don't fail construction, snapshotting might just fail later
@@ -111,7 +115,7 @@ func (brm *BaseReplicationManager) StopBase() {
 }
 
 // GetIndexType ... (existing method)
-func (brm *BaseReplicationManager) GetIndexType() IndexType {
+func (brm *BaseReplicationManager) GetIndexType() indexing.IndexType {
 	return brm.IndexType
 }
 
@@ -369,20 +373,22 @@ func (brm *BaseReplicationManager) PrepareSnapshot(shardID string) (*SnapshotMan
 
 // copyFile performs a simple file copy.
 func (brm *BaseReplicationManager) copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
+	rateLimitBytesPerSec := 10 * 1024 * 1024 // 10MB
+	return storagecommon.CopyThrottled(src, dst, int64(rateLimitBytesPerSec), false)
+	// sourceFile, err := os.Open(src)
+	// if err != nil {
+	// 	return err
+	// }
+	// defer sourceFile.Close()
 
-	destFile, err := os.Create(dst) // Creates or truncates
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
+	// destFile, err := os.Create(dst) // Creates or truncates
+	// if err != nil {
+	// 	return err
+	// }
+	// defer destFile.Close()
 
-	_, err = io.Copy(destFile, sourceFile)
-	return err
+	// _, err = io.Copy(destFile, sourceFile)
+	// return err
 }
 
 // calculateSHA256 computes the SHA256 checksum of a file.
