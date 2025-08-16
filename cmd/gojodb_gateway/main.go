@@ -200,11 +200,13 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 	assignment, ok := gs.slotAssignments[slotID]
 
 	if !ok || assignment == nil {
+		gs.mu.Unlock()
 		return "", fmt.Errorf("no assignment found for slot %d", slotID)
 	}
 
 	if isWrite {
 		if assignment.PrimaryNodeID == "" {
+			gs.mu.Unlock()
 			return "", fmt.Errorf("no primary assigned for slot %d", slotID)
 		}
 		gs.mu.Unlock()

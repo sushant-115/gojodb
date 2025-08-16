@@ -520,7 +520,7 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) ([]byte, error) {
 				r.logManager.logger.Error("Error reading log record size", zap.Error(err))
 				return nil, err
 			}
-
+			r.logManager.logger.Debug("Got the record", zap.Int("recordSize", int(recordSize)))
 			// Step 2: Read the full record data into a buffer.
 			recordData := make([]byte, recordSize)
 			if _, err := io.ReadFull(r.currentFile, recordData); err != nil {
@@ -528,7 +528,7 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) ([]byte, error) {
 				r.logManager.logger.Error("Failed to read full log record from WAL stream", zap.Error(err), zap.Uint32("expectedSize", recordSize))
 				return nil, err
 			}
-
+			r.logManager.logger.Debug("Read the bytes", zap.Int("recordSize", int(recordSize)), zap.Int("readSize", len(recordData)))
 			logRecord, err := DecodeLogRecord(recordData)
 			if err != nil {
 				return nil, err
@@ -851,7 +851,6 @@ func (lm *LogManager) persistReplicationSlots() error {
 // AppendRecord appends a log record to the WAL.
 func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) {
 	lm.mu.Lock()
-	defer lm.mu.Unlock()
 
 	lm.currentLSN++
 	lsn := lm.currentLSN
@@ -879,7 +878,8 @@ func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) 
 		lm.logger.Fatal("FATAL: Failed to write record data to WAL. WAL may be corrupt.", zap.Error(err))
 		return 0, fmt.Errorf("failed to write record data to WAL: %w", err)
 	}
-
+	lm.mu.Unlock()
+	lm.cond.Broadcast()
 	return lsn, nil
 }
 

@@ -61,12 +61,13 @@ var (
 	// NEW: Map of index type to its replication manager
 	indexReplicationManagers map[indexing.IndexType]logreplication.ReplicationManagerInterface
 
-	raftNode       *raft.Raft
-	raftFSM        *fsm.FSM
-	grpcServer     *grpc.Server
-	raftController *gojodbcontroller.Controller
-	httpServer     *http.Server
-	zlogger        *zap.Logger // Changed from logger to zlogger to avoid conflict with standard log package
+	raftNode                *raft.Raft
+	raftFSM                 *fsm.FSM
+	grpcServer              *grpc.Server
+	raftController          *gojodbcontroller.Controller
+	httpServer              *http.Server
+	zlogger                 *zap.Logger // Changed from logger to zlogger to avoid conflict with standard log package
+	replicationOrchestrator *logreplication.ReplicationOrchestrator
 
 	// Command-line flags
 	nodeID            = flag.String("node_id", "node1", "Unique ID for the node")
@@ -306,7 +307,7 @@ func initStorageNode(logger *zap.Logger) error {
 	indexReplicationManagers[indexing.SpatialIndexType] = spatialRepMgr
 	zlogger.Info("Spatial Index Replication Manager initialized")
 
-	replicationOrchestrator := logreplication.NewReplicationOrchestrator(*replicationAddr, indexReplicationManagers)
+	replicationOrchestrator = logreplication.NewReplicationOrchestrator(*replicationAddr, indexReplicationManagers)
 	if err := replicationOrchestrator.Start(); err != nil {
 		zlogger.Fatal("Failed to start replication orchestrator", zap.Any("error", err))
 	}
@@ -676,6 +677,9 @@ func initialFetchShardMapFromController() {
 func closeStorageNode() {
 	zlogger.Info("Initiating shutdown of GojoDB storage node components...")
 
+	if replicationOrchestrator != nil {
+		replicationOrchestrator.Stop()
+	}
 	// 1. Stop Raft node first to prevent new FSM applications
 	if raftTransport != nil {
 		zlogger.Info("Closing Raft transport...")
@@ -898,23 +902,21 @@ func setupSignalHandling(stopChan chan struct{}) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		sig := <-signals
-		zlogger.Info("Received signal, initiating graceful shutdown", zap.String("signal", sig.String()))
+	sig := <-signals
+	zlogger.Info("Received signal, initiating graceful shutdown", zap.String("signal", sig.String()))
 
-		// Start shutdown sequence
-		closeStorageNode()
-		stopChan <- struct{}{}
+	// Start shutdown sequence
+	closeStorageNode()
+	stopChan <- struct{}{}
 
-		// If there are other goroutines managed by globalWG that closeStorageNode doesn't explicitly stop,
-		// they should also check a global shutdown channel or context.
-		// For now, closeStorageNode is assumed to handle stopping most things directly or indirectly.
+	// If there are other goroutines managed by globalWG that closeStorageNode doesn't explicitly stop,
+	// they should also check a global shutdown channel or context.
+	// For now, closeStorageNode is assumed to handle stopping most things directly or indirectly.
 
-		// Give some time for graceful shutdown before forceful exit (optional)
-		// time.AfterFunc(30*time.Second, func() {
-		//  zlogger.Fatal("Graceful shutdown timed out, forcing exit.")
-		// })
-	}()
+	// Give some time for graceful shutdown before forceful exit (optional)
+	// time.AfterFunc(30*time.Second, func() {
+	//  zlogger.Fatal("Graceful shutdown timed out, forcing exit.")
+	// })
 }
 
 func addMuxHandler(mux *http.ServeMux) error {

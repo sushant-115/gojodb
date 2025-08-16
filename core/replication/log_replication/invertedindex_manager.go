@@ -89,7 +89,15 @@ func (iirm *InvertedIndexReplicationManager) BecomePrimaryForSlot(slotID uint64,
 			iirm.Logger.Info("Already primary and streaming to replica for Inverted Index slot", zap.Uint64("slotID", slotID), zap.String("replicaNodeID", replicaNodeID))
 			continue
 		}
-		eventSender := events.NewEventSender(replicaAddress, 10*1024, internaltls.GetTestClientCert())
+		cfg := events.Config{
+			Addr:    replicaAddress,
+			URLPath: "/events",
+			TLS:     internaltls.GetTestClientCert(),
+		}
+		eventSender, err := events.NewEventSender(cfg)
+		if err != nil {
+			iirm.Logger.Error("Failed to create eventSender for ", zap.String("replicaAddr", replicaAddress))
+		}
 
 		iirm.Logger.Info("Successfully connected to Inverted Index replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
 

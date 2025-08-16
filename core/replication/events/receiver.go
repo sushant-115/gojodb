@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -9,158 +10,369 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
 
-// EventReceiver handles receiving and processing length-prefixed events over HTTP/3.
-type EventReceiver struct {
-	addr     string
-	server   *http3.Server
-	eventsCh chan []byte
-	pool     *sync.Pool
-	wg       sync.WaitGroup
-	stopChan chan struct{}
+type ReceiverLogger interface {
+	Infof(format string, args ...any)
+	Warnf(format string, args ...any)
+	Errorf(format string, args ...any)
+	Debugf(format string, args ...any)
 }
 
-// NewEventReceiver creates and configures a new EventReceiver.
-// bufferSize specifies the capacity of the output events channel.
-func NewEventReceiver(addr string, bufferSize int, tlsConf *tls.Config) *EventReceiver {
+// NopLogger is used if you don't supply a logger.
+type NopLogger struct{}
+
+func (NopLogger) Infof(string, ...any)  {}
+func (NopLogger) Warnf(string, ...any)  {}
+func (NopLogger) Errorf(string, ...any) {}
+func (NopLogger) Debugf(string, ...any) {}
+
+// Hooks let you wire metrics/alerts without coupling.
+type ReceiverHooks struct {
+	OnAccepted    func()                         // called when an event is accepted into the channel
+	OnDropped     func(reason string)            // called when an event is dropped (queue full, too large, etc.)
+	OnStreamStart func(remote string)            // new incoming POST /events
+	OnStreamClose func(remote string, err error) // stream ended (err may be nil)
+	OnServerStart func(addr string)
+	OnServerClose func()
+	OnError       func(stage string, err error)
+}
+
+// Backpressure policy for the events channel.
+type BackpressurePolicy int
+
+const (
+	// BlockSender blocks the handler until a slot frees up (risk: head-of-line blocking).
+	BlockSender BackpressurePolicy = iota
+	// DropIfFull drops the event immediately when channel is full (lossy, but protects latency).
+	DropIfFull
+)
+
+type ReceiverConfig struct {
+	Addr    string       // e.g., ":8444" or "0.0.0.0:8444"
+	URLPath string       // e.g., "/events"
+	TLS     *tls.Config  // required for HTTP/3
+	QUIC    *quic.Config // optional; timeouts, keepalive, etc.
+
+	QueueCapacity int // capacity of r.eventsCh
+
+	// Limits
+	MaxEventBytes   int   // maximum single event size (length-prefix) e.g., 1<<20 (1MiB)
+	MaxStreamBytes  int64 // cap total bytes we will accept from a single stream; 0 = unlimited
+	MaxConcurrency  int   // max concurrent request handlers; 0/neg = unlimited
+	Backpressure    BackpressurePolicy
+	ResponseOnStart bool // if true, write 200 OK immediately (best-effort acknowledge). Note: client still must finish sending.
+	RequireMethod   bool // if true, enforce POST only (otherwise allow any method)
+}
+
+type EventReceiver struct {
+	cfg     ReceiverConfig
+	log     ReceiverLogger
+	hooks   ReceiverHooks
+	server  *http3.Server
+	ln      net.PacketConn
+	events  chan []byte
+	pool    *sync.Pool
+	wg      sync.WaitGroup
+	closed  int32
+	sem     chan struct{} // concurrency limiter
+	started int32
+}
+
+// NewEventReceiver builds a receiver. Pass nil logger to use NopLogger.
+func NewEventReceiver(cfg ReceiverConfig, logger ReceiverLogger, hooks ReceiverHooks) (*EventReceiver, error) {
+	if cfg.Addr == "" {
+		return nil, errors.New("Config.Addr is required")
+	}
+	if cfg.URLPath == "" {
+		cfg.URLPath = "/events"
+	}
+	if cfg.TLS == nil {
+		return nil, errors.New("Config.TLS is required for HTTP/3")
+	}
+	if cfg.QueueCapacity <= 0 {
+		cfg.QueueCapacity = 4096
+	}
+	if cfg.MaxEventBytes <= 0 {
+		cfg.MaxEventBytes = 1 << 20 // 1 MiB
+	}
+	if logger == nil {
+		logger = NopLogger{}
+	}
+
 	r := &EventReceiver{
-		addr:     addr,
-		eventsCh: make(chan []byte, bufferSize),
+		cfg:    cfg,
+		log:    logger,
+		hooks:  hooks,
+		events: make(chan []byte, cfg.QueueCapacity),
 		pool: &sync.Pool{
-			New: func() interface{} {
-				// Pre-allocate a reasonably sized buffer.
-				return make([]byte, 4096)
+			New: func() any {
+				// a modest default; will grow on demand
+				b := make([]byte, 4096)
+				return &b
 			},
 		},
-		stopChan: make(chan struct{}),
+	}
+	if cfg.MaxConcurrency > 0 {
+		r.sem = make(chan struct{}, cfg.MaxConcurrency)
 	}
 
-	// Set up the HTTP handler.
-	handler := http.NewServeMux()
-	handler.HandleFunc("/events", r.eventHandler)
+	mux := http.NewServeMux()
+	mux.HandleFunc(cfg.URLPath, r.eventHandler)
 
 	r.server = &http3.Server{
-		Addr:      addr,
-		TLSConfig: tlsConf,
-		Handler:   handler,
+		Addr:       cfg.Addr,
+		TLSConfig:  cfg.TLS,
+		Handler:    mux,
+		QUICConfig: cfg.QUIC,
 	}
 
-	return r
+	return r, nil
 }
 
-// Start begins listening for incoming connections in a separate goroutine.
+// Start begins listening on UDP and serving HTTP/3.
 func (r *EventReceiver) Start() error {
-	// Since HTTP/3 runs on UDP, we create a UDP packet connection.
-	// This is a synchronous call that will fail immediately if the address is in use.
-	conn, err := net.ListenPacket("udp", r.addr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on UDP address %s: %w", r.addr, err)
+	if !atomic.CompareAndSwapInt32(&r.started, 0, 1) {
+		return errors.New("EventReceiver already started")
 	}
 
-	fmt.Println("Event receiver listening on", conn.LocalAddr().String())
+	conn, err := net.ListenPacket("udp", r.cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("listen UDP %s: %w", r.cfg.Addr, err)
+	}
+	r.ln = conn
 
-	// Start serving on that connection in a background goroutine.
+	if r.hooks.OnServerStart != nil {
+		r.hooks.OnServerStart(conn.LocalAddr().String())
+	}
+	r.log.Infof("EventReceiver: listening (HTTP/3) on %s path=%s", conn.LocalAddr().String(), r.cfg.URLPath)
+
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		// The error from Serve will only be returned on shutdown or a critical error.
-		// It should be logged here rather than returned.
 		if err := r.server.Serve(conn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Printf("Event receiver server error: %v\n", err)
+			r.log.Errorf("EventReceiver serve error: %v", err)
+			if r.hooks.OnError != nil {
+				r.hooks.OnError("serve", err)
+			}
 		}
 	}()
 
+	return nil
+}
+
+// Close stops the server and closes the events channel after all handlers exit.
+func (r *EventReceiver) Close(ctx context.Context) error {
+	if !atomic.CompareAndSwapInt32(&r.closed, 0, 1) {
+		return nil
+	}
+
+	// Stop accepting new connections.
+	_ = r.server.Close()
+	// Close UDP socket so Serve returns.
+	if r.ln != nil {
+		_ = r.ln.Close()
+	}
+
+	done := make(chan struct{})
 	go func() {
-		<-r.stopChan
-		conn.Close()
+		r.wg.Wait()
+		close(done)
 	}()
 
-	return nil // Successfully started listening.
+	select {
+	case <-ctx.Done():
+		r.log.Warnf("EventReceiver: Close timed out: %v", ctx.Err())
+	case <-done:
+	}
+
+	// No more producers; close channel to signal consumers.
+	close(r.events)
+
+	if r.hooks.OnServerClose != nil {
+		r.hooks.OnServerClose()
+	}
+	r.log.Infof("EventReceiver: closed")
+	return nil
 }
 
-// Close gracefully shuts down the server and closes the events channel.
-func (r *EventReceiver) Close() error {
-	// Close the server. This stops it from accepting new connections.
-	err := r.server.Close()
-	// Wait for the ListenAndServe goroutine to exit.
-	r.wg.Wait()
-	// Close the channel to signal to consumers that no more events will be sent.
-	close(r.eventsCh)
-	return err
-}
-
-// Events returns a read-only channel for consuming received events.
+// Events returns the consumer channel (read-only).
 func (r *EventReceiver) Events() <-chan []byte {
-	return r.eventsCh
+	return r.events
 }
 
-// eventHandler is the HTTP handler for incoming event streams.
-// It runs in a new goroutine for each incoming connection.
+func (r *EventReceiver) acquire() func() {
+	if r.sem == nil {
+		return func() {}
+	}
+	r.sem <- struct{}{}
+	return func() { <-r.sem }
+}
+
+// eventHandler processes a length-prefixed stream: [4B big-endian len][payload]...
 func (r *EventReceiver) eventHandler(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if r.cfg.RequireMethod && req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	fmt.Println("server: received new stream")
-	defer fmt.Println("server: stream finished")
+	release := r.acquire()
+	defer release()
 
+	remote := req.RemoteAddr
+	if req.Body == nil {
+		http.Error(w, "empty body", http.StatusBadRequest)
+		return
+	}
+
+	if r.hooks.OnStreamStart != nil {
+		r.hooks.OnStreamStart(remote)
+	}
+	defer func(start time.Time) {
+		if r.hooks.OnStreamClose != nil {
+			r.hooks.OnStreamClose(remote, nil)
+		}
+		r.log.Debugf("EventReceiver: stream from %s finished in %s", remote, time.Since(start))
+	}(time.Now())
+
+	ctx := req.Context()
 	body := req.Body
 	defer body.Close()
 
-	var lenBuf [4]byte
-
-	for {
-		// 1. Read the 4-byte length prefix.
-		_, err := io.ReadFull(body, lenBuf[:])
-		if err != nil {
-			if err != io.EOF && !errors.Is(err, io.ErrUnexpectedEOF) {
-				fmt.Printf("server read len error: %v\n", err)
-			}
-			break // End of stream or error.
-		}
-
-		payloadLen := binary.BigEndian.Uint32(lenBuf[:])
-		if payloadLen == 0 {
-			continue
-		}
-
-		// 2. Read the full payload.
-		// Get a buffer from the pool.
-		payloadBuf := r.pool.Get().([]byte)
-		if uint32(cap(payloadBuf)) < payloadLen {
-			// If the buffer is too small, allocate a new one.
-			payloadBuf = make([]byte, payloadLen)
-		} else {
-			// Otherwise, just slice it to the required length.
-			payloadBuf = payloadBuf[:payloadLen]
-		}
-
-		_, err = io.ReadFull(body, payloadBuf)
-		if err != nil {
-			fmt.Printf("server read payload error: %v\n", err)
-			r.pool.Put(payloadBuf) // Return buffer to the pool on error.
-			break
-		}
-
-		// 3. Send the event for processing.
-		// We send a copy so the consumer doesn't have to worry about the buffer being reused.
-		eventCopy := make([]byte, payloadLen)
-		copy(eventCopy, payloadBuf)
-
-		select {
-		case r.eventsCh <- eventCopy:
-			// Event successfully sent.
-		default:
-			fmt.Println("Warning: Event receiver channel is full. Dropping event.")
-		}
-
-		// Return the buffer to the pool for reuse.
-		r.pool.Put(payloadBuf)
+	// Optionally acknowledge early (best effort).
+	if r.cfg.ResponseOnStart {
+		w.WriteHeader(http.StatusOK)
+		// For HTTP/3, headers are sent when handler returns or when you write.
+		// Writing an empty body nudges headers out.
+		_, _ = w.Write(nil)
 	}
 
-	w.WriteHeader(http.StatusOK)
+	var lenBuf [4]byte
+	var streamBytes int64
+
+	readFull := func(dst []byte) error {
+		_, err := io.ReadFull(body, dst)
+		return err
+	}
+
+	for {
+		// Allow cancel on client disconnect.
+		select {
+		case <-ctx.Done():
+			r.log.Debugf("EventReceiver: client cancelled from %s: %v", remote, ctx.Err())
+			return
+		default:
+		}
+
+		if r.cfg.MaxStreamBytes > 0 && streamBytes >= r.cfg.MaxStreamBytes {
+			r.drop("stream_bytes_cap", fmt.Errorf("stream exceeded cap %d", r.cfg.MaxStreamBytes))
+			return
+		}
+
+		if err := readFull(lenBuf[:]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				// normal close or truncated final frame; treat as end of stream
+				return
+			}
+			r.err("read_len", err)
+			// For well-formedness errors, respond 400 if we didn't already.
+			if !r.cfg.ResponseOnStart {
+				http.Error(w, "bad stream", http.StatusBadRequest)
+			}
+			return
+		}
+		streamBytes += 4
+
+		n := binary.BigEndian.Uint32(lenBuf[:])
+		if n == 0 {
+			// skip zero-length frames
+			continue
+		}
+		if int(n) <= 0 || int(n) > r.cfg.MaxEventBytes {
+			r.drop("event_too_large", fmt.Errorf("event size %d > max %d", n, r.cfg.MaxEventBytes))
+			if !r.cfg.ResponseOnStart {
+				http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+			}
+			return
+		}
+
+		// Rent buffer
+		bufPtr := r.pool.Get().(*[]byte)
+		b := *bufPtr
+		if cap(b) < int(n) {
+			b = make([]byte, int(n))
+		} else {
+			b = b[:int(n)]
+		}
+
+		// Read payload
+		if err := readFull(b); err != nil {
+			// return buffer before exiting
+			r.pool.Put(&b)
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				// truncated final frame; end stream
+				return
+			}
+			r.err("read_payload", err)
+			if !r.cfg.ResponseOnStart {
+				http.Error(w, "bad stream", http.StatusBadRequest)
+			}
+			return
+		}
+		streamBytes += int64(n)
+
+		// Handoff: copy into stable slice owned by receiver (so pool reuse is safe)
+		ev := make([]byte, int(n))
+		copy(ev, b)
+		r.pool.Put(&b)
+
+		// Backpressure policy
+		switch r.cfg.Backpressure {
+		case BlockSender:
+			select {
+			case r.events <- ev:
+				if r.hooks.OnAccepted != nil {
+					r.hooks.OnAccepted()
+				}
+			case <-ctx.Done():
+				// client left while we were blocking
+				r.drop("client_cancelled_blocking", ctx.Err())
+				return
+			}
+		case DropIfFull:
+			select {
+			case r.events <- ev:
+				if r.hooks.OnAccepted != nil {
+					r.hooks.OnAccepted()
+				}
+			default:
+				r.drop("queue_full", nil)
+				// drop ev; GC will collect
+			}
+		}
+	}
+}
+
+// helper: uniform error logging + hook
+func (r *EventReceiver) err(stage string, err error) {
+	r.log.Errorf("EventReceiver: %s: %v", stage, err)
+	if r.hooks.OnError != nil {
+		r.hooks.OnError(stage, err)
+	}
+}
+
+func (r *EventReceiver) drop(reason string, err error) {
+	if err != nil {
+		r.log.Warnf("EventReceiver: drop (%s): %v", reason, err)
+	} else {
+		r.log.Warnf("EventReceiver: drop (%s)", reason)
+	}
+	if r.hooks.OnDropped != nil {
+		r.hooks.OnDropped(reason)
+	}
 }

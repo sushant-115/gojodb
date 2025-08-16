@@ -148,7 +148,15 @@ func (brm *BTreeReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas
 		}
 
 		brm.Logger.Info("Attempting to connect to B-tree replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
-		eventSender := events.NewEventSender(replicaAddress, 10*1024, internaltls.GetTestClientCert())
+		cfg := events.Config{
+			Addr:    replicaAddress,
+			URLPath: "/events",
+			TLS:     internaltls.GetTestClientCert(),
+		}
+		eventSender, err := events.NewEventSender(cfg)
+		if err != nil {
+			brm.Logger.Error("Failed to create eventSender for ", zap.String("replicaAddr", replicaAddress))
+		}
 		//brm.Logger.Info("Successfully connected to B-tree replica and sent handshake", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
 
 		connInfo := &ReplicaConnectionInfo{

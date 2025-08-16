@@ -1,3 +1,6 @@
+// Package events provides a production‑ready HTTP/3 (QUIC) batching sender
+// with multi-connection streaming, bounded backpressure, retries with
+// exponential backoff, and graceful shutdown.
 package events
 
 import (
@@ -9,8 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,90 +23,154 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-const numConnections = 5
-
-// EventSender sends events from many goroutines over multiple concurrent HTTP/3 streams.
-type EventSender struct {
-	addr string
-	url  string
-
-	// config
-	maxBatchBytes    int           // coalesce up to this many bytes before writing
-	maxBatchMessages int           // or this many messages
-	flushInterval    time.Duration // or every this duration
-
-	// internal
-	eventsCh chan []byte
-	batchChs [numConnections]chan []byte // Channels to send batches to connection managers
-	pool     *sync.Pool
-	quit     chan struct{}
-	closed   int32
-	wg       sync.WaitGroup
-
-	// --- HTTP/3 Connection Management ---
-	roundTripper *http3.Transport
-	h3Client     *http.Client
+// Logger is a tiny interface to allow plugging your own logger (zap, slog, logrus).
+// The standard library's *log.Logger satisfies it via LoggerFunc below.
+type Logger interface {
+	Printf(format string, args ...any)
 }
 
-// connectionState holds the active components for a single HTTP/3 stream.
-type connectionState struct {
-	writer    io.WriteCloser
-	cancelReq context.CancelFunc
+// LoggerFunc adapts a function to the Logger interface.
+type LoggerFunc func(format string, args ...any)
+
+func (f LoggerFunc) Printf(format string, args ...any) { f(format, args...) }
+
+// Metrics hooks let you observe behavior without importing a metrics library here.
+// Provide nil to skip.
+type Metrics struct {
+	OnBatchEnqueued   func(bytes int, msgs int)
+	OnBatchDispatched func(connID int, bytes int, msgs int)
+	OnBatchRetried    func(connID int, attempt int)
+	OnBatchDropped    func(connID int, reason string)
+	OnConnEstablished func(connID int)
+	OnConnFailed      func(connID int, err error)
+	OnConnTornDown    func(connID int)
 }
 
-// NewEventSender returns a configured EventSender for HTTP/3.
-// It creates two concurrent connections for high availability.
-func NewEventSender(addr string, bufferSize int, clientTLSConf *tls.Config) *EventSender {
-	rt := &http3.Transport{
-		TLSClientConfig: clientTLSConf,
-		QUICConfig: &quic.Config{
-			MaxIdleTimeout:  time.Minute,
-			KeepAlivePeriod: 15 * time.Second,
-		},
+// Config controls EventSender behavior.
+type Config struct {
+	// Remote endpoint.
+	Addr    string      // host:port
+	URLPath string      // e.g. "/events"
+	TLS     *tls.Config // TLS config (SNI, RootCAs, etc.)
+
+	// Concurrency & buffering.
+	NumConnections   int           // number of concurrent streaming POSTs
+	QueueCapacity    int           // capacity of the ingress queue (messages)
+	MaxBatchBytes    int           // max bytes per batch
+	MaxBatchMessages int           // max messages per batch
+	FlushInterval    time.Duration // max time to wait before flushing a partial batch
+
+	// Retry policy for establishing connections and writing batches.
+	MaxWriteRetries   int           // total attempts = 1 + MaxWriteRetries
+	InitialBackoff    time.Duration // base backoff (e.g., 100ms)
+	MaxBackoff        time.Duration // cap for backoff
+	BackoffJitterFrac float64       // e.g., 0.2 => ±20% jitter
+
+	// QUIC/HTTP3 low-level knobs (optional).
+	QUIC *quic.Config
+
+	// Logging & metrics (optional).
+	Logger  Logger
+	Metrics *Metrics
+}
+
+// setDefaults applies sensible defaults when fields are zero.
+func (c *Config) setDefaults() {
+	if c.URLPath == "" {
+		c.URLPath = "/events"
 	}
+	if c.NumConnections <= 0 {
+		c.NumConnections = 4
+	}
+	if c.QueueCapacity <= 0 {
+		c.QueueCapacity = 4096
+	}
+	if c.MaxBatchBytes <= 0 {
+		c.MaxBatchBytes = 64 * 1024
+	}
+	if c.MaxBatchMessages <= 0 {
+		c.MaxBatchMessages = 256
+	}
+	if c.FlushInterval <= 0 {
+		c.FlushInterval = 50 * time.Millisecond
+	}
+	if c.MaxWriteRetries < 0 {
+		c.MaxWriteRetries = 0
+	}
+	if c.InitialBackoff <= 0 {
+		c.InitialBackoff = 100 * time.Millisecond
+	}
+	if c.MaxBackoff <= 0 {
+		c.MaxBackoff = 5 * time.Second
+	}
+	if c.BackoffJitterFrac <= 0 {
+		c.BackoffJitterFrac = 0.2
+	}
+	if c.Logger == nil {
+		c.Logger = LoggerFunc(func(f string, a ...any) { log.Printf(f, a...) })
+	}
+}
+
+// EventSender sends events over HTTP/3 using concurrent long‑lived requests.
+type EventSender struct {
+	cfg        Config
+	url        string
+	pool       *sync.Pool
+	quit       chan struct{}
+	closed     int32
+	wg         sync.WaitGroup
+	client     *http.Client
+	rt         *http3.Transport
+	eventsCh   chan []byte   // ingress of individual messages (owned by batchingLoop)
+	connInputs []chan []byte // one batch channel per connectionManager
+	randSrc    *rand.Rand
+}
+
+// New creates a production‑ready EventSender.
+func NewEventSender(cfg Config) (*EventSender, error) {
+	cfg.setDefaults()
+	if cfg.Addr == "" {
+		return nil, errors.New("Config.Addr is required")
+	}
+
+	rt := &http3.Transport{TLSClientConfig: cfg.TLS, QUICConfig: cfg.QUIC}
+	client := &http.Client{Transport: rt}
 
 	s := &EventSender{
-		addr:             addr,
-		url:              fmt.Sprintf("https://%s/events", addr),
-		maxBatchBytes:    64 * 1024,
-		maxBatchMessages: 256,
-		flushInterval:    50 * time.Millisecond,
-		eventsCh:         make(chan []byte, bufferSize),
-		pool: &sync.Pool{
-			New: func() any { return make([]byte, 0, 1024) },
-		},
-		quit:         make(chan struct{}),
-		roundTripper: rt,
-		h3Client:     &http.Client{Transport: rt},
+		cfg:      cfg,
+		url:      fmt.Sprintf("https://%s%s", cfg.Addr, cfg.URLPath),
+		pool:     &sync.Pool{New: func() any { return make([]byte, 0, 2048) }},
+		quit:     make(chan struct{}),
+		client:   client,
+		rt:       rt,
+		eventsCh: make(chan []byte, cfg.QueueCapacity),
+		randSrc:  rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
-	// Initialize a channel for each connection manager.
-	// A small buffer of 1 allows the batching loop to not block if a manager is busy.
-	for i := 0; i < numConnections; i++ {
-		s.batchChs[i] = make(chan []byte, 1)
+	// Per‑connection batch channels (buffer=1 to decouple a bit).
+	s.connInputs = make([]chan []byte, cfg.NumConnections)
+	for i := 0; i < cfg.NumConnections; i++ {
+		s.connInputs[i] = make(chan []byte, 1)
 	}
 
-	// Launch the main batching loop.
+	// Start batching loop and connection managers.
 	s.wg.Add(1)
 	go s.batchingLoop()
 
-	// Launch a dedicated manager for each connection.
-	for i := 0; i < numConnections; i++ {
+	for i := 0; i < cfg.NumConnections; i++ {
 		s.wg.Add(1)
-		go s.connectionManager(i, s.batchChs[i])
+		go s.connectionManager(i, s.connInputs[i])
 	}
-
-	return s
+	return s, nil
 }
 
-// Send blocks until data is queued (or returns error if sender closed).
-func (s *EventSender) Send(data []byte) error {
-	fmt.Println("Calling send for ", len(data))
+// Send blocks until the message is enqueued or the sender is closed.
+func (s *EventSender) Send(msg []byte) error {
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return errors.New("sender closed")
 	}
 	buf := s.pool.Get().([]byte)[:0]
-	buf = append(buf, data...)
+	buf = append(buf, msg...)
 	select {
 	case s.eventsCh <- buf:
 		return nil
@@ -112,14 +180,13 @@ func (s *EventSender) Send(data []byte) error {
 	}
 }
 
-// TrySend attempts to enqueue without blocking; returns true if accepted.
-func (s *EventSender) TrySend(data []byte) bool {
-	log.Println("EventSender: sending data", len(data))
+// TrySend attempts to enqueue without blocking.
+func (s *EventSender) TrySend(msg []byte) bool {
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return false
 	}
 	buf := s.pool.Get().([]byte)[:0]
-	buf = append(buf, data...)
+	buf = append(buf, msg...)
 	select {
 	case s.eventsCh <- buf:
 		return true
@@ -129,66 +196,68 @@ func (s *EventSender) TrySend(data []byte) bool {
 	}
 }
 
-// Close gracefully shuts down all loops and connections.
+// Close gracefully drains and stops all goroutines.
 func (s *EventSender) Close() error {
 	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
 		return errors.New("already closed")
 	}
 	close(s.quit)
 	s.wg.Wait()
-	s.roundTripper.Close()
-	return nil
+	return s.rt.Close()
 }
 
-// batchingLoop is the single goroutine that collects events and forms batches.
-// It then dispatches the batch to any available connection manager.
+// ----------------- internal -----------------
+
+type connectionState struct {
+	writer    io.WriteCloser
+	cancelReq context.CancelFunc
+}
+
 func (s *EventSender) batchingLoop() {
 	defer s.wg.Done()
-	// When this loop exits, close the batch channels to signal the connection managers to exit.
-	defer func() {
-		for i := 0; i < numConnections; i++ {
-			close(s.batchChs[i])
+	defer func() { // close per‑conn inputs so managers exit
+		for _, ch := range s.connInputs {
+			close(ch)
 		}
 	}()
 
 	var batch bytes.Buffer
-	var messagesInBatch int
-	flushTimer := time.NewTimer(s.flushInterval)
+	msgs := 0
+	flushTimer := time.NewTimer(s.cfg.FlushInterval)
 	defer flushTimer.Stop()
 
-	dispatchBatch := func() {
-		if batch.Len() == 0 {
+	dispatch := func() {
+		if msgs == 0 {
 			return
 		}
-
 		payload := make([]byte, batch.Len())
 		copy(payload, batch.Bytes())
-
-		// --- DYNAMIC SELECT ---
-		// Build a slice of cases for reflect.Select. This allows us to
-		// select on a dynamic number of channels.
-		cases := make([]reflect.SelectCase, numConnections+1)
-		for i := 0; i < numConnections; i++ {
-			cases[i] = reflect.SelectCase{
-				Dir:  reflect.SelectSend,
-				Chan: reflect.ValueOf(s.batchChs[i]),
-				Send: reflect.ValueOf(payload),
+		// try to hand off to any connection non‑blocking first (randomized start for fairness)
+		start := s.randSrc.Intn(len(s.connInputs))
+		for i := 0; i < len(s.connInputs); i++ {
+			idx := (start + i) % len(s.connInputs)
+			select {
+			case s.connInputs[idx] <- payload:
+				if s.cfg.Metrics != nil && s.cfg.Metrics.OnBatchDispatched != nil {
+					s.cfg.Metrics.OnBatchDispatched(idx, len(payload), msgs)
+				}
+				batch.Reset()
+				msgs = 0
+				return
+			default:
 			}
 		}
-		// Add the quit channel as the last case.
-		cases[numConnections] = reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(s.quit),
+		// If none accepted immediately, block on any one becoming available or quit.
+		select {
+		case s.connInputs[start] <- payload: // pick deterministic one to avoid reflect.Select overhead
+			if s.cfg.Metrics != nil && s.cfg.Metrics.OnBatchDispatched != nil {
+				s.cfg.Metrics.OnBatchDispatched(start, len(payload), msgs)
+			}
+			batch.Reset()
+			msgs = 0
+		case <-s.quit:
+			return
 		}
-
-		// reflect.Select blocks until one of the cases can proceed.
-		// If multiple are ready, it chooses one pseudo-randomly.
-		// This provides both load balancing and failover.
-		reflect.Select(cases)
-		// We don't need the return value (chosen index) for this logic.
-
-		batch.Reset()
-		messagesInBatch = 0
 	}
 
 	resetTimer := func() {
@@ -198,212 +267,204 @@ func (s *EventSender) batchingLoop() {
 			default:
 			}
 		}
-		flushTimer.Reset(s.flushInterval)
+		flushTimer.Reset(s.cfg.FlushInterval)
 	}
 
 	for {
 		select {
 		case <-s.quit:
-			// Drain eventsCh and attempt one final dispatch.
-			for len(s.eventsCh) > 0 {
-				msg := <-s.eventsCh
-				s.frameAppend(&batch, msg)
-				messagesInBatch++
-				s.pool.Put(msg[:0])
+			// drain
+			for {
+				select {
+				case m := <-s.eventsCh:
+					s.frameAppend(&batch, m)
+					msgs++
+					s.pool.Put(m[:0])
+					if s.cfg.Metrics != nil && s.cfg.Metrics.OnBatchEnqueued != nil {
+						s.cfg.Metrics.OnBatchEnqueued(len(m), 1)
+					}
+				default:
+					dispatch()
+					return
+				}
 			}
-			dispatchBatch()
-			return
 
-		case msg := <-s.eventsCh:
-			s.frameAppend(&batch, msg)
-			messagesInBatch++
-			s.pool.Put(msg[:0])
-			if batch.Len() >= s.maxBatchBytes || messagesInBatch >= s.maxBatchMessages {
-				dispatchBatch()
+		case m := <-s.eventsCh:
+			s.frameAppend(&batch, m)
+			msgs++
+			s.pool.Put(m[:0])
+			if s.cfg.Metrics != nil && s.cfg.Metrics.OnBatchEnqueued != nil {
+				s.cfg.Metrics.OnBatchEnqueued(len(m), 1)
+			}
+			if batch.Len() >= s.cfg.MaxBatchBytes || msgs >= s.cfg.MaxBatchMessages {
+				dispatch()
 				resetTimer()
 			}
 
 		case <-flushTimer.C:
-			dispatchBatch()
+			dispatch()
 			resetTimer()
 		}
 	}
 }
 
-// connectionManager runs in its own goroutine, managing a single HTTP/3 stream.
-func (s *EventSender) connectionManager(id int, batchCh <-chan []byte) {
+func (s *EventSender) connectionManager(id int, in <-chan []byte) {
 	defer s.wg.Done()
-	var connState *connectionState
-
-	// Ensure connection is torn down on exit.
+	var st *connectionState
 	defer func() {
-		if connState != nil {
-			_ = connState.writer.Close()
-			connState.cancelReq()
+		if st != nil {
+			_ = st.writer.Close()
+			st.cancelReq()
+			if s.cfg.Metrics != nil && s.cfg.Metrics.OnConnTornDown != nil {
+				s.cfg.Metrics.OnConnTornDown(id)
+			}
 		}
 	}()
 
-	for batch := range batchCh {
-		// Establish connection if we don't have one.
-		if connState == nil {
+	for payload := range in { // receive batches
+		// lazy connect or reconnect if needed
+		if st == nil {
 			var err error
-			connState, err = s.establishConnection(id)
+			st, err = s.establishConnection(id)
 			if err != nil {
-				fmt.Printf("[conn %d] failed to establish connection: %v. Dropping batch.\n", id, err)
-				// Sleep briefly to prevent a tight loop of failures.
-				time.Sleep(250 * time.Millisecond)
+				s.noteConnFailed(id, err)
+				// retry sending this payload with backoff and a fresh connection each time
+				if !s.retrySend(id, nil, payload) {
+					s.drop(id, payload, "establish failed")
+				}
 				continue
 			}
 		}
 
-		// Write the batch.
-		_, err := connState.writer.Write(batch)
-		if err != nil {
-			fmt.Printf("[conn %d] write error: %v. Tearing down connection.\n", id, err)
-			// Error on write means the stream is broken. Close it and nil it out
-			// so it gets re-established on the next batch.
-			_ = connState.writer.Close()
-			connState.cancelReq()
-			connState = nil
+		if _, err := st.writer.Write(payload); err != nil {
+			s.cfg.Logger.Printf("[conn %d] write error: %v — reconnecting", id, err)
+			_ = st.writer.Close()
+			st.cancelReq()
+			st = nil
+			if !s.retrySend(id, nil, payload) {
+				s.drop(id, payload, "write failed")
+			}
+			continue
 		}
 	}
 }
 
-// establishConnection creates a new HTTP/3 stream and returns its state.
+// retrySend attempts to (re)establish a connection and write the payload
+// using exponential backoff. On success, returns true.
+func (s *EventSender) retrySend(id int, st *connectionState, payload []byte) bool {
+	backoff := s.cfg.InitialBackoff
+	attempts := 0
+	for {
+		if attempts > s.cfg.MaxWriteRetries {
+			return false
+		}
+		attempts++
+
+		if st == nil {
+			var err error
+			st, err = s.establishConnection(id)
+			if err != nil {
+				s.noteConnFailed(id, err)
+				if !s.sleepBackoff(backoff) {
+					return false
+				}
+				backoff = nextBackoff(backoff, s.cfg.MaxBackoff, s.cfg.BackoffJitterFrac, s.randSrc)
+				continue
+			}
+		}
+
+		if _, err := st.writer.Write(payload); err == nil {
+			return true
+		}
+		// write failed; tear down and try again
+		_ = st.writer.Close()
+		st.cancelReq()
+		st = nil
+		if s.cfg.Metrics != nil && s.cfg.Metrics.OnBatchRetried != nil {
+			s.cfg.Metrics.OnBatchRetried(id, attempts)
+		}
+		if !s.sleepBackoff(backoff) {
+			return false
+		}
+		backoff = nextBackoff(backoff, s.cfg.MaxBackoff, s.cfg.BackoffJitterFrac, s.randSrc)
+	}
+}
+
+func (s *EventSender) sleepBackoff(d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-s.quit:
+		return false
+	}
+}
+
+func nextBackoff(cur, max time.Duration, jitterFrac float64, r *rand.Rand) time.Duration {
+	next := time.Duration(float64(cur) * 2)
+	if next > max {
+		next = max
+	}
+	if jitterFrac > 0 && r != nil {
+		j := 1 + (r.Float64()*2-1)*jitterFrac // 1±frac
+		next = time.Duration(math.Max(0, float64(next)*j))
+	}
+	return next
+}
+
+func (s *EventSender) drop(connID int, payload []byte, reason string) {
+	if s.cfg.Metrics != nil && s.cfg.Metrics.OnBatchDropped != nil {
+		s.cfg.Metrics.OnBatchDropped(connID, reason)
+	}
+	s.cfg.Logger.Printf("[conn %d] dropping batch (%d bytes): %s", connID, len(payload), reason)
+}
+
+// establishConnection opens a streaming HTTP/3 POST using io.Pipe for body.
 func (s *EventSender) establishConnection(id int) (*connectionState, error) {
-	pipeReader, pipeWriter := io.Pipe()
+	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, pipeReader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, pr)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to create h3 request: %w", err)
+		return nil, fmt.Errorf("new request: %w", err)
 	}
 
+	// Fire the request in a goroutine and watch its response lifecycle.
 	go func() {
-		resp, err := s.h3Client.Do(req)
+		resp, err := s.client.Do(req)
 		if err != nil {
-			_ = pipeWriter.CloseWithError(fmt.Errorf("client request failed: %w", err))
+			_ = pw.CloseWithError(fmt.Errorf("client request failed: %w", err))
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 300 {
-			err := fmt.Errorf("server returned non-2xx status: %s", resp.Status)
-			_ = pipeWriter.CloseWithError(err)
-		} else {
-			// Read the body to completion to allow the server to close gracefully.
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = pipeWriter.Close()
-		}
-	}()
-
-	fmt.Printf("[conn %d] established new http/3 stream\n", id)
-	return &connectionState{writer: pipeWriter, cancelReq: cancel}, nil
-}
-
-// frameAppend appends a length-prefixed message to the buffer.
-func (s *EventSender) frameAppend(buf *bytes.Buffer, msg []byte) {
-	var lenBytes [4]byte
-	binary.BigEndian.PutUint32(lenBytes[:], uint32(len(msg)))
-	buf.Write(lenBytes[:])
-	buf.Write(msg)
-}
-
-// --- Example Usage & Server ---
-
-// func main() {
-// 	serverTLSConf, clientCertPool := generateTLSConfig()
-// 	addr := "localhost:9090"
-
-// 	go runDummyH3Server(addr, serverTLSConf)
-// 	time.Sleep(100 * time.Millisecond)
-
-// 	clientTLSConf := &tls.Config{
-// 		RootCAs:    clientCertPool,
-// 		NextProtos: []string{"h3"},
-// 	}
-
-// 	sender := NewEventSender(addr, 4096, clientTLSConf)
-// 	defer sender.Close()
-
-// 	var wg sync.WaitGroup
-// 	producers := 200
-// 	msgsPerProducer := 1000
-
-// 	start := time.Now()
-// 	for i := 0; i < producers; i++ {
-// 		wg.Add(1)
-// 		go func(id int) {
-// 			defer wg.Done()
-// 			for j := 0; j < msgsPerProducer; j++ {
-// 				payload := []byte(fmt.Sprintf("producer=%d seq=%d time=%d", id, j, time.Now().UnixNano()))
-// 				if !sender.TrySend(payload) {
-// 					_ = sender.Send(payload)
-// 				}
-// 			}
-// 		}(i)
-// 	}
-// 	wg.Wait()
-
-// 	time.Sleep(500 * time.Millisecond)
-// 	fmt.Printf("done sending %d messages in %v\n", producers*msgsPerProducer, time.Since(start))
-// }
-
-func runDummyH3Server(addr string, tlsConf *tls.Config) {
-	handler := http.NewServeMux()
-	handler.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			_ = pw.CloseWithError(fmt.Errorf("server returned non-2xx: %s", resp.Status))
 			return
 		}
+		// Drain so server can close cleanly when we finish.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = pw.Close()
+	}()
 
-		fmt.Println("server: received new stream")
-		var total int
-		var lenBuf [4]byte
-		body := r.Body
-		defer body.Close()
-
-		for {
-			_, err := io.ReadFull(body, lenBuf[:])
-			if err != nil {
-				if err != io.EOF && !errors.Is(err, io.ErrUnexpectedEOF) {
-					fmt.Printf("server read len error: %v\n", err)
-				}
-				break
-			}
-
-			payloadLen := binary.BigEndian.Uint32(lenBuf[:])
-			if payloadLen == 0 {
-				continue
-			}
-
-			payload := make([]byte, payloadLen)
-			_, err = io.ReadFull(body, payload)
-			if err != nil {
-				fmt.Printf("server read payload error: %v\n", err)
-				break
-			}
-			total++
-			// if strings.Contains(string(payload), "producer=0") {
-			// 	time.Sleep(50 * time.Millisecond)
-			// }
-			if total%20000 == 0 {
-				fmt.Printf("server: received total %d messages on this stream\n", total)
-			}
-		}
-		fmt.Printf("server: stream finished, received total %d messages\n", total)
-		w.WriteHeader(http.StatusOK)
-	})
-
-	server := &http3.Server{
-		Addr:      addr,
-		TLSConfig: tlsConf,
-		Handler:   handler,
+	if s.cfg.Metrics != nil && s.cfg.Metrics.OnConnEstablished != nil {
+		s.cfg.Metrics.OnConnEstablished(id)
 	}
+	s.cfg.Logger.Printf("[conn %d] established new HTTP/3 stream to %s", id, s.url)
+	return &connectionState{writer: pw, cancelReq: cancel}, nil
+}
 
-	fmt.Println("dummy HTTP/3 server listening on", addr)
-	if err := server.ListenAndServe(); err != nil {
-		panic(err)
+func (s *EventSender) noteConnFailed(id int, err error) {
+	if s.cfg.Metrics != nil && s.cfg.Metrics.OnConnFailed != nil {
+		s.cfg.Metrics.OnConnFailed(id, err)
 	}
+	s.cfg.Logger.Printf("[conn %d] establish failed: %v", id, err)
+}
+
+// frameAppend writes a 4‑byte big‑endian length prefix followed by msg bytes into buf.
+func (s *EventSender) frameAppend(buf *bytes.Buffer, msg []byte) {
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], uint32(len(msg)))
+	buf.Write(n[:])
+	buf.Write(msg)
 }

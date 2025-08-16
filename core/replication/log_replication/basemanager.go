@@ -110,7 +110,7 @@ func (brm *BaseReplicationManager) StopBase() {
 	brm.ReplicaSlotPrimaries = make(map[uint64]*ReplicaConnectionInfo) // Clear map
 	brm.mu.Unlock()
 
-	brm.wg.Wait()
+	//brm.wg.Wait()
 	brm.Logger.Info("Base replication manager stopped")
 }
 

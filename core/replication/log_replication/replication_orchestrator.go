@@ -1,6 +1,8 @@
 package logreplication
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"sync"
 
@@ -19,7 +21,28 @@ type ReplicationOrchestrator struct {
 }
 
 func NewReplicationOrchestrator(addr string, replMgrs map[indexing.IndexType]ReplicationManagerInterface) *ReplicationOrchestrator {
-	eventsReceiver := events.NewEventReceiver(addr, 10*1024, internaltls.GetTestServerCert())
+	cfg := events.ReceiverConfig{
+		Addr:    addr,
+		URLPath: "/events",
+		TLS:     internaltls.GetTestServerCert(),
+	}
+	eventsReceiver, err := events.NewEventReceiver(cfg, nil, events.ReceiverHooks{
+		OnAccepted: func() {
+			fmt.Println("Received a new connection")
+		},
+		OnDropped: func(reason string) {
+			fmt.Println("Dropped the packets due to ", reason)
+		},
+		OnStreamStart: func(remote string) {
+			fmt.Println("Started the stream from: ", remote)
+		},
+		OnStreamClose: func(remote string, err error) {
+			fmt.Println("Stream closed from: ", remote, " Due to: ", err)
+		},
+	})
+	if err != nil {
+
+	}
 	return &ReplicationOrchestrator{
 		ReplMgrs:      replMgrs,
 		EventReceiver: eventsReceiver,
@@ -38,7 +61,7 @@ func (r *ReplicationOrchestrator) Start() error {
 }
 
 func (r *ReplicationOrchestrator) Stop() {
-	r.EventReceiver.Close()
+	r.EventReceiver.Close(context.Background())
 	close(r.stopChan)
 }
 

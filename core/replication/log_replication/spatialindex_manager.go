@@ -87,7 +87,15 @@ func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replic
 		if _, exists := srm.PrimarySlotReplicas[slotID][replicaNodeID]; exists && srm.PrimarySlotReplicas[slotID][replicaNodeID].IsActive {
 			continue // Already streaming
 		}
-		eventSender := events.NewEventSender(replicaAddress, 10*1024, internaltls.GetTestClientCert())
+		cfg := events.Config{
+			Addr:    replicaAddress,
+			URLPath: "/events",
+			TLS:     internaltls.GetTestClientCert(),
+		}
+		eventSender, err := events.NewEventSender(cfg)
+		if err != nil {
+			srm.Logger.Error("Failed to create eventSender for ", zap.String("replicaAddr", replicaAddress))
+		}
 		// conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
 		// if err != nil {
 		// 	srm.Logger.Error("Failed to connect to Spatial Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
