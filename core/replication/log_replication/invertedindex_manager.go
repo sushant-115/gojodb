@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
+	"github.com/sushant-115/gojodb/core/replication/events"
+	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
 )
@@ -88,31 +89,22 @@ func (iirm *InvertedIndexReplicationManager) BecomePrimaryForSlot(slotID uint64,
 			iirm.Logger.Info("Already primary and streaming to replica for Inverted Index slot", zap.Uint64("slotID", slotID), zap.String("replicaNodeID", replicaNodeID))
 			continue
 		}
+		eventSender := events.NewEventSender(replicaAddress, 10*1024, internaltls.GetTestClientCert())
 
-		conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
-		if err != nil {
-			iirm.Logger.Error("Failed to connect to Inverted Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-			continue
-		}
-		if err := iirm.sendHandshake(conn); err != nil {
-			iirm.Logger.Error("Failed to send handshake to Inverted Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-			conn.Close()
-			continue
-		}
 		iirm.Logger.Info("Successfully connected to Inverted Index replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
 
 		connInfo := &ReplicaConnectionInfo{
-			NodeID:     replicaNodeID,
-			Address:    replicaAddress,
-			Conn:       conn,
-			StopChan:   make(chan struct{}),
-			IsActive:   true,
-			LastAckLSN: 0, // TODO: Fetch initial LSN
+			NodeID:      replicaNodeID,
+			Address:     replicaAddress,
+			EventSender: eventSender,
+			StopChan:    make(chan struct{}),
+			IsActive:    true,
+			LastAckLSN:  0, // TODO: Fetch initial LSN
 		}
 		iirm.PrimarySlotReplicas[slotID][replicaNodeID] = connInfo
 
 		iirm.wg.Add(1)
-		go iirm.streamLogs(conn, connInfo.LastAckLSN, connInfo.StopChan, &iirm.wg, replicaNodeID)
+		go iirm.streamLogs(connInfo, &iirm.wg, replicaNodeID)
 	}
 	return nil
 }

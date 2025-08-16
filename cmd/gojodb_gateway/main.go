@@ -17,7 +17,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/sushant-115/gojodb/api/proto" // Assuming your proto package is named 'proto'
@@ -166,14 +165,16 @@ func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn,
 	if !ok || addr == "" {
 		return nil, fmt.Errorf("address for storage node %s not found", nodeID)
 	}
-
+	// TO DO
 	// The sync.Pool stores grpc.ClientConn directly
-	if conn, ok := gs.nodeConns.Get().(*grpc.ClientConn); ok && conn != nil && conn.GetState() != (connectivity.TransientFailure) && conn.GetState() != (connectivity.Shutdown) {
-		// Verify if the connection is still valid and for the correct address
-		// This is a simple check, a more robust solution might involve connection wrappers
-		// For simplicity, we just return it. If it's broken, the subsequent RPC will fail.
-		return conn, nil
-	}
+	// if conn, ok := gs.nodeConns.Get().(*grpc.ClientConn); ok && conn != nil && conn.GetState() != (connectivity.TransientFailure) && conn.GetState() != (connectivity.Shutdown) {
+	// 	// Verify if the connection is still valid and for the correct address
+	// 	// This is a simple check, a more robust solution might involve connection wrappers
+	// 	// For simplicity, we just return it. If it's broken, the subsequent RPC will fail.
+
+	// 	log.Println("Picked connection from pool: ", nodeID, addr, conn.Target())
+	// 	return conn, nil
+	// }
 
 	// No valid connection in pool, create a new one
 	log.Printf("Establishing new gRPC connection to storage node %s at %s", nodeID, addr)
@@ -197,7 +198,6 @@ func (gs *GatewayService) returnStorageNodeClient(conn *grpc.ClientConn) {
 func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (string, error) {
 	gs.mu.Lock()
 	assignment, ok := gs.slotAssignments[slotID]
-	gs.mu.Unlock()
 
 	if !ok || assignment == nil {
 		return "", fmt.Errorf("no assignment found for slot %d", slotID)
@@ -207,6 +207,7 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 		if assignment.PrimaryNodeID == "" {
 			return "", fmt.Errorf("no primary assigned for slot %d", slotID)
 		}
+		gs.mu.Unlock()
 		return assignment.PrimaryNodeID, nil
 	} else {
 		targetNodes := []string{}
@@ -219,12 +220,14 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 
 		}
 		if len(targetNodes) == 0 {
+			gs.mu.Unlock()
 			return "", fmt.Errorf("no primary or replica assigned for slot %d", slotID)
 
 		}
 		index := rand.Intn(len(targetNodes))
 		targetNodeId := targetNodes[index]
 		log.Println("Picked for get: ", targetNodeId, slotID)
+		gs.mu.Unlock()
 		return targetNodeId, nil
 	}
 }

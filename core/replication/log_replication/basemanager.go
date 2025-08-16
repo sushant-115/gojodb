@@ -15,7 +15,7 @@ import (
 
 	"github.com/google/uuid" // For snapshot IDs
 	"github.com/sushant-115/gojodb/core/indexing"
-	"github.com/sushant-115/gojodb/core/replication/eventsender"
+	"github.com/sushant-115/gojodb/core/replication/events"
 	storagecommon "github.com/sushant-115/gojodb/core/storage_engine/common"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
@@ -26,7 +26,7 @@ type ReplicaConnectionInfo struct {
 	NodeID      string
 	Address     string
 	Conn        net.Conn
-	EventSender eventsender.EventSender
+	EventSender *events.EventSender
 	StopChan    chan struct{}
 	Wg          sync.WaitGroup
 	LastAckLSN  wal.LSN
@@ -145,22 +145,13 @@ func (brm *BaseReplicationManager) sendHandshake(conn net.Conn) error {
 
 // streamLogs ... (existing method, ensure it's robust)
 func (brm *BaseReplicationManager) streamLogs(
-	conn net.Conn,
-	fromLSN wal.LSN,
-	stopChan chan struct{},
+	connInfo *ReplicaConnectionInfo,
 	wg *sync.WaitGroup,
 	remoteNodeID string,
 ) {
 	defer wg.Done()
 
-	var closeOnce sync.Once
-	closeConn := func() {
-		closeOnce.Do(func() {
-			conn.Close()
-		})
-	}
-	defer closeConn()
-
+	fromLSN := connInfo.LastAckLSN
 	brm.Logger.Info("Starting log stream",
 		zap.String("remoteNodeID", remoteNodeID),
 		zap.Uint64("fromLSN", uint64(fromLSN)),
@@ -173,33 +164,39 @@ func (brm *BaseReplicationManager) streamLogs(
 	}
 	defer walReader.Close()
 
-	go func() {
-		<-stopChan
-		brm.Logger.Info("Stopping log stream due to stop signal", zap.String("remoteNodeID", remoteNodeID))
-		walReader.Close()
-		closeConn()
-	}()
+	// go func() {
+	// 	<-stopChan
+	// 	brm.Logger.Info("Stopping log stream due to stop signal", zap.String("remoteNodeID", remoteNodeID))
+	// 	walReader.Close()
+	// 	closeConn()
+	// }()
 
-	encoder := gob.NewEncoder(conn)
+	// encoder := gob.NewEncoder(conn)
 
 	for {
 		var lr wal.LogRecord
-		err := walReader.Next(&lr)
+		brm.Logger.Info("Calling walreader next", zap.Any("Index type", brm.IndexType))
+		b, err := walReader.Next(&lr)
 		if err != nil {
 			if err != io.EOF {
 				brm.Logger.Error("Failed to get next log record from WAL stream", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
 			}
 			return
 		}
-
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		err = encoder.Encode(lr)
-		conn.SetWriteDeadline(time.Time{}) // Clear deadline
-
-		if err != nil {
+		brm.Logger.Info("Sending log record: ", zap.Any("indexType", lr.IndexType), zap.Any("page", lr.PageID), zap.Any("remote", connInfo.Address))
+		if err := connInfo.EventSender.Send(b); err != nil {
 			brm.Logger.Error("Failed to send log record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
 			return
 		}
+
+		// conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		// err = encoder.Encode(lr)
+		// conn.SetWriteDeadline(time.Time{}) // Clear deadline
+
+		// if err != nil {
+		// 	brm.Logger.Error("Failed to send log record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
+		// 	return
+		// }
 	}
 }
 

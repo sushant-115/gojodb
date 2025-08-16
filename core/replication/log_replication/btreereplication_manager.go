@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
+	"github.com/sushant-115/gojodb/core/replication/events"
+	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
@@ -147,33 +148,21 @@ func (brm *BTreeReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas
 		}
 
 		brm.Logger.Info("Attempting to connect to B-tree replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
-		conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second) // TODO: Make timeout configurable
-		if err != nil {
-			brm.Logger.Error("Failed to connect to B-tree replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-			continue // Try next replica
-		}
-
-		// Send handshake to specify IndexType
-		if err := brm.sendHandshake(conn); err != nil {
-			brm.Logger.Error("Failed to send handshake to B-tree replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-			conn.Close()
-			continue
-		}
-
-		brm.Logger.Info("Successfully connected to B-tree replica and sent handshake", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
+		eventSender := events.NewEventSender(replicaAddress, 10*1024, internaltls.GetTestClientCert())
+		//brm.Logger.Info("Successfully connected to B-tree replica and sent handshake", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
 
 		connInfo := &ReplicaConnectionInfo{
-			NodeID:     replicaNodeID,
-			Address:    replicaAddress,
-			Conn:       conn,
-			StopChan:   make(chan struct{}),
-			IsActive:   true,
-			LastAckLSN: 0, // TODO: This should be fetched, e.g., from persisted state or an initial sync with replica
+			NodeID:      replicaNodeID,
+			Address:     replicaAddress,
+			EventSender: eventSender,
+			StopChan:    make(chan struct{}),
+			IsActive:    true,
+			LastAckLSN:  0, // TODO: This should be fetched, e.g., from persisted state or an initial sync with replica
 		}
 		brm.PrimarySlotReplicas[slotID][replicaNodeID] = connInfo
 
 		brm.wg.Add(1)
-		go brm.streamLogs(conn, connInfo.LastAckLSN, connInfo.StopChan, &brm.wg, replicaNodeID)
+		go brm.streamLogs(connInfo, &brm.wg, replicaNodeID)
 	}
 	return nil
 }

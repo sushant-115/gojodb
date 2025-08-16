@@ -2,7 +2,10 @@ package wal
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
+	"errors"
+	"hash/crc32"
 
 	// "encoding/gob" // No longer needed for WALStreamReader
 	"encoding/json"
@@ -66,7 +69,7 @@ const (
 	LogRecordTypeNoOp
 )
 
-type LogType uint
+type LogType uint8
 
 const (
 	LogTypeBtree LogType = iota + 1
@@ -88,6 +91,139 @@ type LogRecord struct {
 	LogType    LogType            // General type for routing to index specific apply logic
 	SegmentID  uint64             // ID of the WAL segment this record belongs to
 	RecordSize uint32             // Size of this record on disk
+}
+
+// Encode serializes the LogRecord into a byte slice for network transmission or disk storage.
+func (lr *LogRecord) Encode() ([]byte, error) {
+	// Use a buffer for efficient byte concatenation.
+	buf := new(bytes.Buffer)
+
+	// Write fixed-size fields using binary.BigEndian.
+	// The order of writing must be strictly maintained for decoding.
+	if err := binary.Write(buf, binary.BigEndian, lr.LSN); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, lr.Type); err != nil {
+		return nil, err
+	}
+
+	indexTypeLen := uint32(len(lr.IndexType))
+	if err := binary.Write(buf, binary.BigEndian, indexTypeLen); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(string(lr.IndexType)); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, lr.Timestamp); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, lr.TxnID); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, lr.PageID); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, lr.PrevLSN); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, lr.LogType); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, lr.SegmentID); err != nil {
+		return nil, err
+	}
+
+	// For the variable-size Data field, first write its length, then the data itself.
+	// This is crucial for the decoder to know how many bytes to read.
+	dataLen := uint32(len(lr.Data))
+	if err := binary.Write(buf, binary.BigEndian, dataLen); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(lr.Data); err != nil {
+		return nil, err
+	}
+
+	// The CRC should be calculated on the encoded data *before* the CRC field itself is appended.
+	// We'll calculate it now and then append it.
+	encodedBytesWithoutCRC := buf.Bytes()
+	crc := crc32.ChecksumIEEE(encodedBytesWithoutCRC)
+	if err := binary.Write(buf, binary.BigEndian, crc); err != nil {
+		return nil, err
+	}
+
+	// Finally, we can set the total record size and return the full byte slice.
+	lr.RecordSize = uint32(buf.Len())
+
+	return buf.Bytes(), nil
+}
+
+// DecodeLogRecord deserializes a byte slice back into a LogRecord struct.
+func DecodeLogRecord(data []byte) (*LogRecord, error) {
+	buf := bytes.NewReader(data)
+	lr := &LogRecord{}
+
+	// Read fixed-size fields in the exact same order they were written.
+	if err := binary.Read(buf, binary.BigEndian, &lr.LSN); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(buf, binary.BigEndian, &lr.Type); err != nil {
+		return nil, err
+	}
+
+	var indexTypeLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &indexTypeLen); err != nil {
+		return nil, err
+	}
+	indexTypeBytes := make([]byte, indexTypeLen)
+	if _, err := io.ReadFull(buf, indexTypeBytes); err != nil {
+		return nil, err
+	}
+	lr.IndexType = indexing.IndexType(indexTypeBytes)
+
+	if err := binary.Read(buf, binary.BigEndian, &lr.Timestamp); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(buf, binary.BigEndian, &lr.TxnID); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(buf, binary.BigEndian, &lr.PageID); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(buf, binary.BigEndian, &lr.PrevLSN); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(buf, binary.BigEndian, &lr.LogType); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(buf, binary.BigEndian, &lr.SegmentID); err != nil {
+		return nil, err
+	}
+
+	// Read the length of the Data field, then read that many bytes.
+	var dataLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &dataLen); err != nil {
+		return nil, err
+	}
+	lr.Data = make([]byte, dataLen)
+	if _, err := io.ReadFull(buf, lr.Data); err != nil {
+		return nil, err
+	}
+
+	// Read the CRC.
+	if err := binary.Read(buf, binary.BigEndian, &lr.CRC); err != nil {
+		return nil, err
+	}
+
+	// Verify the CRC for data integrity.
+	// The CRC was calculated on the data *before* the CRC itself was appended.
+	bytesToVerify := data[:len(data)-4]
+	if crc32.ChecksumIEEE(bytesToVerify) != lr.CRC {
+		return nil, errors.New("log record checksum mismatch")
+	}
+
+	lr.RecordSize = uint32(len(data))
+	return lr, nil
 }
 
 // ReplicationSlot tracks a consumer of WAL records.
@@ -328,6 +464,10 @@ func (lm *LogManager) GetWALReaderForStreaming(fromLSN LSN, slotName string) (*W
 
 	// Open the initial segment using the effective LSN
 	if err := reader.openSegmentForLSN(slot.RestartLSN); err != nil {
+		lm.logger.Warn("Failed to open segment from LSN.",
+			zap.String("slot", slotName),
+			zap.Uint64("requested", uint64(effectiveFromLSN)),
+			zap.Uint64("tracked", uint64(slot.RestartLSN)))
 		return nil, err
 	}
 
@@ -336,16 +476,18 @@ func (lm *LogManager) GetWALReaderForStreaming(fromLSN LSN, slotName string) (*W
 
 // Next reads the next log record from the stream. It blocks until a new record is available
 // or the reader is closed. This function is now rewritten to manually parse the binary format.
-func (r *WALStreamReader) Next(logRecord *LogRecord) error {
+func (r *WALStreamReader) Next(logRecord *LogRecord) ([]byte, error) {
 	for {
+		r.logManager.logger.Debug("Calling Next", zap.Any("Currentfile", r.currentFile.Name()))
 		select {
 		case <-r.stopChan:
-			return io.EOF // Or a more specific error like ErrReaderClosed
+			return nil, io.EOF // Or a more specific error like ErrReaderClosed
 		default:
 			// Step 1: Read the size of the record first (4 bytes).
 			var recordSize uint32
-			if err := binary.Read(r.currentFile, binary.LittleEndian, &recordSize); err != nil {
+			if err := binary.Read(r.currentFile, binary.BigEndian, &recordSize); err != nil {
 				if err == io.EOF {
+					r.logManager.logger.Debug("End of the file", zap.Any("Currentfile", r.currentFile))
 					// Reached the end of the current file. We need to check if a new segment exists.
 					nextSegmentID := r.currentSegmentID + 1
 					r.logManager.segmentMetaMtx.RLock()
@@ -357,7 +499,7 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 						r.logManager.logger.Debug("Switching to next WAL segment for streaming", zap.Int("nextSegmentID", nextSegmentID))
 						r.currentFile.Close()
 						if openErr := r.openSegment(nextSegmentID); openErr != nil {
-							return openErr
+							return nil, openErr
 						}
 						continue // Retry reading from the new segment
 					}
@@ -367,7 +509,7 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 					select {
 					case <-r.stopChan: // Check again in case of race
 						r.logManager.mtx.Unlock()
-						return io.EOF
+						return nil, io.EOF
 					default:
 						r.logManager.cond.Wait()
 					}
@@ -376,7 +518,7 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 				}
 				// A real error occurred while reading the size
 				r.logManager.logger.Error("Error reading log record size", zap.Error(err))
-				return err
+				return nil, err
 			}
 
 			// Step 2: Read the full record data into a buffer.
@@ -384,32 +526,13 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 			if _, err := io.ReadFull(r.currentFile, recordData); err != nil {
 				// This is a critical error, might indicate a truncated/corrupt WAL file.
 				r.logManager.logger.Error("Failed to read full log record from WAL stream", zap.Error(err), zap.Uint32("expectedSize", recordSize))
-				return err
+				return nil, err
 			}
 
-			// Step 3: Manually deserialize the buffer into the logRecord struct.
-			offset := 0
-			logRecord.LSN = LSN(binary.LittleEndian.Uint64(recordData[offset:]))
-			offset += 8
-			logRecord.Type = LogRecordType(recordData[offset])
-			offset += 1
-			logRecord.Timestamp = int64(binary.LittleEndian.Uint64(recordData[offset:]))
-			offset += 8
-			logRecord.TxnID = binary.LittleEndian.Uint64(recordData[offset:])
-			offset += 8
-			logRecord.PageID = pagemanager.PageID(binary.LittleEndian.Uint32(recordData[offset:]))
-			offset += 4
-			dataLen := binary.LittleEndian.Uint32(recordData[offset:])
-			offset += 4
-
-			// Extract the data payload
-			dataEnd := offset + int(dataLen)
-			logRecord.Data = recordData[offset:dataEnd]
-			offset = dataEnd
-
-			// Extract CRC
-			logRecord.CRC = binary.LittleEndian.Uint32(recordData[offset:])
-			// TODO: Optionally validate CRC here against recordData[:offset]
+			logRecord, err := DecodeLogRecord(recordData)
+			if err != nil {
+				return nil, err
+			}
 
 			// Step 4: Decrypt payload if encryption is enabled.
 			// if r.logManager.cryptoUtil != nil {
@@ -422,7 +545,7 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) error {
 			// }
 			// Step 5: Update the replication slot's progress.
 			r.logManager.UpdateSlotLSN(r.slotName, logRecord.LSN+1)
-			return nil
+			return recordData, nil
 		}
 	}
 }
@@ -478,10 +601,11 @@ func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
 			return fmt.Errorf("could not find WAL segment for LSN %d. It may have been pruned", lsn)
 		}
 	}
-
+	r.logManager.logger.Debug("Found the target segment ID", zap.Any("segmentId", targetSegmentID))
 	if err := r.openSegment(targetSegmentID); err != nil {
 		return err
 	}
+	r.logManager.logger.Debug("Current wal file ", zap.Any("filename", r.currentFile))
 
 	// Scan from the beginning of the segment to find the exact record
 	for {
@@ -492,7 +616,7 @@ func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
 		}
 
 		var recordSize uint32
-		err = binary.Read(r.currentFile, binary.LittleEndian, &recordSize)
+		err = binary.Read(r.currentFile, binary.BigEndian, &recordSize)
 		if err == io.EOF {
 			// We've reached the end of the file while searching for the starting LSN.
 			// This is not an error; it just means the log we're looking for hasn't been written yet.
@@ -516,7 +640,7 @@ func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
 			return nil
 		}
 
-		currentLSN := LSN(binary.LittleEndian.Uint64(recordData[0:8]))
+		currentLSN := LSN(binary.BigEndian.Uint64(recordData[0:8]))
 		if currentLSN >= lsn {
 			// We found the record we need to start at (or the one just after it).
 			// Seek back to the beginning of this record so Next() can read it.
@@ -538,12 +662,16 @@ func (r *WALStreamReader) openSegment(segmentID int) error {
 	// FIX: Removed the incorrect negation of segmentID.
 	// segmentID = -1 * segmentID
 	filePath := filepath.Join(r.logManager.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segmentID, walFileSuffix))
+	r.logManager.logger.Debug("Segment filePath: ", zap.Any("filepath", filePath))
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("could not open WAL segment %d for streaming: %w", segmentID, err)
 	}
+	r.logManager.logger.Debug("Segment filePath: ", zap.Any("filepath", filePath))
 	r.currentFile = file
+	r.logManager.logger.Debug("Segment file: ", zap.Any("file", r.currentFile))
 	r.currentSegmentID = segmentID
+	r.logManager.logger.Debug("Segment ID: ", zap.Any("ID", r.currentSegmentID))
 	// FIX: No longer need a gob decoder.
 	// r.decoder = gob.NewDecoder(file)
 	return nil
@@ -658,7 +786,7 @@ func (lm *LogManager) findLastLSNInSegment(segmentPath string) (LSN, error) {
 
 	for {
 		// Read record size
-		err = binary.Read(reader, binary.LittleEndian, &recordSize)
+		err = binary.Read(reader, binary.BigEndian, &recordSize)
 		if err == io.EOF {
 			break // End of file, successfully read all records
 		}
@@ -684,7 +812,7 @@ func (lm *LogManager) findLastLSNInSegment(segmentPath string) (LSN, error) {
 			lm.logger.Warn("Record data too short to contain LSN", zap.String("segmentPath", segmentPath), zap.Uint32("recordSize", recordSize))
 			return lastReadLSN, fmt.Errorf("record data too short")
 		}
-		currentLSN := LSN(binary.LittleEndian.Uint64(recordData[:8]))
+		currentLSN := LSN(binary.BigEndian.Uint64(recordData[:8]))
 
 		if currentLSN == 0 { // LSNs should be > 0
 			return lastReadLSN, fmt.Errorf("found LSN 0 in segment %s", segmentPath)
@@ -728,59 +856,26 @@ func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) 
 	lm.currentLSN++
 	lsn := lm.currentLSN
 
-	record := LogRecord{
-		LSN:       lsn,
-		Type:      lr.Type,
-		Timestamp: time.Now().UnixNano(),
-		TxnID:     lr.TxnID,
-		PageID:    lr.PageID,
-		Data:      lr.Data,
-		LogType:   logType,
-		SegmentID: lm.currentSegmentID,
+	encoded, err := lr.Encode()
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode log record: %w", err)
 	}
 
-	// FIX: Corrected PageID serialization from uint64 to uint32 to match the struct.
-	// Size = 8(LSN) + 1(Type) + 8(Timestamp) + 8(TxnID) + 4(PageID) + 4(DataLen) + len(Data) + 4(CRC)
-	headerSize := 8 + 1 + 8 + 8 + 4 + 4
-	serializedRecordSize := uint32(headerSize + len(record.Data) + 4)
-	record.RecordSize = serializedRecordSize
-
-	buffer := make([]byte, serializedRecordSize)
-	offset := 0
-	binary.LittleEndian.PutUint64(buffer[offset:], uint64(record.LSN))
-	offset += 8
-	buffer[offset] = byte(record.Type)
-	offset += 1
-	binary.LittleEndian.PutUint64(buffer[offset:], uint64(record.Timestamp))
-	offset += 8
-	binary.LittleEndian.PutUint64(buffer[offset:], record.TxnID)
-	offset += 8
-	binary.LittleEndian.PutUint32(buffer[offset:], uint32(record.PageID))
-	offset += 4
-	binary.LittleEndian.PutUint32(buffer[offset:], uint32(len(record.Data)))
-	offset += 4
-	copy(buffer[offset:], record.Data)
-	offset += len(record.Data)
-
-	// Placeholder CRC
-	binary.LittleEndian.PutUint32(buffer[offset:], 0xDEADBEEF)
-
-	onDiskEntrySize := int64(4 + serializedRecordSize)
 	currentFileSize, err := lm.currentSegmentFile.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, fmt.Errorf("failed to seek current WAL segment: %w", err)
 	}
 
-	if currentFileSize+onDiskEntrySize > lm.maxSegmentSize {
+	if currentFileSize+int64(lr.RecordSize) > lm.maxSegmentSize {
 		if err := lm.rollOverSegment(); err != nil {
 			return 0, fmt.Errorf("failed to roll over WAL segment: %w", err)
 		}
 	}
 
-	if err := binary.Write(lm.currentSegmentFile, binary.LittleEndian, serializedRecordSize); err != nil {
+	if err := binary.Write(lm.currentSegmentFile, binary.BigEndian, lr.RecordSize); err != nil {
 		return 0, fmt.Errorf("failed to write record size to WAL: %w", err)
 	}
-	if _, err := lm.currentSegmentFile.Write(buffer); err != nil {
+	if _, err := lm.currentSegmentFile.Write(encoded); err != nil {
 		lm.logger.Fatal("FATAL: Failed to write record data to WAL. WAL may be corrupt.", zap.Error(err))
 		return 0, fmt.Errorf("failed to write record data to WAL: %w", err)
 	}

@@ -144,8 +144,8 @@ func main() {
 	go startHTTPServer()
 
 	// Start replication listener (for primaries to connect to this replica)
-	globalWG.Add(1)
-	go listenForReplicationRequests()
+	// globalWG.Add(1)
+	// go listenForReplicationRequests()
 
 	// Initial attempt to fetch shard map. FSM will handle subsequent updates via Raft.
 	globalWG.Add(1)
@@ -164,7 +164,7 @@ func main() {
 
 func NewErrorLevelLogger() *zap.Logger {
 	// Set log level to ERROR
-	level := zap.NewAtomicLevelAt(zapcore.ErrorLevel)
+	level := zap.NewAtomicLevelAt(zapcore.DebugLevel)
 
 	// Configure encoder (console or JSON)
 	encoderCfg := zap.NewProductionEncoderConfig()
@@ -306,27 +306,29 @@ func initStorageNode(logger *zap.Logger) error {
 	indexReplicationManagers[indexing.SpatialIndexType] = spatialRepMgr
 	zlogger.Info("Spatial Index Replication Manager initialized")
 
-	// Start all replication managers
-	for idxType, repMgr := range indexReplicationManagers {
-		if err := repMgr.Start(); err != nil {
-			// Log error but don't necessarily fail fast, node might still function for other indexes
-			zlogger.Error("Failed to start replication manager", zap.String("indexType", string(idxType)), zap.Error(err))
-		} else {
-			zlogger.Info("Successfully started replication manager", zap.String("indexType", string(idxType)))
-		}
+	replicationOrchestrator := logreplication.NewReplicationOrchestrator(*replicationAddr, indexReplicationManagers)
+	if err := replicationOrchestrator.Start(); err != nil {
+		zlogger.Fatal("Failed to start replication orchestrator", zap.Any("error", err))
 	}
+	// // Start all replication managers
+	// for idxType, repMgr := range indexReplicationManagers {
+	// 	if err := repMgr.Start(); err != nil {
+	// 		// Log error but don't necessarily fail fast, node might still function for other indexes
+	// 		zlogger.Error("Failed to start replication manager", zap.String("indexType", string(idxType)), zap.Error(err))
+	// 	} else {
+	// 		zlogger.Info("Successfully started replication manager", zap.String("indexType", string(idxType)))
+	// 	}
+	// }
+
 	// --- End of Replication Manager Init ---
 
 	// Initialize FSM, passing the map of replication managers.
 	// The FSM uses these managers to react to shard assignment changes from Raft log.
-	var replMgrs = make(map[indexing.IndexType]logreplication.ReplicationManagerInterface)
-	replMgrs[indexing.BTreeIndexType] = bTreeRepMgr
-	replMgrs[indexing.InvertedIndexType] = invertedIndexRepMgr
-	replMgrs[indexing.SpatialIndexType] = spatialRepMgr
+
 	raftFSM = fsm.NewFSM(
 		myStorageNodeID,
 		myStorageNodeAddr,
-		replMgrs,
+		indexReplicationManagers,
 		zlogger,
 	)
 	zlogger.Info("Raft FSM initialized")
@@ -545,7 +547,6 @@ func handleReplicationConnection(conn net.Conn) {
 
 	indexTypeStr := string(handshakeBuf)
 	indexType := indexing.IndexType(indexTypeStr)
-	log.Println("INDEXTYPE: ", indexTypeStr, indexType)
 	// Find the appropriate replication manager
 	repMgr, ok := indexReplicationManagers[indexType]
 	if !ok {

@@ -1,20 +1,16 @@
-package main
+package events
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
+	"log"
 	"net/http"
-	"strings"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,7 +19,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-const numConnections = 2
+const numConnections = 5
 
 // EventSender sends events from many goroutines over multiple concurrent HTTP/3 streams.
 type EventSender struct {
@@ -73,7 +69,7 @@ func NewEventSender(addr string, bufferSize int, clientTLSConf *tls.Config) *Eve
 		flushInterval:    50 * time.Millisecond,
 		eventsCh:         make(chan []byte, bufferSize),
 		pool: &sync.Pool{
-			New: func() interface{} { return make([]byte, 0, 1024) },
+			New: func() any { return make([]byte, 0, 1024) },
 		},
 		quit:         make(chan struct{}),
 		roundTripper: rt,
@@ -101,6 +97,7 @@ func NewEventSender(addr string, bufferSize int, clientTLSConf *tls.Config) *Eve
 
 // Send blocks until data is queued (or returns error if sender closed).
 func (s *EventSender) Send(data []byte) error {
+	fmt.Println("Calling send for ", len(data))
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return errors.New("sender closed")
 	}
@@ -117,6 +114,7 @@ func (s *EventSender) Send(data []byte) error {
 
 // TrySend attempts to enqueue without blocking; returns true if accepted.
 func (s *EventSender) TrySend(data []byte) bool {
+	log.Println("EventSender: sending data", len(data))
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return false
 	}
@@ -163,22 +161,31 @@ func (s *EventSender) batchingLoop() {
 			return
 		}
 
-		// We must copy the bytes because the two channel sends in the select
-		// statement below can happen concurrently. If we sent a pointer to the
-		// same underlying byte slice, we could have a data race.
 		payload := make([]byte, batch.Len())
 		copy(payload, batch.Bytes())
 
-		// This select statement is the core of the high-availability logic.
-		// It will send the batch to the FIRST available connection manager.
-		// If both are available, one is chosen at random (load balancing).
-		// If one is blocked, the other is chosen instantly (failover).
-		select {
-		case s.batchChs[0] <- payload:
-		case s.batchChs[1] <- payload:
-		case <-s.quit:
-			// If shutting down, don't block trying to send a final batch.
+		// --- DYNAMIC SELECT ---
+		// Build a slice of cases for reflect.Select. This allows us to
+		// select on a dynamic number of channels.
+		cases := make([]reflect.SelectCase, numConnections+1)
+		for i := 0; i < numConnections; i++ {
+			cases[i] = reflect.SelectCase{
+				Dir:  reflect.SelectSend,
+				Chan: reflect.ValueOf(s.batchChs[i]),
+				Send: reflect.ValueOf(payload),
+			}
 		}
+		// Add the quit channel as the last case.
+		cases[numConnections] = reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(s.quit),
+		}
+
+		// reflect.Select blocks until one of the cases can proceed.
+		// If multiple are ready, it chooses one pseudo-randomly.
+		// This provides both load balancing and failover.
+		reflect.Select(cases)
+		// We don't need the return value (chosen index) for this logic.
 
 		batch.Reset()
 		messagesInBatch = 0
@@ -305,74 +312,43 @@ func (s *EventSender) frameAppend(buf *bytes.Buffer, msg []byte) {
 
 // --- Example Usage & Server ---
 
-func main() {
-	serverTLSConf, clientCertPool := generateTLSConfig()
-	addr := "localhost:9090"
+// func main() {
+// 	serverTLSConf, clientCertPool := generateTLSConfig()
+// 	addr := "localhost:9090"
 
-	go runDummyH3Server(addr, serverTLSConf)
-	time.Sleep(100 * time.Millisecond)
+// 	go runDummyH3Server(addr, serverTLSConf)
+// 	time.Sleep(100 * time.Millisecond)
 
-	clientTLSConf := &tls.Config{
-		RootCAs:    clientCertPool,
-		NextProtos: []string{"h3"},
-	}
+// 	clientTLSConf := &tls.Config{
+// 		RootCAs:    clientCertPool,
+// 		NextProtos: []string{"h3"},
+// 	}
 
-	sender := NewEventSender(addr, 4096, clientTLSConf)
-	defer sender.Close()
+// 	sender := NewEventSender(addr, 4096, clientTLSConf)
+// 	defer sender.Close()
 
-	var wg sync.WaitGroup
-	producers := 20
-	msgsPerProducer := 100
+// 	var wg sync.WaitGroup
+// 	producers := 200
+// 	msgsPerProducer := 1000
 
-	start := time.Now()
-	for i := 0; i < producers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < msgsPerProducer; j++ {
-				payload := []byte(fmt.Sprintf("producer=%d seq=%d time=%d", id, j, time.Now().UnixNano()))
-				if !sender.TrySend(payload) {
-					_ = sender.Send(payload)
-				}
-			}
-		}(i)
-	}
-	wg.Wait()
+// 	start := time.Now()
+// 	for i := 0; i < producers; i++ {
+// 		wg.Add(1)
+// 		go func(id int) {
+// 			defer wg.Done()
+// 			for j := 0; j < msgsPerProducer; j++ {
+// 				payload := []byte(fmt.Sprintf("producer=%d seq=%d time=%d", id, j, time.Now().UnixNano()))
+// 				if !sender.TrySend(payload) {
+// 					_ = sender.Send(payload)
+// 				}
+// 			}
+// 		}(i)
+// 	}
+// 	wg.Wait()
 
-	time.Sleep(12000 * time.Millisecond)
-	fmt.Printf("done sending %d messages in %v\n", producers*msgsPerProducer, time.Since(start))
-}
-
-func generateTLSConfig() (*tls.Config, *x509.CertPool) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{Organization: []string{"Test Co"}},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	leafCert, err := x509.ParseCertificate(certDER)
-	if err != nil {
-		panic(err)
-	}
-	serverTLSConf := &tls.Config{
-		Certificates: []tls.Certificate{{Certificate: [][]byte{certDER}, PrivateKey: key, Leaf: leafCert}},
-		NextProtos:   []string{"h3"},
-	}
-	certPool := x509.NewCertPool()
-	certPool.AddCert(leafCert)
-	return serverTLSConf, certPool
-}
+// 	time.Sleep(500 * time.Millisecond)
+// 	fmt.Printf("done sending %d messages in %v\n", producers*msgsPerProducer, time.Since(start))
+// }
 
 func runDummyH3Server(addr string, tlsConf *tls.Config) {
 	handler := http.NewServeMux()
@@ -408,11 +384,10 @@ func runDummyH3Server(addr string, tlsConf *tls.Config) {
 				fmt.Printf("server read payload error: %v\n", err)
 				break
 			}
-			fmt.Println("Payload: ", string(payload))
-			if strings.Contains(string(payload), "producer=0") {
-				time.Sleep(100 * time.Millisecond)
-			}
 			total++
+			// if strings.Contains(string(payload), "producer=0") {
+			// 	time.Sleep(50 * time.Millisecond)
+			// }
 			if total%20000 == 0 {
 				fmt.Printf("server: received total %d messages on this stream\n", total)
 			}

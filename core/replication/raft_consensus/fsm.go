@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -316,11 +317,11 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		f.logger.Info("Applied InitiateShardMigration", zap.String("opID", cmd.MigrationState.OperationID), zap.String("shard", cmd.MigrationState.ShardID))
 		// Controller logic (outside FSM Apply) would then RPC source/target to begin.
 		for index, replMgr := range f.indexReplicationMgrs {
-			manifest, err := replMgr.PrepareSnapshot(cmd.ShardID)
+			_, err := replMgr.PrepareSnapshot(cmd.ShardID)
 			if err != nil {
 				f.logger.Error("Error while creating snapshot", zap.String("opID", cmd.MigrationState.OperationID), zap.String("shard", cmd.MigrationState.ShardID), zap.String("indexType", string(index)))
 			}
-			replMgr.GetSnapshotDataStream(cmd.ShardID, manifest.SnapshotID, manifest.Path)
+			// replMgr.GetSnapshotDataStream(cmd.ShardID, manifest.SnapshotID, manifest.)
 		}
 		return nil
 	case CommandUpdateShardMigrationState:
@@ -526,6 +527,7 @@ func (f *FSM) applyUpdateNodeStatus(cmd Command) error {
 }
 
 func (f *FSM) applyAssignSlot(cmd Command) error {
+	log.Println("Called apply assign slot")
 	if cmd.SlotID > 1023 || cmd.PrimaryNodeID == "" { // NodeID is the new primary
 		return fmt.Errorf("AssignSlot command missing SlotID or NodeID (primary)")
 	}
@@ -580,6 +582,7 @@ func (f *FSM) applyAssignSlot(cmd Command) error {
 
 	// This function will notify local replication managers if this FSM instance's node
 	// had its role changed for this slot.
+	log.Println("Called handle assign slot")
 	f.handleSlotAssignmentChange(cmd.SlotID, assignment, oldPrimaryNodeID)
 	return nil
 }
@@ -734,18 +737,22 @@ func (f *FSM) getSlotIDFromShardID(shardID string) (uint64, error) {
 // It checks if the local node's role for the given slot has changed and, if so,
 // instructs the local ReplicationManagers.
 func (f *FSM) handleSlotAssignmentChange(slotID uint64, newAssignment *SlotAssignment, oldPrimaryNodeID string) {
+	f.logger.Info("Handling slot assignment")
 	if newAssignment == nil {
 		f.logger.Warn("handleSlotAssignmentChange called with nil newAssignment", zap.Uint64("slotID", slotID))
 		return
 	}
-
+	log.Println("Primary node: ", newAssignment.PrimaryNodeID, "l", f.localNodeID, "o", oldPrimaryNodeID)
 	// --- Check if this node's role as PRIMARY changed ---
 	isNowPrimary := newAssignment.PrimaryNodeID == f.localNodeID
 	wasPrimary := oldPrimaryNodeID == f.localNodeID
-
+	log.Println("Primary option: ", isNowPrimary, wasPrimary)
+	log.Println("eval: ", isNowPrimary && !wasPrimary)
 	if isNowPrimary && !wasPrimary {
+		fmt.Println("=== REACHED HERE 751 ===")
+		f.logger.Info("Here 751")
 		// This node just became primary for slotID
-		f.logger.Info("FSM: This node BECAME PRIMARY for slot", zap.Uint64("slotID", slotID), zap.Any("replicas", newAssignment.ReplicaNodes))
+		log.Println("FSM: This node BECAME PRIMARY for slot", zap.Uint64("slotID", slotID), zap.Any("replicas", newAssignment.ReplicaNodes))
 		for _, repMgr := range f.indexReplicationMgrs {
 			// Pass replica addresses (NodeID -> Addr from f.storageNodes)
 			replicaAddrMap := make(map[string]string)
@@ -756,21 +763,24 @@ func (f *FSM) handleSlotAssignmentChange(slotID uint64, newAssignment *SlotAssig
 					f.logger.Warn("Replica node info not found in FSM for primary assignment", zap.String("replicaNodeID", repNodeID), zap.Uint64("slotID", slotID))
 				}
 			}
+			log.Println("Called Become primary 760", replicaAddrMap)
 			if err := repMgr.BecomePrimaryForSlot(slotID, replicaAddrMap); err != nil {
 				f.logger.Error("Error calling BecomePrimaryForSlot on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
 			}
 		}
 	} else if !isNowPrimary && wasPrimary {
+		log.Println("Here 770")
 		// This node CEASED to be primary for slotID
-		f.logger.Info("FSM: This node CEASED TO BE PRIMARY for slot", zap.Uint64("slotID", slotID))
+		log.Println("FSM: This node CEASED TO BE PRIMARY for slot", zap.Uint64("slotID", slotID))
 		for _, repMgr := range f.indexReplicationMgrs {
 			if err := repMgr.CeasePrimaryForSlot(slotID); err != nil {
 				f.logger.Error("Error calling CeasePrimaryForSlot on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
 			}
 		}
 	} else if isNowPrimary && wasPrimary {
+		log.Println("Here 779")
 		// Still primary, but replica set might have changed.
-		f.logger.Info("FSM: This node REMAINS PRIMARY for slot, replica set may have changed", zap.Uint64("slotID", slotID), zap.Any("newReplicas", newAssignment.ReplicaNodes))
+		log.Println("FSM: This node REMAINS PRIMARY for slot, replica set may have changed", zap.Uint64("slotID", slotID), zap.Any("newReplicas", newAssignment.ReplicaNodes))
 		// The BecomePrimaryForSlot on replication managers should be idempotent or handle updates to the replica set.
 		// It might need to start streaming to new replicas and stop streaming to removed ones.
 		// For simplicity, re-calling BecomePrimaryForSlot might refresh its state.
@@ -781,6 +791,7 @@ func (f *FSM) handleSlotAssignmentChange(slotID uint64, newAssignment *SlotAssig
 					replicaAddrMap[repNodeID] = nodeInfo.ReplicationAddr
 				}
 			}
+			log.Println("Called Become primary 786")
 			if err := repMgr.BecomePrimaryForSlot(slotID, replicaAddrMap); err != nil { // This should reconcile replicas
 				f.logger.Error("Error calling BecomePrimaryForSlot (for update) on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
 			}
@@ -801,12 +812,13 @@ func (f *FSM) handleSlotAssignmentChange(slotID uint64, newAssignment *SlotAssig
 		// A simpler check: if we were in f.storageNodes[f.localNodeID].ShardsReplicating for this slot.
 		_, wasReplica = f.storageNodes[f.localNodeID].ShardsReplicating[slotID]
 	}
-
+	log.Println("Here 813")
 	if isNowReplica {
 		primaryForThisSlot := newAssignment.PrimaryNodeID
 		if primaryInfo, ok := f.storageNodes[primaryForThisSlot]; ok {
 			f.logger.Info("FSM: This node IS/REMAINS A REPLICA for slot", zap.Uint64("slotID", slotID), zap.String("primary", primaryForThisSlot))
 			for _, repMgr := range f.indexReplicationMgrs {
+				f.logger.Info("Called Become primary 813")
 				if err := repMgr.BecomeReplicaForSlot(slotID, primaryForThisSlot, primaryInfo.ReplicationAddr); err != nil {
 					f.logger.Error("Error calling BecomeReplicaForSlot on local manager", zap.Error(err), zap.String("indexType", string(repMgr.GetIndexType())))
 				}

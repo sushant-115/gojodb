@@ -3,10 +3,11 @@ package logreplication
 import (
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
+	"github.com/sushant-115/gojodb/core/replication/events"
+	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
 )
@@ -86,31 +87,31 @@ func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replic
 		if _, exists := srm.PrimarySlotReplicas[slotID][replicaNodeID]; exists && srm.PrimarySlotReplicas[slotID][replicaNodeID].IsActive {
 			continue // Already streaming
 		}
-
-		conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
-		if err != nil {
-			srm.Logger.Error("Failed to connect to Spatial Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-			continue
-		}
-		if err := srm.sendHandshake(conn); err != nil {
-			srm.Logger.Error("Failed to send handshake to Spatial replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-			conn.Close()
-			continue
-		}
+		eventSender := events.NewEventSender(replicaAddress, 10*1024, internaltls.GetTestClientCert())
+		// conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
+		// if err != nil {
+		// 	srm.Logger.Error("Failed to connect to Spatial Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
+		// 	continue
+		// }
+		// if err := srm.sendHandshake(conn); err != nil {
+		// 	srm.Logger.Error("Failed to send handshake to Spatial replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
+		// 	conn.Close()
+		// 	continue
+		// }
 		srm.Logger.Info("Successfully connected to Spatial Index replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
 
 		connInfo := &ReplicaConnectionInfo{
-			NodeID:     replicaNodeID,
-			Address:    replicaAddress,
-			Conn:       conn,
-			StopChan:   make(chan struct{}),
-			IsActive:   true,
-			LastAckLSN: 0, // TODO: Fetch initial LSN
+			NodeID:      replicaNodeID,
+			Address:     replicaAddress,
+			EventSender: eventSender,
+			StopChan:    make(chan struct{}),
+			IsActive:    true,
+			LastAckLSN:  0, // TODO: Fetch initial LSN
 		}
 		srm.PrimarySlotReplicas[slotID][replicaNodeID] = connInfo
 
 		srm.wg.Add(1)
-		go srm.streamLogs(conn, connInfo.LastAckLSN, connInfo.StopChan, &srm.wg, replicaNodeID)
+		go srm.streamLogs(connInfo, &srm.wg, replicaNodeID)
 	}
 	return nil
 }
