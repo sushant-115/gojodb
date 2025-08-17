@@ -101,6 +101,9 @@ func NewEventReceiver(cfg ReceiverConfig, logger ReceiverLogger, hooks ReceiverH
 	if cfg.MaxEventBytes <= 0 {
 		cfg.MaxEventBytes = 1 << 20 // 1 MiB
 	}
+
+	cfg.ResponseOnStart = true
+
 	if logger == nil {
 		logger = NopLogger{}
 	}
@@ -242,7 +245,7 @@ func (r *EventReceiver) eventHandler(w http.ResponseWriter, req *http.Request) {
 
 	ctx := req.Context()
 	body := req.Body
-	defer body.Close()
+	//defer body.Close()
 
 	// Optionally acknowledge early (best effort).
 	if r.cfg.ResponseOnStart {
@@ -256,7 +259,8 @@ func (r *EventReceiver) eventHandler(w http.ResponseWriter, req *http.Request) {
 	var streamBytes int64
 
 	readFull := func(dst []byte) error {
-		_, err := io.ReadFull(body, dst)
+		n, err := io.ReadFull(body, dst)
+		fmt.Println("Received bytes count: ", n, err)
 		return err
 	}
 
@@ -276,6 +280,7 @@ func (r *EventReceiver) eventHandler(w http.ResponseWriter, req *http.Request) {
 
 		if err := readFull(lenBuf[:]); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				fmt.Println("End of stream")
 				// normal close or truncated final frame; treat as end of stream
 				return
 			}
@@ -330,7 +335,10 @@ func (r *EventReceiver) eventHandler(w http.ResponseWriter, req *http.Request) {
 		ev := make([]byte, int(n))
 		copy(ev, b)
 		r.pool.Put(&b)
-
+		if string(ev) == "Test" {
+			fmt.Println("Received test message: ", string(ev))
+			continue
+		}
 		// Backpressure policy
 		switch r.cfg.Backpressure {
 		case BlockSender:

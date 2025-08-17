@@ -335,7 +335,7 @@ func (s *EventSender) connectionManager(id int, in <-chan []byte) {
 				continue
 			}
 		}
-
+		// log.Println("Payload: ", payload)
 		if _, err := st.writer.Write(payload); err != nil {
 			s.cfg.Logger.Printf("[conn %d] write error: %v — reconnecting", id, err)
 			_ = st.writer.Close()

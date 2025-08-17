@@ -156,7 +156,18 @@ func (brm *BaseReplicationManager) streamLogs(
 		zap.String("remoteNodeID", remoteNodeID),
 		zap.Uint64("fromLSN", uint64(fromLSN)),
 	)
-
+	// Send a NO-OP record to establish the stream and prevent the receiver from closing it.
+	noOpRecord := &wal.LogRecord{Type: wal.LogRecordTypeNoOp, IndexType: brm.IndexType}
+	encodedNoOp, err := noOpRecord.Encode() // You'll need an Encode method on LogRecord
+	if err != nil {
+		brm.Logger.Error("Failed to encode NO-OP log record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
+		return
+	}
+	if err := connInfo.EventSender.Send(encodedNoOp); err != nil {
+		brm.Logger.Error("Failed to send initial NO-OP record", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))
+		return
+	}
+	brm.Logger.Info("Sent initial NO-OP record to establish stream", zap.String("remoteNodeID", remoteNodeID))
 	walReader, err := brm.LogManager.GetWALReaderForStreaming(fromLSN, remoteNodeID+"_"+string(brm.IndexType))
 	if err != nil {
 		brm.Logger.Error("Failed to get WAL reader for streaming", zap.Error(err), zap.String("remoteNodeID", remoteNodeID))

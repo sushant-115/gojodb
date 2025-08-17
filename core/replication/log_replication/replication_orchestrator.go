@@ -39,6 +39,9 @@ func NewReplicationOrchestrator(addr string, replMgrs map[indexing.IndexType]Rep
 		OnStreamClose: func(remote string, err error) {
 			fmt.Println("Stream closed from: ", remote, " Due to: ", err)
 		},
+		OnError: func(stage string, err error) {
+			fmt.Println("Error occured: ", stage, err)
+		},
 	})
 	if err != nil {
 
@@ -68,22 +71,37 @@ func (r *ReplicationOrchestrator) Stop() {
 func (r *ReplicationOrchestrator) handleInboundStream() {
 	log.Println("Orch Handle inbound stream")
 	eventsCh := r.EventReceiver.Events()
-	for event := range eventsCh {
-		log.Println("Received event: ", len(event))
-		lr, err := wal.DecodeLogRecord(event)
-		if err != nil || lr == nil {
-			log.Println("Error: Couldn't decode the log record: ", string(event))
-			continue
-		}
-		r.mu.Lock()
-		replMgr, ok := r.ReplMgrs[lr.IndexType]
-		if !ok {
-			log.Println("Error: found unknown/invalid index type in the replication event: ", lr.IndexType)
-			continue
-		}
-		r.mu.Unlock()
-		if err := replMgr.ApplyLogRecord(*lr); err != nil {
-			log.Println("Error: Couldn't apply the log record: ", lr)
+	for {
+		select {
+		case event, ok := <-eventsCh:
+			if !ok {
+				// Channel is closed, so we can exit.
+				log.Println("Event channel closed, stopping inbound stream handler.")
+				return
+			}
+
+			log.Println("Received event: ", len(event))
+			lr, err := wal.DecodeLogRecord(event)
+			if err != nil || lr == nil {
+				log.Println("Error: Couldn't decode the log record: ", string(event))
+				continue
+			}
+
+			r.mu.Lock()
+			replMgr, ok := r.ReplMgrs[lr.IndexType]
+			r.mu.Unlock() // Unlock immediately after accessing the map
+
+			if !ok {
+				log.Println("Error: found unknown/invalid index type in the replication event: ", lr.IndexType)
+				continue
+			}
+
+			if err := replMgr.ApplyLogRecord(*lr); err != nil {
+				log.Println("Error: Couldn't apply the log record: ", lr)
+			}
+		case <-r.stopChan:
+			log.Println("Received stop signal, stopping inbound stream handler.")
+			return
 		}
 	}
 }
