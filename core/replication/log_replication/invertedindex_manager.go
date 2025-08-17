@@ -2,6 +2,7 @@ package logreplication
 
 import (
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -9,7 +10,6 @@ import (
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/replication/events"
-	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
 )
@@ -21,9 +21,9 @@ type InvertedIndexReplicationManager struct {
 }
 
 // NewInvertedIndexReplicationManager creates a new InvertedIndexReplicationManager.
-func NewInvertedIndexReplicationManager(nodeID string, ii *inverted_index.InvertedIndex, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *InvertedIndexReplicationManager {
+func NewInvertedIndexReplicationManager(nodeID string, ii *inverted_index.InvertedIndex, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, clientCert *tls.Config) *InvertedIndexReplicationManager {
 	return &InvertedIndexReplicationManager{
-		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.InvertedIndexType, lm, logger, nodeDataDir),
+		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.InvertedIndexType, lm, logger, nodeDataDir, clientCert),
 		InvertedIndex:          ii,
 	}
 }
@@ -92,7 +92,7 @@ func (iirm *InvertedIndexReplicationManager) BecomePrimaryForSlot(slotID uint64,
 		cfg := events.Config{
 			Addr:    replicaAddress,
 			URLPath: "/events",
-			TLS:     internaltls.GetTestClientCert(),
+			TLS:     iirm.clientTLSCert,
 		}
 		eventSender, err := events.NewEventSender(cfg)
 		if err != nil {

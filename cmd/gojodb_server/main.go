@@ -23,6 +23,7 @@ import (
 	indexedwritesservice "github.com/sushant-115/gojodb/api/indexed_writes_service"
 	pb "github.com/sushant-115/gojodb/api/proto"
 	gojodbcontroller "github.com/sushant-115/gojodb/cmd/gojodb_controller"
+	"github.com/sushant-115/gojodb/config/certs"
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
@@ -192,6 +193,9 @@ func initStorageNode(logger *zap.Logger) error {
 		return fmt.Errorf("failed to create base data directory %s: %w", baseDataDir, err)
 	}
 
+	// Load certs
+	serverCert, clientCert := certs.LoadCerts("/Users/sushant/go/src/gojodb/config/certs")
+
 	// Initialize Log Manager (WAL)
 	walPath := filepath.Join(baseDataDir, "wal")
 	if err := os.MkdirAll(walPath, 0750); err != nil {
@@ -286,7 +290,7 @@ func initStorageNode(logger *zap.Logger) error {
 	indexReplicationManagers = make(map[indexing.IndexType]logreplication.ReplicationManagerInterface)
 
 	// B-tree Replication Manager (uses the main logManager)
-	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, baseDataDir)
+	bTreeRepMgr := logreplication.NewBTreeReplicationManager(myStorageNodeID, dbInstance, logManager, zlogger, baseDataDir, clientCert)
 	indexReplicationManagers[indexing.BTreeIndexType] = bTreeRepMgr
 	zlogger.Info("B-tree Replication Manager initialized")
 
@@ -298,16 +302,16 @@ func initStorageNode(logger *zap.Logger) error {
 		zlogger.Warn("InvertedIndex GetLogManager returned nil, using main logManager for its replication. Review InvertedIndex WAL strategy.")
 		iiLogManager = logManager // Fallback, ensure this is correct for how Inverted Index logs its changes.
 	}
-	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger, invertedIndexPath)
+	invertedIndexRepMgr := logreplication.NewInvertedIndexReplicationManager(myStorageNodeID, invertedIndexInstance, iiLogManager, zlogger, invertedIndexPath, clientCert)
 	indexReplicationManagers[indexing.InvertedIndexType] = invertedIndexRepMgr
 	zlogger.Info("Inverted Index Replication Manager initialized")
 
 	// Spatial Index Replication Manager (uses its own `spatialLm`)
-	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger, spatialIndexPath)
+	spatialRepMgr := logreplication.NewSpatialReplicationManager(myStorageNodeID, spatialIdx, spatialLm, zlogger, spatialIndexPath, clientCert)
 	indexReplicationManagers[indexing.SpatialIndexType] = spatialRepMgr
 	zlogger.Info("Spatial Index Replication Manager initialized")
 
-	replicationOrchestrator = logreplication.NewReplicationOrchestrator(*replicationAddr, indexReplicationManagers)
+	replicationOrchestrator = logreplication.NewReplicationOrchestrator(*replicationAddr, indexReplicationManagers, serverCert)
 	if err := replicationOrchestrator.Start(); err != nil {
 		zlogger.Fatal("Failed to start replication orchestrator", zap.Any("error", err))
 	}

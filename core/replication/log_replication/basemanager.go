@@ -2,6 +2,7 @@ package logreplication
 
 import (
 	"crypto/sha256" // For checksums
+	"crypto/tls"
 	"encoding/gob"
 	"encoding/hex" // For checksums
 	"fmt"
@@ -50,11 +51,12 @@ type BaseReplicationManager struct {
 	// Base path for storing/retrieving snapshot files for THIS index type on THIS node.
 	// e.g., /var/lib/gojodb/<node_id>/snapshots/<index_type>/
 	snapshotBaseDir string
+	clientTLSCert   *tls.Config
 }
 
 // NewBaseReplicationManager initializes a new BaseReplicationManager.
 // dataDir is the base data directory for the GojoDB node.
-func NewBaseReplicationManager(nodeID string, indexType indexing.IndexType, logManager *wal.LogManager, logger *zap.Logger, nodeDataDir string) BaseReplicationManager {
+func NewBaseReplicationManager(nodeID string, indexType indexing.IndexType, logManager *wal.LogManager, logger *zap.Logger, nodeDataDir string, clientCert *tls.Config) BaseReplicationManager {
 	snapDir := filepath.Join(nodeDataDir, "snapshots", string(indexType))
 	if err := os.MkdirAll(snapDir, 0750); err != nil {
 		// Log error but don't fail construction, snapshotting might just fail later

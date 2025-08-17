@@ -2,13 +2,13 @@ package logreplication
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"sync"
 
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/replication/events"
-	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 )
 
@@ -20,11 +20,11 @@ type ReplicationOrchestrator struct {
 	stopChan chan struct{}
 }
 
-func NewReplicationOrchestrator(addr string, replMgrs map[indexing.IndexType]ReplicationManagerInterface) *ReplicationOrchestrator {
+func NewReplicationOrchestrator(addr string, replMgrs map[indexing.IndexType]ReplicationManagerInterface, serverCert *tls.Config) *ReplicationOrchestrator {
 	cfg := events.ReceiverConfig{
 		Addr:    addr,
 		URLPath: "/events",
-		TLS:     internaltls.GetTestServerCert(),
+		TLS:     serverCert,
 	}
 	eventsReceiver, err := events.NewEventReceiver(cfg, nil, events.ReceiverHooks{
 		OnAccepted: func() {

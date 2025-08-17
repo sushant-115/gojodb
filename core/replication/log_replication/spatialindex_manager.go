@@ -1,13 +1,13 @@
 package logreplication
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	"github.com/sushant-115/gojodb/core/replication/events"
-	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
 )
@@ -19,11 +19,11 @@ type SpatialReplicationManager struct {
 }
 
 // NewSpatialReplicationManager creates a new SpatialReplicationManager.
-func NewSpatialReplicationManager(nodeID string, sim *spatial.SpatialIndexManager, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *SpatialReplicationManager {
+func NewSpatialReplicationManager(nodeID string, sim *spatial.SpatialIndexManager, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, clientCert *tls.Config) *SpatialReplicationManager {
 	// NOTE: spatial.IndexManager does not currently have GetLogManager() or an obvious LogManager field.
 	// We are passing the 'lm' parameter, assuming it's the correct one or spatial.IndexManager will be adapted.
 	return &SpatialReplicationManager{
-		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.SpatialIndexType, lm, logger, nodeDataDir),
+		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.SpatialIndexType, lm, logger, nodeDataDir, clientCert),
 		SpatialIndex:           sim,
 	}
 }
@@ -90,7 +90,7 @@ func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replic
 		cfg := events.Config{
 			Addr:    replicaAddress,
 			URLPath: "/events",
-			TLS:     internaltls.GetTestClientCert(),
+			TLS:     srm.clientTLSCert,
 		}
 		eventSender, err := events.NewEventSender(cfg)
 		if err != nil {

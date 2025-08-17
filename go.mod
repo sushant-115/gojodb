@@ -24,6 +24,7 @@ require (
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fatih/color v1.13.0 // indirect
+	github.com/francoispqt/gojay v1.2.13 // indirect
 	github.com/go-viper/mapstructure/v2 v2.2.1 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/hashicorp/go-immutable-radix v1.0.0 // indirect

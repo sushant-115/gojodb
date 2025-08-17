@@ -1,6 +1,7 @@
 package logreplication
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -9,7 +10,6 @@ import (
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/replication/events"
-	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
@@ -23,9 +23,9 @@ type BTreeReplicationManager struct {
 }
 
 // NewBTreeReplicationManager creates a new BTreeReplicationManager.
-func NewBTreeReplicationManager(nodeID string, db *btree.BTree[string, string], lm *wal.LogManager, logger *zap.Logger, nodeDataDir string) *BTreeReplicationManager {
+func NewBTreeReplicationManager(nodeID string, db *btree.BTree[string, string], lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, clientCert *tls.Config) *BTreeReplicationManager {
 	return &BTreeReplicationManager{
-		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.BTreeIndexType, lm, logger, nodeDataDir),
+		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.BTreeIndexType, lm, logger, nodeDataDir, clientCert),
 		DbInstance:             db,
 	}
 }
@@ -151,7 +151,7 @@ func (brm *BTreeReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas
 		cfg := events.Config{
 			Addr:    replicaAddress,
 			URLPath: "/events",
-			TLS:     internaltls.GetTestClientCert(),
+			TLS:     brm.clientTLSCert,
 		}
 		eventSender, err := events.NewEventSender(cfg)
 		if err != nil {
