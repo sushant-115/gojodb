@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sushant-115/gojodb/config/certs"
 	"github.com/sushant-115/gojodb/core/replication/events"
-	"github.com/sushant-115/gojodb/core/security/encryption/internaltls"
 	"go.uber.org/zap"
 )
 
@@ -24,7 +24,7 @@ func main() {
 	// Use a WaitGroup to synchronize the sender and receiver goroutines.
 	var wg sync.WaitGroup
 	wg.Add(2)
-
+	serverCrt, clientCrt := certs.LoadCerts("/tmp")
 	// A channel to signal that the receiver is ready to accept connections.
 	receiverReady := make(chan bool)
 
@@ -38,10 +38,11 @@ func main() {
 
 		// Create a new EventReceiver.
 		// The event handler function simply logs the received data.
+
 		cfg := events.ReceiverConfig{
 			Addr:    testAddress,
 			URLPath: "/events",
-			TLS:     internaltls.GetTestServerCert(),
+			TLS:     serverCrt,
 		}
 		eventsReceiver, err := events.NewEventReceiver(cfg, nil, events.ReceiverHooks{
 			OnAccepted: func() {
@@ -106,7 +107,7 @@ func main() {
 		cfg := events.Config{
 			Addr:    testAddress,
 			URLPath: "/events",
-			TLS:     internaltls.GetTestClientCert(),
+			TLS:     clientCrt,
 		}
 		eventSender, err := events.NewEventSender(cfg)
 		if err != nil {

@@ -83,8 +83,9 @@ func LoadServerTLSConfig(caCertPath, serverCertPath, serverKeyPath string) (*tls
 	// Create and return the TLS config.
 	return &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
-		ClientAuth:   tls.NoClientCert, // Require clients to present a certificate.
-		ClientCAs:    caCertPool,       // Use this CA to verify the client's certificate.
+		ClientAuth:   tls.RequireAndVerifyClientCert, // Require clients to present a certificate.
+		ClientCAs:    caCertPool,                     // Use this CA to verify the client's certificate.
+		NextProtos:   []string{"h3"},
 	}, nil
 }
 
@@ -112,6 +113,7 @@ func LoadClientTLSConfig(caCertPath, clientCertPath, clientKeyPath string) (*tls
 		InsecureSkipVerify: true,
 		Certificates:       []tls.Certificate{clientCert},
 		RootCAs:            caCertPool, // Use this CA to verify the server's certificate.
+		NextProtos:         []string{"h3"},
 	}, nil
 }
 
