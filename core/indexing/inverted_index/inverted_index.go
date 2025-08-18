@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"regexp"
 	"sort"
@@ -98,7 +97,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (
 	}
 
 	// 2. Initialize DiskManager for the inverted index data file
-	log.Println("filepath: ", filePath)
+	// log.Println("filepath: ", filePath)
 	idx.dm, err = flushmanager.NewDiskManager(filePath, invertedIndexPageSize)
 	if err != nil {
 		idx.lm.Close() // Clean up log manager
@@ -114,7 +113,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (
 	_, err = idx.dm.OpenOrCreateFile(false, 0, 0) // Try to open existing file
 	if err != nil {
 		if os.IsNotExist(err) || strings.Contains(err.Error(), "database file not found") {
-			log.Printf("INFO: Inverted index file %s not found. Creating new file.", filePath)
+			// log.Printf("INFO: Inverted index file %s not found. Creating new file.", filePath)
 			// File not found, so create a new one
 			_, err = idx.dm.OpenOrCreateFile(true, 0, 0) // Now create it
 			if err != nil {
@@ -138,7 +137,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (
 				return nil, fmt.Errorf("failed to allocate header page (page 0) for new inverted index: %w", writeErr)
 			}
 			if newPageID != invertedIndexHeaderPageID {
-				log.Printf("WARNING: NewPage returned PageID %d, expected %d for header.", newPageID, invertedIndexHeaderPageID)
+				// log.Printf("WARNING: NewPage returned PageID %d, expected %d for header.", newPageID, invertedIndexHeaderPageID)
 			}
 
 			headerPage.Lock() // Acquire X-latch
@@ -167,9 +166,9 @@ func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (
 			headerPage.SetDirty(true)
 			headerPage.Unlock()
 			if err := idx.bpm.UnpinPage(newPageID, true); err != nil { // Unpin and mark dirty
-				log.Printf("WARNING: Failed to unpin header page %d after initial write: %v", newPageID, err)
+				// log.Printf("WARNING: Failed to unpin header page %d after initial write: %v", newPageID, err)
 			}
-			log.Printf("INFO: Initial inverted index header written to new file %s.", filePath)
+			// log.Printf("INFO: Initial inverted index header written to new file %s.", filePath)
 		} else {
 			// Some other error occurred trying to open the existing file
 			idx.bpm.FlushAllPages() // Clean up BPM
@@ -204,12 +203,12 @@ func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (
 
 	// 6. Load the term dictionary (from dedicated JSON file for simplicity)
 	if err := idx.loadTermDictionary(); err != nil {
-		log.Printf("WARNING: Failed to load inverted index term dictionary: %v. Starting with empty dictionary.", err)
+		// log.Printf("WARNING: Failed to load inverted index term dictionary: %v. Starting with empty dictionary.", err)
 		idx.termDictionary = make(map[string]PostingsListMetadata) // Start fresh if load fails
 	}
 
-	log.Printf("INFO: Inverted index initialized. Data file: %s, Log dir: %s, Terms in dictionary: %d",
-		filePath, logDir, len(idx.termDictionary))
+	// log.Printf("INFO: Inverted index initialized. Data file: %s, Log dir: %s, Terms in dictionary: %d",
+	// filePath, logDir, len(idx.termDictionary))
 	return idx, nil
 }
 
@@ -245,8 +244,8 @@ func (idx *InvertedIndex) readHeader() error {
 	if err := binary.Read(buf, binary.LittleEndian, &idx.header); err != nil {
 		return fmt.Errorf("failed to deserialize inverted index header: %w", err)
 	}
-	log.Printf("DEBUG: Inverted index header read. Magic: 0x%x, Version: %d, LastLSN: %d",
-		idx.header.Magic, idx.header.Version, idx.header.LastLSN) // Corrected log line
+	// log.Printf("DEBUG: Inverted index header read. Magic: 0x%x, Version: %d, LastLSN: %d",
+	// idx.header.Magic, idx.header.Version, idx.header.LastLSN) // Corrected log line
 	return nil
 }
 
@@ -276,8 +275,8 @@ func (idx *InvertedIndex) writeHeader() error {
 	page.SetData(h)
 	page.SetDirty(true) // Mark the page dirty
 
-	log.Printf("DEBUG: Inverted index header written. Magic: 0x%x, Version: %d, LastLSN: %d",
-		idx.header.Magic, idx.header.Version, idx.header.LastLSN)
+	// log.Printf("DEBUG: Inverted index header written. Magic: 0x%x, Version: %d, LastLSN: %d",
+	// idx.header.Magic, idx.header.Version, idx.header.LastLSN)
 	return nil
 }
 
@@ -328,7 +327,7 @@ func (idx *InvertedIndex) saveTermDictionary() error {
 // Insert processes a text and associates it with a document key in the inverted index.
 // It tokenizes, normalizes, and adds terms to the disk-backed postings lists.
 func (idx *InvertedIndex) Insert(text string, docKey string) error {
-	log.Println("Recieved insert request", text, docKey)
+	// log.Println("Recieved insert request", text, docKey)
 	if text == "" || docKey == "" {
 		return nil // Nothing to index
 	}
@@ -351,7 +350,7 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 			var err error
 			currentPostingsList, err = idx.readPostingsList(metadata)
 			if err != nil {
-				log.Printf("ERROR: Failed to read postings list for term '%s': %v. Re-creating list.", term, err)
+				// log.Printf("ERROR: Failed to read postings list for term '%s': %v. Re-creating list.", term, err)
 				// If we can't read, treat as if it doesn't exist and create new.
 				// In a real system, this might warrant more robust error handling or recovery.
 				currentPostingsList = []string{}
@@ -386,7 +385,7 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 
 		// Update term dictionary
 		idx.termDictionary[term] = newMetadata
-		log.Printf("DEBUG: Inverted index: Updated term '%s'. New metadata: %+v", term, newMetadata)
+		// log.Printf("DEBUG: Inverted index: Updated term '%s'. New metadata: %+v", term, newMetadata)
 
 		// Log the update operation for recovery (conceptual for now)
 		// This is a simplified logging. A real system would log the term, old metadata, and new metadata.
@@ -408,7 +407,7 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 			Data:      logData.Bytes(),
 		}
 		if _, err := idx.lm.AppendRecord(lr, wal.LogTypeInvertedIndex); err != nil {
-			log.Printf("WARNING: Failed to log inverted index update for term '%s': %v", term, err)
+			// log.Printf("WARNING: Failed to log inverted index update for term '%s': %v", term, err)
 		}
 	}
 	return nil
@@ -434,7 +433,7 @@ func (idx *InvertedIndex) Search(query string) ([]string, error) {
 		if metadata, ok := idx.termDictionary[term]; ok {
 			postingsList, err := idx.readPostingsList(metadata)
 			if err != nil {
-				log.Printf("ERROR: Failed to read postings list for term '%s' during search: %v", term, err)
+				// log.Printf("ERROR: Failed to read postings list for term '%s' during search: %v", term, err)
 				continue // Skip this term if its postings list can't be read
 			}
 			for _, key := range postingsList {
@@ -450,7 +449,7 @@ func (idx *InvertedIndex) Search(query string) ([]string, error) {
 	}
 	sort.Strings(results) // Sort results for consistent output
 
-	log.Printf("DEBUG: Inverted index: Search for '%s'. Found %d results: %v", query, len(results), results)
+	// log.Printf("DEBUG: Inverted index: Search for '%s'. Found %d results: %v", query, len(results), results)
 	return results, nil
 }
 
@@ -483,7 +482,7 @@ func (idx *InvertedIndex) writePostingsList(serializedList []byte) (PostingsList
 		if err != nil {
 			// If allocation fails, attempt to deallocate any pages already allocated for this list
 			// (This is a simplification; full rollback would be complex)
-			log.Printf("ERROR: Failed to allocate new page for postings list (chunk size %d): %v", chunkSize, err)
+			// log.Printf("ERROR: Failed to allocate new page for postings list (chunk size %d): %v", chunkSize, err)
 			return PostingsListMetadata{}, fmt.Errorf("failed to allocate page for postings list: %w", err)
 		}
 
@@ -533,11 +532,11 @@ func (idx *InvertedIndex) writePostingsList(serializedList []byte) (PostingsList
 	// Unpin the last page (which is `prevPage`)
 	if prevPage != nil {
 		if err := idx.bpm.UnpinPage(prevPageID, true); err != nil {
-			log.Printf("WARNING: Failed to unpin last postings list page %d: %v", prevPageID, err)
+			// log.Printf("WARNING: Failed to unpin last postings list page %d: %v", prevPageID, err)
 		}
 	}
 
-	log.Printf("DEBUG: Wrote postings list of total length %d starting at PageID %d", totalLength, firstPageID)
+	// log.Printf("DEBUG: Wrote postings list of total length %d starting at PageID %d", totalLength, firstPageID)
 	return PostingsListMetadata{
 		StartPageID: firstPageID,
 		TotalLength: totalLength,
@@ -560,7 +559,7 @@ func (idx *InvertedIndex) readPostingsList(metadata PostingsListMetadata) ([]str
 		if err != nil {
 			// Unpin any previously fetched pages before returning an error
 			// This is simplified: a real system would track all pinned pages in a transaction context.
-			log.Printf("ERROR: Failed to fetch page %d while reading postings list: %v", currentPageID, err)
+			// log.Printf("ERROR: Failed to fetch page %d while reading postings list: %v", currentPageID, err)
 			return nil, fmt.Errorf("failed to fetch page %d for postings list: %w", currentPageID, err)
 		}
 
@@ -587,7 +586,7 @@ func (idx *InvertedIndex) readPostingsList(metadata PostingsListMetadata) ([]str
 
 		page.RUnlock()                                              // Release S-latch
 		if e := idx.bpm.UnpinPage(currentPageID, false); e != nil { // Unpin clean page
-			log.Printf("WARNING: Failed to unpin page %d after reading postings list chunk: %v", currentPageID, e)
+			// log.Printf("WARNING: Failed to unpin page %d after reading postings list chunk: %v", currentPageID, e)
 		}
 		currentPageID = nextPageID
 	}
@@ -602,18 +601,18 @@ func (idx *InvertedIndex) readPostingsList(metadata PostingsListMetadata) ([]str
 
 // Close ensures the inverted index is saved before shutdown.
 func (idx *InvertedIndex) Close() error {
-	log.Println("INFO: Closing InvertedIndex...")
+	// log.Println("INFO: Closing InvertedIndex...")
 	var firstErr error
 
 	// Flush all dirty pages from the buffer pool
 	if err := idx.bpm.FlushAllPages(); err != nil {
-		log.Printf("ERROR: Failed to flush all pages from inverted index BPM: %v", err)
+		// log.Printf("ERROR: Failed to flush all pages from inverted index BPM: %v", err)
 		firstErr = err
 	}
 
 	// Save the term dictionary
 	if err := idx.saveTermDictionary(); err != nil {
-		log.Printf("ERROR: Failed to save inverted index term dictionary: %v", err)
+		// log.Printf("ERROR: Failed to save inverted index term dictionary: %v", err)
 		if firstErr == nil {
 			firstErr = err
 		}
@@ -622,7 +621,7 @@ func (idx *InvertedIndex) Close() error {
 	// Update header with latest LSN (after all flushes)
 	idx.header.LastLSN = pagemanager.LSN(idx.lm.GetCurrentLSN())
 	if err := idx.writeHeader(); err != nil {
-		log.Printf("ERROR: Failed to write final inverted index header: %v", err)
+		// log.Printf("ERROR: Failed to write final inverted index header: %v", err)
 		if firstErr == nil {
 			firstErr = err
 		}
@@ -630,20 +629,20 @@ func (idx *InvertedIndex) Close() error {
 
 	// Close the underlying buffer pool manager (which also closes disk manager)
 	if err := idx.bpm.FlushAllPages(); err != nil {
-		log.Printf("ERROR: Failed to close inverted index BPM: %v", err)
+		// log.Printf("ERROR: Failed to close inverted index BPM: %v", err)
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
 	// Close the log manager
 	if err := idx.lm.Close(); err != nil {
-		log.Printf("ERROR: Failed to close inverted index LogManager: %v", err)
+		// log.Printf("ERROR: Failed to close inverted index LogManager: %v", err)
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
 
-	log.Println("INFO: InvertedIndex closed successfully.")
+	// log.Println("INFO: InvertedIndex closed successfully.")
 	return firstErr
 }
 

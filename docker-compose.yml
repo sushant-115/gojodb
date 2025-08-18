@@ -1,215 +1,155 @@
+# docker-compose.yml
+# This file sets up a 3-node GojoDB cluster with a single gateway.
+#
+# To run:
+# 1. Build the Docker images: docker-compose build
+# 2. Start the cluster: docker-compose up -d
+#
+# To shutdown:
+# docker-compose down
+
 version: '3.8'
 
-# Define a custom bridge network for the GojoDB cluster
 networks:
-  gojodb_network:
+  gojodb-net:
     driver: bridge
 
 services:
-  # --- GojoDB Controller Instances ---
-  # These run the cmd/gojodb_controller application.
-  # We define 3 separate services to allow for unique NODE_ID and explicit port mappings.
+  # --- GojoDB Storage Nodes ---
+  # These are the core data storage and controller nodes.
 
-  controller-1:
+  gojodb-server-1:
+    image: gojodb-server
     build:
       context: .
-      dockerfile: cmd/gojodb_controller/Dockerfile # Path to the Dockerfile for the controller
-      args:
-        # Pass the path to the main package for building
-        COMPONENT_PATH: ./cmd/gojodb_controller
-    container_name: gojodb_controller_1
-    environment:
-      # Unique identifier for this Raft node
-      - NODE_ID=node1
-      # Raft binding address within the Docker network
-      - RAFT_BIND_ADDR=controller-1:7081
-      # HTTP API address within the Docker network
-      - HTTP_ADDR=controller-1:7080
-      # Heartbeat listener port
-      - HEARTBEAT_LISTEN_ADDR=controller-1:8087
-      # Initial Raft cluster members (comma-separated list of NODE_ID=RAFT_BIND_ADDR)
-      - RAFT_CLUSTER=node1=controller-1:8081,node2=controller-2:8081,node3=controller-3:8081
-    ports:
-      # Map container ports to host ports for external access (optional for internal communication)
-      - "7080:7080" # Expose HTTP API
-      - "7081:7081" # Expose Raft communication port
-      - "8087:8087" # Expose Heartbeat port
-      - "8095:8095/udp" # Expose Heartbeat port
-    networks:
-      - gojodb_network
-
-  controller-2:
-    build:
-      context: .
-      dockerfile: cmd/gojodb_controller/Dockerfile
-      args:
-        COMPONENT_PATH: ./cmd/gojodb_controller
-    container_name: gojodb_controller_2
-    environment:
-      - NODE_ID=node2
-      - RAFT_BIND_ADDR=controller-2:7082
-      - HTTP_ADDR=controller-2:7083
-      - HEARTBEAT_LISTEN_ADDR=controller-2:8088
-      - RAFT_CLUSTER=node1=controller-1:8081,node2=controller-2:8081,node3=controller-3:8081
-      - JOIN_ADDR=controller-1:7080
-    ports:
-      # Map container ports to host ports for external access (optional for internal communication)
-      - "7082:7082" # Expose HTTP API
-      - "7083:7083" # Expose Raft communication port
-      - "8088:8088" # Expose Heartbeat port
-      - "8096:8096/udp"
-    networks:
-      - gojodb_network
-    depends_on:
-      - controller-1
-
-  controller-3:
-    build:
-      context: .
-      dockerfile: cmd/gojodb_controller/Dockerfile
-      args:
-        COMPONENT_PATH: ./cmd/gojodb_controller
-    container_name: gojodb_controller_3
-    environment:
-      - NODE_ID=node3
-      - RAFT_BIND_ADDR=controller-3:7084
-      - HTTP_ADDR=controller-3:7085
-      - HEARTBEAT_LISTEN_ADDR=controller-3:8089
-      - RAFT_CLUSTER=node1=controller-1:8081,node2=controller-2:8081,node3=controller-3:8081
-      - JOIN_ADDR=controller-1:7080
-    ports:
-      # Map container ports to host ports for external access (optional for internal communication)
-      - "7084:7084" # Expose HTTP API
-      - "7085:7085" # Expose Raft communication port
-      - "8089:8089" # Expose Heartbeat port
-      - "8097:8097/udp"
-    networks:
-      - gojodb_network
-    depends_on:
-      - controller-1
-
-  # --- GojoDB Server Instances ---
-  # These run the cmd/gojodb_server application.
-  # We define 3 separate services for unique STORAGE_NODE_ID and explicit port mappings.
-
-  server-1:
-    build:
-      context: .
-      dockerfile: cmd/gojodb_server/Dockerfile # Path to the Dockerfile for the server
+      dockerfile: ./cmd/gojodb_server/Dockerfile
       args:
         COMPONENT_PATH: ./cmd/gojodb_server
-    container_name: gojodb_server_1
-    environment:
-      # Unique identifier for this storage node
-      - STORAGE_NODE_ID=storage_node_1
-      # Storage node address within the Docker network
-      - STORAGE_NODE_ADDR=server-1:9090
-      # Ports for replication mechanisms
-      - BTREE_REPLICATION_LISTEN_PORT=9117
-      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9127
-      # Address of a controller for Raft communication (points to controller-1's HTTP API)
-      - RAFT_HEARTBEAT_ADDRESS=controller-1:8087,controller-2:8088,controller-3:8089
-      - RAFT_HTTP_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
-      
-    ports:
-      # Map container ports to host ports
-      - "9090:9090" # Expose Storage Node API
-      - "9117:9117" # Expose B-tree replication port
-      - "9127:9127" # Expose Inverted index replication port
     networks:
-      - gojodb_network
-    # Ensure controllers are up before starting servers
-    depends_on:
-      - controller-1
-      - controller-2
-      - controller-3
+      - gojodb-net
+    ports:
+      - "8001:8001" # gRPC
+      - "7001:7001" # Raft
+      - "9001:9001" # HTTP
+      - "6001:6001/udp" # Replication
+      - "8083:8083" # Heartbeat
+    volumes:
+      - ./data/node1:/data
+    command:
+      - "/app/app"
+      - "--node_id=node-1"
+      - "--grpc_addr=gojodb-server-1:8001"
+      - "--raft_addr=gojodb-server-1:7001"
+      - "--http_addr=gojodb-server-1:9001"
+      - "--replication_addr=gojodb-server-1:6001"
+      - "--heartbeat_addr=gojodb-server-1:8083"
+      - "--controller_addr=gojodb-server-1:9001"
+      - "--bootstrap"
+      # First node, so no --join argument
+    healthcheck:
+      test: ["CMD", "sh", "-c", "sleep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
-  server-2:
+  gojodb-server-2:
+    image: gojodb-server
     build:
       context: .
-      dockerfile: cmd/gojodb_server/Dockerfile
+      dockerfile: ./cmd/gojodb_server/Dockerfile
       args:
         COMPONENT_PATH: ./cmd/gojodb_server
-    container_name: gojodb_server_2
-    environment:
-      - STORAGE_NODE_ID=storage_node_2
-      - STORAGE_NODE_ADDR=server-2:9092
-      - BTREE_REPLICATION_LISTEN_PORT=9118
-      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9128
-      - RAFT_HEARTBEAT_ADDRESS=controller-1:8087,controller-2:8088,controller-3:8089
-      - RAFT_HTTP_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
-    ports:
-      - "9092:9092"
-      - "9118:9118" # Expose B-tree replication port
-      - "9128:9128" # Expose Inverted index replication port
     networks:
-      - gojodb_network
+      - gojodb-net
+    ports:
+      - "8002:8002"
+      - "7002:7002"
+      - "9002:9002"
+      - "6002:6002/udp"
+      - "8084:8084"
+    volumes:
+      - ./data/node2:/data
+    command:
+      - "/app/app"
+      - "--node_id=node-2"
+      - "--grpc_addr=gojodb-server-2:8002"
+      - "--raft_addr=gojodb-server-2:7002"
+      - "--http_addr=gojodb-server-2:9002"
+      - "--replication_addr=gojodb-server-2:6002"
+      - "--heartbeat_addr=gojodb-server-2:8084"
+      - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
     depends_on:
-      - controller-1
-      - controller-2
-      - controller-3
+      gojodb-server-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "sleep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
-  server-3:
+  gojodb-server-3:
+    image: gojodb-server
     build:
       context: .
-      dockerfile: cmd/gojodb_server/Dockerfile
+      dockerfile: ./cmd/gojodb_server/Dockerfile
       args:
         COMPONENT_PATH: ./cmd/gojodb_server
-    container_name: gojodb_server_3
-    environment:
-      - STORAGE_NODE_ID=storage_node_3
-      - STORAGE_NODE_ADDR=server-3:9093
-      - BTREE_REPLICATION_LISTEN_PORT=9119
-      - INVERTED_IDX_REPLICATION_LISTEN_PORT=9129
-      - RAFT_HEARTBEAT_ADDRESS=controller-1:8087,controller-2:8088,controller-3:8089
-      - RAFT_HTTP_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
-    ports:
-      - "9093:9093"
-      - "9119:9119" # Expose B-tree replication port
-      - "9129:9129" # Expose Inverted index replication port
     networks:
-      - gojodb_network
+      - gojodb-net
+    ports:
+      - "8003:8003"
+      - "7003:7003"
+      - "9003:9003"
+      - "6003:6003/udp"
+      - "8085:8085"
+    volumes:
+      - ./data/node3:/data
+    command:
+      - "/app/app"
+      - "--node_id=node-3"
+      - "--grpc_addr=gojodb-server-3:8003"
+      - "--raft_addr=gojodb-server-3:7003"
+      - "--http_addr=gojodb-server-3:9003"
+      - "--replication_addr=gojodb-server-3:6003"
+      - "--heartbeat_addr=gojodb-server-3:8085"
+      - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
     depends_on:
-      - controller-1
-      - controller-2
-      - controller-3
+      gojodb-server-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "sleep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
-  # --- API Servers ---
+  # --- GojoDB Gateway ---
+  # This is the single entry point for clients.
 
-  api-basic:
+  gojodb-gateway:
+    image: gojodb-gateway
     build:
       context: .
-      dockerfile: api/basic/Dockerfile # Path to the Dockerfile for the basic API
+      dockerfile: ./cmd/gojodb_gateway/Dockerfile
       args:
-        COMPONENT_PATH: ./api/basic
-    container_name: gojodb_api_basic
+        COMPONENT_PATH: ./cmd/gojodb_gateway
+    networks:
+      - gojodb-net
+    ports:
+      - "50051:50051" # Client-facing gRPC port
     environment:
-      - RAFT_ADDRESS=controller-1:7080,controller-2:7083,controller-3:7085
-      - API_SERVICE_ADDR=:8082
-    # Assuming the basic API server listens on port 8082
-    ports:
-      - "8082:8082"
-    networks:
-      - gojodb_network
-    # API servers depend on controllers and servers for database operations
+      # The gateway needs to know the gRPC addresses of all storage nodes.
+      - CLUSTER_NODES=gojodb-server-1:8001,gojodb-server-2:8002,gojodb-server-3:8003
+      - LISTEN_ADDR=:7000
+    command: ["/app/app", "--controller_addr=gojodb-server-1:9001"]
     depends_on:
-      - controller-1
-      - controller-2
-      - controller-3
-      - server-1
+      gojodb-server-1:
+        condition: service_healthy
+      gojodb-server-2:
+        condition: service_healthy
+      gojodb-server-3:
+        condition: service_healthy
 
-  api-graphql:
-    build:
-      context: .
-      dockerfile: api/graphql_service/Dockerfile # Path to the Dockerfile for the GraphQL API
-      args:
-        COMPONENT_PATH: ./api/graphql_service
-    container_name: gojodb_api_graphql
-    # Assuming the GraphQL API server listens on port 8083
-    ports:
-      - "8083:8083"
-    networks:
-      - gojodb_network
-    depends_on:
-      - controller-1
-      - server-1
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

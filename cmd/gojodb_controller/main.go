@@ -75,11 +75,11 @@ func (c *Controller) startHeartbeatListener(heartbeatAddr string) {
 		Handler: mux,
 	}
 	c.HeartbeatServer = heartbeatServer
-	log.Printf("Heartbeat listener starting on %s", heartbeatAddr)
+	// log.Printf("Heartbeat listener starting on %s", heartbeatAddr)
 	if err := heartbeatServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Heartbeat listener failed: %v", err)
 	}
-	log.Println("Heartbeat listener stopped.")
+	// log.Println("Heartbeat listener stopped.")
 }
 
 // handleHeartbeat processes heartbeat requests from storage nodes.
@@ -93,7 +93,7 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	address := r.URL.Query().Get("address") // gRPC address of the storage node
 	replicationAddr := r.URL.Query().Get("replication_addr")
 	grpcAddr := r.URL.Query().Get("grpc_addr")
-	//log.Print("Received heartbeat: ", nodeID, address)
+	log.Print("Received heartbeat: ", nodeID, address)
 	if nodeID == "" || address == "" {
 		http.Error(w, "nodeId and address are required", http.StatusBadRequest)
 		return
@@ -136,7 +136,7 @@ func (c *Controller) monitorStorageNodes() {
 			c.storageNodeInfoMutex.Lock()
 			for nodeID, lastHeartbeat := range c.lastHeartbeatReceived {
 				if time.Since(lastHeartbeat) > HeartbeatTimeout {
-					log.Printf("Storage node %s heartbeat expired. Marking as down.", nodeID)
+					// log.Printf("Storage node %s heartbeat expired. Marking as down.", nodeID)
 					// Submit Raft command to mark node as down
 					cmd := fsm.Command{
 						Type:    fsm.CommandUpdateNodeStatus,
@@ -193,7 +193,7 @@ func (c *Controller) forwardRaftCommandToLeader(cmd fsm.Command) error {
 // applyCommand submits a command to the Raft leader.
 func (c *Controller) applyCommand(cmd fsm.Command) error {
 	if c.raft.State() != raft.Leader {
-		//log.Println("Can't apply command not leader, forwarding it to leader: ", c.leaderControllerAddr)
+		log.Println("Can't apply command not leader, forwarding it to leader: ", c.leaderControllerAddr)
 		if err := c.forwardRaftCommandToLeader(cmd); err != nil {
 			return fmt.Errorf("failed to forward the apply command to leader %s , error: %v", c.leaderControllerAddr, err)
 		}
@@ -263,7 +263,7 @@ func (c *Controller) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	future := c.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(peerAddress), 0, 0)
 	if err := future.Error(); err != nil {
-		log.Printf("Failed to add voter %s (%s): %v", nodeID, peerAddress, err)
+		// log.Printf("Failed to add voter %s (%s): %v", nodeID, peerAddress, err)
 		http.Error(w, fmt.Sprintf("Failed to add voter: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -292,7 +292,7 @@ func (c *Controller) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 
 	future := c.raft.RemoveServer(raft.ServerID(nodeID), 0, 0)
 	if err := future.Error(); err != nil {
-		log.Printf("Failed to remove peer %s: %v", nodeID, err)
+		// log.Printf("Failed to remove peer %s: %v", nodeID, err)
 		http.Error(w, fmt.Sprintf("Failed to remove peer: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -724,7 +724,7 @@ func (c *Controller) handleApplyForwardedCommand(w http.ResponseWriter, r *http.
 		// Log the error but return 200 to the follower, as the follower's job
 		// was just to forward. The error is now the leader's responsibility.
 		// A more robust system might relay the exact error back.
-		log.Printf("Leader failed to apply forwarded command type %d: %v", cmd.Type, err)
+		// log.Printf("Leader failed to apply forwarded command type %d: %v", cmd.Type, err)
 		http.Error(w, fmt.Sprintf("Leader failed to apply forwarded command: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -816,42 +816,3 @@ func (c *Controller) handleAdminCommitShardMigration(w http.ResponseWriter, r *h
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Shard migration committed"))
 }
-
-// // Main function to start the Controller.
-// func main() {
-// 	c, err := NewController(NodeID, RaftBindAddr, RaftDir)
-// 	if err != nil {
-// 		log.Fatalf("Failed to create controller: %v", err)
-// 	}
-
-// 	c.registerHandlers()
-
-// 	log.Printf("GojoDB Controller server listening on %s", HTTPListenAddr)
-// 	go func() {
-// 		if err := http.ListenAndServe(HTTPListenAddr, nil); err != nil && err != http.ErrServerClosed {
-// 			log.Fatalf("HTTP server failed: %v", err)
-// 		}
-// 	}()
-
-// 	// Handle graceful shutdown
-// 	sigCh := make(chan os.Signal, 1)
-// 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-// 	<-sigCh
-// 	log.Println("Shutting down Controller...")
-
-// 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 	defer cancel()
-// 	if err := c.httpServer.Shutdown(ctx); err != nil {
-// 		log.Printf("HTTP server shutdown error: %v", err)
-// 	}
-// 	if c.raft != nil {
-// 		// Attempt to gracefully shutdown Raft
-// 		shutdownFuture := c.raft.Shutdown()
-// 		if err := shutdownFuture.Error(); err != nil {
-// 			log.Printf("Error shutting down Raft: %v", err)
-// 		} else {
-// 			log.Println("Raft gracefully shut down.")
-// 		}
-// 	}
-// 	log.Println("Controller gracefully shut down.")
-// }
