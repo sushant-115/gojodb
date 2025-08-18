@@ -97,7 +97,7 @@ func (r *ReplicationOrchestrator) handleInboundStream() {
 			}
 
 			if err := replMgr.ApplyLogRecord(*lr); err != nil {
-				log.Println("Error: Couldn't apply the log record: ", lr)
+				log.Println("Error: Couldn't apply the log record: ", lr, err)
 			}
 		case <-r.stopChan:
 			log.Println("Received stop signal, stopping inbound stream handler.")

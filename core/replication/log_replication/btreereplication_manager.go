@@ -2,10 +2,9 @@ package logreplication
 
 import (
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
-	"log"
 	"net"
+	"strings"
 
 	"github.com/sushant-115/gojodb/config/certs"
 	"github.com/sushant-115/gojodb/core/indexing"
@@ -44,70 +43,91 @@ func (brm *BTreeReplicationManager) Stop() error {
 	return nil
 }
 
-// ApplyLogRecord applies a B-tree specific log record.
+// ApplyLogRecord applies a physical log record to the database state via the buffer pool.
 func (brm *BTreeReplicationManager) ApplyLogRecord(lr wal.LogRecord) error {
-	brm.Logger.Debug("Applying B-tree log record", zap.Uint64("lsn", uint64(lr.LSN)), zap.Any("type", lr.Type))
+	brm.Logger.Debug("Applying log record", zap.Uint64("lsn", uint64(lr.LSN)), zap.Any("type", lr.Type))
 
 	if brm.DbInstance == nil {
-		return fmt.Errorf("BTree instance is nil in BTreeReplicationManager")
+		return fmt.Errorf("database instance is nil in ReplicationManager")
 	}
+
+	// Lock the manager to ensure log records are applied serially.
 	brm.mu.Lock()
 	defer brm.mu.Unlock()
 
-	// Apply B-tree log record (simplified logic from your original code)
 	switch lr.Type {
-	case wal.LogRecordTypeNewPage, wal.LogRecordTypeInsertKey, wal.LogTypeRTreeInsert, wal.LogTypeRTreeNewRoot:
-		if lr.PageID.GetID() >= brm.DbInstance.GetNumPages() {
-			emptyPage := make([]byte, brm.DbInstance.GetPageSize())
-			if writeErr := brm.DbInstance.WritePage(lr.PageID, emptyPage); writeErr != nil {
-				return fmt.Errorf("failed to allocate/write empty page %d on disk: %w", lr.PageID, writeErr)
-			}
-			if lr.PageID >= pagemanager.PageID(brm.DbInstance.GetNumPages()) {
-				brm.DbInstance.SetNumPages(uint64(lr.PageID) + 1)
-			}
-		}
-		page, fetchErr := brm.DbInstance.FetchPage(lr.PageID)
+	// These cases all represent a physical page overwrite.
+	case wal.LogRecordTypeNewPage, wal.LogRecordTypeUpdate, wal.LogRecordTypeInsertKey,
+		wal.LogTypeRTreeInsert, wal.LogTypeRTreeUpdate, wal.LogTypeRTreeNewRoot:
+		var page *pagemanager.Page
+		var fetchErr error
+		// 1. Ask the buffer pool for the page. It handles all disk I/O and allocation.
+		page, fetchErr = brm.DbInstance.FetchPage(lr.PageID)
 		if fetchErr != nil {
-			return fmt.Errorf("failed to fetch page %d for NEW_PAGE: %w", lr.PageID, fetchErr)
+			if strings.Contains(fetchErr.Error(), "EOF") {
+				page, _, fetchErr = brm.DbInstance.NewPage()
+				if fetchErr != nil {
+					return fmt.Errorf("failed to allocate page %d: %w", lr.PageID, fetchErr)
+				}
+			}
+			return fmt.Errorf("failed to fetch page %d: %w", lr.PageID, fetchErr)
 		}
+
+		// Defer the Unpin operation to ensure it's always called, even if panics occur.
+		// The second argument 'true' signifies that the page is dirty.
+		defer func() {
+			if errUnpin := brm.DbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
+				brm.Logger.Warn("Failed to unpin page after applying log record",
+					zap.Uint64("pageID", uint64(page.GetPageID())),
+					zap.Error(errUnpin),
+				)
+			}
+		}()
+
+		// 2. Lock the page itself for exclusive access to its data.
 		page.Lock()
+
+		// 3. Apply the change from the log record to the in-memory page.
 		page.SetData(lr.Data)
+
+		// 4. Mark the page as dirty. This is CRITICAL. It tells the buffer pool
+		//    that this page must be written to disk later.
 		page.SetDirty(true)
+
+		// 5. Unlock the page.
 		page.Unlock()
-		if errUnpin := brm.DbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
-			log.Printf("WARNING: Failed to unpin page %d after NEW_PAGE application: %v", page.GetPageID(), errUnpin)
-		}
-		// if errFlush := brm.DbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-		// 	return fmt.Errorf("failed to flush page %d after NEW_PAGE: %w", page.GetPageID(), errFlush)
-		// }
-	case wal.LogRecordTypeUpdate, wal.LogTypeRTreeUpdate:
-		page, fetchErr := brm.DbInstance.FetchPage(lr.PageID)
-		if fetchErr != nil {
-			return fmt.Errorf("failed to fetch page %d for UPDATE: %w", lr.PageID, fetchErr)
-		}
-		page.Lock()
-		page.SetData(lr.Data)
-		page.SetDirty(true)
-		page.Unlock()
-		if errUnpin := brm.DbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
-			log.Printf("WARNING: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
-		}
-		// if errFlush := brm.DbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-		// 	return fmt.Errorf("failed to flush page %d after UPDATE: %w", page.GetPageID(), errFlush)
-		// }
+
+		// 6. DO NOT FLUSH. The buffer pool manager will handle flushing this dirty
+		//    page to disk at the optimal time (e.g., during checkpointing or
+		//    when memory pressure is high). Forcing a flush here would be a
+		//    major performance bottleneck.
+
+	// This is a special metadata update, not a standard page write.
 	case wal.LogRecordTypeRootChange, wal.LogTypeRTreeSplit:
-		newRootPageID := pagemanager.PageID(binary.LittleEndian.Uint64(lr.Data))
-		brm.DbInstance.SetRootPageID(newRootPageID, lr.TxnID)
+		newRootPageID := pagemanager.PageID((lr.PageID))
+
+		// Update the in-memory root pointer.
+		err := brm.DbInstance.SetRootPageID(newRootPageID, lr.TxnID)
+		if err != nil {
+			return fmt.Errorf("failed to set new root page ID %d: %w", newRootPageID, err)
+		}
+
+		// Persist the header page change. The header is a special page and it's
+		// acceptable to flush it directly as it's critical for recovery.
 		if err := brm.DbInstance.GetDiskManager().UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
 			h.RootPageID = newRootPageID
 		}); err != nil {
 			return fmt.Errorf("failed to update disk header with new root page ID %d: %w", newRootPageID, err)
 		}
+
 	default:
-		log.Printf("INFO: ReplicationManager: Applying B-Tree log record type %v (LSN %d) - specific logic depends on btree implementation details for these types.", lr.Type, lr.LSN)
-		// Add handling for InsertKey, DeleteKey, NodeSplit, NodeMerge, etc., if needed at this level.
-		// Often, these logical operations are covered by the physical page updates (NewPage, Update).
+		// It's good practice to log unhandled types.
+		brm.Logger.Warn("ReplicationManager encountered an unhandled log record type",
+			zap.Any("type", lr.Type),
+			zap.Uint64("lsn", uint64(lr.LSN)),
+		)
 	}
+
 	return nil
 }
 

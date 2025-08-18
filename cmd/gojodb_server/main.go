@@ -218,7 +218,7 @@ func initStorageNode(logger *zap.Logger) error {
 			SerializeValue:   btree.SerializeString,
 			DeserializeValue: btree.DeserializeString,
 		},
-		10,
+		10000,
 		4096,
 		logManager,
 	)

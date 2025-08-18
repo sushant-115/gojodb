@@ -361,6 +361,10 @@ func (bt *BTree[K, V]) FetchPage(pageID pagemanager.PageID) (*pagemanager.Page, 
 	return bt.bpm.FetchPage(pageID)
 }
 
+func (bt *BTree[K, V]) NewPage() (*pagemanager.Page, pagemanager.PageID, error) {
+	return bt.bpm.NewPage()
+}
+
 func (bt *BTree[K, V]) FlushPage(pageID pagemanager.PageID) error {
 	return bt.bpm.FlushPage(pageID)
 }
