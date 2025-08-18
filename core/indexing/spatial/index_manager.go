@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
@@ -104,7 +105,7 @@ func NewSpatialIndexManager(uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath
 	logBufferSize, dbPageSize int, logger *zap.Logger,
 ) (*SpatialIndexManager, error) {
 
-	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir, logger)
+	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir, logger, indexing.SpatialIndexType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for spatial index: %w", err)
 	}

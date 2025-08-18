@@ -86,6 +86,41 @@ func LoadServerTLSConfig(caCertPath, serverCertPath, serverKeyPath string) (*tls
 		ClientAuth:   tls.RequireAndVerifyClientCert, // Require clients to present a certificate.
 		ClientCAs:    caCertPool,                     // Use this CA to verify the client's certificate.
 		NextProtos:   []string{"h3"},
+		// --- START DIAGNOSTIC HOOK ---
+		// This function will run for every incoming connection attempt.
+		// --- START DIAGNOSTIC HOOK ---
+		// This function runs AFTER the client has presented its certificates.
+		// This is the correct place to debug mTLS issues.
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			log.Println("--- TLS HANDSHAKE DIAGNOSTICS (SERVER-SIDE) ---")
+			log.Printf("Hook 'VerifyPeerCertificate' was triggered by: %s\n", "a connecting client")
+
+			if len(rawCerts) == 0 {
+				log.Println("❌ FATAL: Client did not present any certificates.")
+			} else {
+				log.Printf("✅ Client presented %d certificate(s).\n", len(rawCerts))
+				// Attempt to parse the first certificate to see what it is.
+				cert, err := x509.ParseCertificate(rawCerts[0])
+				if err != nil {
+					log.Printf("   - Error parsing client certificate: %v\n", err)
+				} else {
+					log.Printf("   - Client Certificate Subject: %s\n", cert.Subject)
+					log.Printf("   - Client Certificate Issuer: %s\n", cert.Issuer)
+				}
+			}
+
+			if len(verifiedChains) > 0 {
+				log.Println("✅ Certificate chain was successfully verified by the standard library.")
+			} else {
+				log.Println("❌ FATAL: Certificate chain could NOT be verified against the server's ClientCAs pool.")
+			}
+			log.Println("-----------------------------------------------")
+
+			// We are only using this for logging. We return nil to let the default
+			// verification logic proceed. The connection will still fail if the
+			// standard library's own check fails.
+			return nil
+		},
 	}, nil
 }
 

@@ -201,7 +201,7 @@ func initStorageNode(logger *zap.Logger) error {
 	if err := os.MkdirAll(walPath, 0750); err != nil {
 		return fmt.Errorf("failed to create WAL directory %s: %w", walPath, err)
 	}
-	logManager, err = wal.NewLogManager(walPath, logger)
+	logManager, err = wal.NewLogManager(walPath, logger, indexing.BTreeIndexType)
 	if err != nil {
 		return fmt.Errorf("failed to create main log manager: %w", err)
 	}
@@ -264,7 +264,7 @@ func initStorageNode(logger *zap.Logger) error {
 	if err := os.MkdirAll(spatialLogManagerPath, 0750); err != nil {
 		return fmt.Errorf("failed to create spatial WAL directory %s: %w", spatialLogManagerPath, err)
 	}
-	spatialLm, err := wal.NewLogManager(spatialLogManagerPath, logger) // Spatial index gets its own WAL
+	spatialLm, err := wal.NewLogManager(spatialLogManagerPath, logger, indexing.SpatialIndexType) // Spatial index gets its own WAL
 	if err != nil {
 		return fmt.Errorf("failed to create spatial log manager: %w", err)
 	}

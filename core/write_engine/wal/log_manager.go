@@ -241,6 +241,7 @@ type ReplicationSlot struct {
 
 type LogManager struct {
 	walDir             string
+	IndexType          indexing.IndexType
 	currentSegmentFile *os.File
 	currentSegmentID   uint64
 	currentLSN         LSN
@@ -281,7 +282,7 @@ type WALStreamReader struct {
 }
 
 // NewLogManager creates or opens a LogManager for the given directory.
-func NewLogManager(walDir string, logger *zap.Logger) (*LogManager, error) {
+func NewLogManager(walDir string, logger *zap.Logger, indextype indexing.IndexType) (*LogManager, error) {
 	if err := os.MkdirAll(walDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory %s: %w", walDir, err)
 	}
@@ -306,6 +307,7 @@ func NewLogManager(walDir string, logger *zap.Logger) (*LogManager, error) {
 	lm := &LogManager{
 		walDir:           walDir,
 		maxSegmentSize:   defaultMaxWalSegmentSize,
+		IndexType:        indextype,
 		archiveDir:       archivePath,
 		slotsFilePath:    filepath.Join(walDir, slotsFileName),
 		segmentStartLSNs: make(map[int]LSN),
@@ -851,7 +853,7 @@ func (lm *LogManager) persistReplicationSlots() error {
 // AppendRecord appends a log record to the WAL.
 func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) {
 	lm.mu.Lock()
-
+	lr.IndexType = lm.IndexType
 	lm.currentLSN++
 	lsn := lm.currentLSN
 

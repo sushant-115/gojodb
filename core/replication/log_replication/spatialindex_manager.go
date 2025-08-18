@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/sushant-115/gojodb/config/certs"
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	"github.com/sushant-115/gojodb/core/replication/events"
@@ -87,10 +88,11 @@ func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replic
 		if _, exists := srm.PrimarySlotReplicas[slotID][replicaNodeID]; exists && srm.PrimarySlotReplicas[slotID][replicaNodeID].IsActive {
 			continue // Already streaming
 		}
+		_, cert := certs.LoadCerts("/tmp")
 		cfg := events.Config{
 			Addr:    replicaAddress,
 			URLPath: "/events",
-			TLS:     srm.clientTLSCert,
+			TLS:     cert,
 		}
 		eventSender, err := events.NewEventSender(cfg)
 		if err != nil {

@@ -92,7 +92,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (
 
 	// 1. Initialize LogManager for the inverted index
 	var err error
-	idx.lm, err = wal.NewLogManager(logDir, logger)
+	idx.lm, err = wal.NewLogManager(logDir, logger, indexing.InvertedIndexType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for inverted index: %w", err)
 	}

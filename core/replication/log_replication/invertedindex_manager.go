@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 
+	"github.com/sushant-115/gojodb/config/certs"
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/replication/events"
@@ -89,10 +90,11 @@ func (iirm *InvertedIndexReplicationManager) BecomePrimaryForSlot(slotID uint64,
 			iirm.Logger.Info("Already primary and streaming to replica for Inverted Index slot", zap.Uint64("slotID", slotID), zap.String("replicaNodeID", replicaNodeID))
 			continue
 		}
+		_, cert := certs.LoadCerts("/tmp")
 		cfg := events.Config{
 			Addr:    replicaAddress,
 			URLPath: "/events",
-			TLS:     iirm.clientTLSCert,
+			TLS:     cert,
 		}
 		eventSender, err := events.NewEventSender(cfg)
 		if err != nil {

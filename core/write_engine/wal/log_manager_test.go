@@ -27,7 +27,7 @@ func setupLogManager(t *testing.T) (*LogManager, string) {
 	logger, err := zap.NewDevelopment()
 	require.NoError(t, err)
 
-	lm, err := NewLogManager(tempDir, logger)
+	lm, err := NewLogManager(tempDir, logger, "")
 	require.NoError(t, err)
 
 	return lm, tempDir
@@ -104,7 +104,7 @@ func TestWALReader_RecoveryAndRead(t *testing.T) {
 	require.NoError(t, err)
 
 	// --- Phase 1: Write data and shutdown ---
-	lm1, err := NewLogManager(tempDir, logger)
+	lm1, err := NewLogManager(tempDir, logger, "")
 	require.NoError(t, err)
 
 	recordToRecover := newTestLogRecord("this must survive a restart")
@@ -114,7 +114,7 @@ func TestWALReader_RecoveryAndRead(t *testing.T) {
 
 	// --- Phase 2: Recover and Read ---
 	// Create a NEW LogManager instance to trigger the recovery process
-	lm2, err := NewLogManager(tempDir, logger)
+	lm2, err := NewLogManager(tempDir, logger, "")
 	require.NoError(t, err)
 	defer lm2.Close()
 

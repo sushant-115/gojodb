@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 
+	"github.com/sushant-115/gojodb/config/certs"
 	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/replication/events"
@@ -76,9 +77,9 @@ func (brm *BTreeReplicationManager) ApplyLogRecord(lr wal.LogRecord) error {
 		if errUnpin := brm.DbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
 			log.Printf("WARNING: Failed to unpin page %d after NEW_PAGE application: %v", page.GetPageID(), errUnpin)
 		}
-		if errFlush := brm.DbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-			return fmt.Errorf("failed to flush page %d after NEW_PAGE: %w", page.GetPageID(), errFlush)
-		}
+		// if errFlush := brm.DbInstance.FlushPage(page.GetPageID()); errFlush != nil {
+		// 	return fmt.Errorf("failed to flush page %d after NEW_PAGE: %w", page.GetPageID(), errFlush)
+		// }
 	case wal.LogRecordTypeUpdate, wal.LogTypeRTreeUpdate:
 		page, fetchErr := brm.DbInstance.FetchPage(lr.PageID)
 		if fetchErr != nil {
@@ -91,9 +92,9 @@ func (brm *BTreeReplicationManager) ApplyLogRecord(lr wal.LogRecord) error {
 		if errUnpin := brm.DbInstance.UnpinPage(page.GetPageID(), true); errUnpin != nil {
 			log.Printf("WARNING: Failed to unpin page %d after UPDATE application: %v", page.GetPageID(), errUnpin)
 		}
-		if errFlush := brm.DbInstance.FlushPage(page.GetPageID()); errFlush != nil {
-			return fmt.Errorf("failed to flush page %d after UPDATE: %w", page.GetPageID(), errFlush)
-		}
+		// if errFlush := brm.DbInstance.FlushPage(page.GetPageID()); errFlush != nil {
+		// 	return fmt.Errorf("failed to flush page %d after UPDATE: %w", page.GetPageID(), errFlush)
+		// }
 	case wal.LogRecordTypeRootChange, wal.LogTypeRTreeSplit:
 		newRootPageID := pagemanager.PageID(binary.LittleEndian.Uint64(lr.Data))
 		brm.DbInstance.SetRootPageID(newRootPageID, lr.TxnID)
@@ -146,12 +147,12 @@ func (brm *BTreeReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas
 			brm.Logger.Info("Already primary and streaming to replica for B-tree slot", zap.Uint64("slotID", slotID), zap.String("replicaNodeID", replicaNodeID))
 			continue
 		}
-
+		_, cert := certs.LoadCerts("/tmp")
 		brm.Logger.Info("Attempting to connect to B-tree replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
 		cfg := events.Config{
 			Addr:    replicaAddress,
 			URLPath: "/events",
-			TLS:     brm.clientTLSCert,
+			TLS:     cert,
 		}
 		eventSender, err := events.NewEventSender(cfg)
 		if err != nil {
