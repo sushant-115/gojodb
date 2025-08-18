@@ -3,6 +3,7 @@ package pagemanager
 import (
 	"container/list" // For LRU
 	"sync"           // For sync.RWMutex
+	"time"
 )
 
 // --- Page Management ---
@@ -32,6 +33,7 @@ type Page struct {
 	// It's a lightweight lock for physical concurrency control.
 	latch sync.RWMutex
 	// --- END NEW ---
+	updatedAt time.Time
 }
 
 // NewPage creates a new Page instance.
@@ -77,6 +79,8 @@ func (p *Page) SetLSN(lsn LSN)              { p.lsn = lsn }
 func (p *PageID) GetID() uint64 {
 	return uint64(*p)
 }
+func (p *Page) UpdatedAt(t time.Time)   { p.updatedAt = t }
+func (p *Page) GetUpdatedAt() time.Time { return p.updatedAt }
 
 // --- NEW: Latch Methods ---
 
