@@ -27,6 +27,7 @@ type BufferPoolManager struct {
 	mu          sync.Mutex
 	pageSize    int
 	numPages    pagemanager.PageID
+	logType     wal.LogType
 }
 
 func (bpm *BufferPoolManager) GetNumPages() pagemanager.PageID {
@@ -90,7 +91,7 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 	if victimPage.IsDirty() && victimPage.GetPageID() != pagemanager.InvalidPageID {
 		// WAL INTEGRATION: Ensure all log records for this page up to its LSN are flushed
 		if bpm.logManager != nil && victimPage.GetLSN() != pagemanager.InvalidLSN {
-			if err := bpm.logManager.Flush(wal.LSN(victimPage.GetLSN())); err != nil {
+			if err := bpm.logManager.Sync(); err != nil {
 				log.Printf("ERROR: Failed to flush log for victim page %d (LSN %d) before flushing page: %v", victimPage.GetPageID(), victimPage.GetLSN(), err)
 				// This is a critical error, as we might be flushing a page before its log is durable.
 				// For now, return error, but a real system might panic or try another victim.
@@ -201,11 +202,10 @@ func (bpm *BufferPoolManager) UnpinPage(pageID pagemanager.PageID, isDirty bool)
 					TxnID:  0, // Placeholder: real transactions would have a TxnID
 					Type:   wal.LogRecordTypeUpdate,
 					PageID: pageID,
-					Offset: 0, // Whole page update
 					// OldData:  make([]byte, bpm.pageSize), // Requires copying old state
-					NewData: page.GetData(), // Copy of current page data
+					Data: page.GetData(), // Copy of current page data
 				}
-				lsn, err := bpm.logManager.Append(logRecord)
+				lsn, err := bpm.logManager.AppendRecord(logRecord, bpm.logType)
 				if err != nil {
 					log.Printf("ERROR: Failed to append log record for page %d update: %v", pageID, err)
 					// This is a critical error. A real system would likely crash or panic.
@@ -253,7 +253,7 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 	if victimPage.IsDirty() && victimPage.GetPageID() != pagemanager.InvalidPageID {
 		// WAL INTEGRATION: Ensure logs for victimPage are flushed before eviction
 		if bpm.logManager != nil && victimPage.GetLSN() != pagemanager.InvalidLSN {
-			if err := bpm.logManager.Flush(wal.LSN(victimPage.GetLSN())); err != nil {
+			if err := bpm.logManager.Sync(); err != nil {
 				log.Printf("ERROR: Failed to flush log for victim page %d (LSN %d) before flushing page: %v", victimPage.GetPageID(), victimPage.GetLSN(), err)
 				return nil, pagemanager.InvalidPageID, fmt.Errorf("failed to flush log for victim page %d: %w", victimPage.GetPageID(), err)
 			}
@@ -293,11 +293,10 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 			TxnID:  0, // Placeholder
 			Type:   wal.LogRecordTypeNewPage,
 			PageID: newPageID,
-			Offset: 0,
 			// NewData can be the initial empty page data, or just the fact of allocation.
 			// For simplicity, we'll log the allocation itself.
 		}
-		lsn, err := bpm.logManager.Append(logRecord)
+		lsn, err := bpm.logManager.AppendRecord(logRecord, bpm.logType)
 		if err != nil {
 			log.Printf("ERROR: Failed to append LogRecordTypeNewPage for page %d: %v", newPageID, err)
 			// This is a critical error. A real system would likely crash or panic.
@@ -319,7 +318,7 @@ func (bpm *BufferPoolManager) FlushPage(pageID pagemanager.PageID) error {
 		if page.IsDirty() {
 			// WAL INTEGRATION: Ensure log records up to page.GetLSN() are flushed before this.
 			if bpm.logManager != nil && page.GetLSN() != pagemanager.InvalidLSN {
-				if err := bpm.logManager.Flush(wal.LSN(page.GetLSN())); err != nil {
+				if err := bpm.logManager.Sync(); err != nil {
 					log.Printf("ERROR: Failed to flush log for page %d (LSN %d) before flushing page: %v", pageID, page.GetLSN(), err)
 					return fmt.Errorf("failed to flush log for page %d: %w", pageID, err)
 				}
@@ -356,7 +355,7 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 	// WAL INTEGRATION: Before flushing all pages, ensure all pending log records are flushed.
 	if bpm.logManager != nil {
 		log.Println("DEBUG: Flushing all pending log records before flushing all pages.")
-		if firstErr = bpm.logManager.Flush(wal.InvalidLSN); firstErr != nil { // Flush all logs
+		if firstErr = bpm.logManager.Sync(); firstErr != nil { // Flush all logs
 			log.Printf("ERROR: Failed to flush all log records before flushing all pages: %v", firstErr)
 		}
 	}
@@ -367,7 +366,7 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 			// WAL INTEGRATION: Although logs should be flushed above, this is a redundant check
 			// for safety if a page's LSN is somehow higher than what was flushed.
 			if bpm.logManager != nil && page.GetLSN() != pagemanager.InvalidLSN {
-				if err := bpm.logManager.Flush(wal.LSN(page.GetLSN())); err != nil {
+				if err := bpm.logManager.Sync(); err != nil {
 					log.Printf("ERROR: Failed to flush log for page %d (LSN %d) during FlushAllPages: %v", page.GetPageID(), page.GetLSN(), err)
 					if firstErr == nil {
 						firstErr = err

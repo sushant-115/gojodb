@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync" // For sync.RWMutex and sync.Map
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
@@ -145,7 +146,12 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 	}
 
 	// Open or create the file. 'create=true' means it will create if not exists, error if exists.
-	_, err = dm.OpenOrCreateFile(true, degree, 0)
+	create := false
+	_, statErr := os.Stat(filePath)
+	if os.IsNotExist(statErr) {
+		create = true
+	}
+	_, err = dm.OpenOrCreateFile(create, degree, 0)
 	if err != nil {
 		dm.Close() // Ensure disk manager is closed on failure
 		// If the file already exists, it's an error for NewBTreeFile
@@ -266,10 +272,10 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 	if logManager != nil {
 		log.Println("INFO: Starting database recovery process...")
 		// Pass the BTree instance to recovery so it can interact with its locking and transaction table
-		if err := logManager.Recover(dm, wal.LSN(header.LastLSN)); err != nil {
-			dm.Close()
-			return nil, fmt.Errorf("database recovery failed: %w", err)
-		}
+		// if err := logManager.Recover(dm, wal.LSN(header.LastLSN)); err != nil {
+		// 	dm.Close()
+		// 	return nil, fmt.Errorf("database recovery failed: %w", err)
+		// }
 		log.Println("INFO: Database recovery complete.")
 		// After recovery, the header's LastLSN might need to be updated if the recovery process
 		// wrote new log records (e.g., compensation logs for undo).
@@ -307,15 +313,15 @@ func (bt *BTree[K, V]) SetRootPageID(newRootPageID pagemanager.PageID, txnID uin
 	binary.LittleEndian.PutUint64(newRootPageIDBytes, uint64(newRootPageID))
 
 	logRecord := &wal.LogRecord{
-		TxnID:   txnID,
-		Type:    wal.LogRecordTypeRootChange,
-		PageID:  newRootPageID,   // New root page ID
-		OldData: make([]byte, 8), // Store old root for undo, if needed
-		NewData: newRootPageIDBytes,
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypeRootChange,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    newRootPageID, // New root page ID
+		Data:      newRootPageIDBytes,
 	}
-	binary.LittleEndian.PutUint64(logRecord.OldData, uint64(oldRootPageID))
+	// binary.LittleEndian.PutUint64(logRecord.Data, uint64(oldRootPageID))
 
-	lsn, err := bt.logManager.Append(logRecord)
+	lsn, err := bt.logManager.AppendRecord(logRecord, wal.LogTypeBtree)
 	if err != nil {
 		log.Printf("ERROR: Failed to log root page ID change from %d to %d: %v", oldRootPageID, newRootPageID, err)
 		// This is a critical error, as root change might not be recoverable.
@@ -325,7 +331,7 @@ func (bt *BTree[K, V]) SetRootPageID(newRootPageID pagemanager.PageID, txnID uin
 	}
 
 	// Flush the log immediately to ensure durability of the root change record
-	if err := bt.logManager.Flush(lsn); err != nil {
+	if err := bt.logManager.Sync(); err != nil {
 		log.Printf("ERROR: Failed to flush log for root page ID change LSN %d: %v", lsn, err)
 		// This is also critical.
 		bt.rootPageID = oldRootPageID
@@ -353,6 +359,10 @@ func (bt *BTree[K, V]) GetDiskManager() *flushmanager.DiskManager {
 
 func (bt *BTree[K, V]) FetchPage(pageID pagemanager.PageID) (*pagemanager.Page, error) {
 	return bt.bpm.FetchPage(pageID)
+}
+
+func (bt *BTree[K, V]) NewPage() (*pagemanager.Page, pagemanager.PageID, error) {
+	return bt.bpm.NewPage()
 }
 
 func (bt *BTree[K, V]) FlushPage(pageID pagemanager.PageID) error {
@@ -1633,18 +1643,19 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 	// This record needs to contain enough info to redo/undo the operations if needed.
 	// For V1, we'll log a generic PREPARE record. Full operations would be serialized into NewData.
 	// For now, we assume the Coordinator will re-send operations on COMMIT/ABORT.
-	lsn, err := bt.logManager.Append(&wal.LogRecord{
-		TxnID:  txnID,
-		Type:   wal.LogRecordTypePrepare,
-		PageID: InvalidPageID, // Not specific to a page, but to the transaction
-	})
+	_, err = bt.logManager.AppendRecord(&wal.LogRecord{
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypePrepare,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    InvalidPageID, // Not specific to a page, but to the transaction
+	}, wal.LogTypeBtree)
 	if err != nil {
 		bt.releaseAllLocksForTxn(txnID)
 		delete(bt.transactionTable, txnID)
 		return fmt.Errorf("%w: failed to log PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
 	}
 	// Flush the log to ensure the PREPARE record is durable before voting COMMIT
-	if err := bt.logManager.Flush(lsn); err != nil {
+	if err := bt.logManager.Sync(); err != nil {
 		bt.releaseAllLocksForTxn(txnID)
 		delete(bt.transactionTable, txnID)
 		return fmt.Errorf("%w: failed to flush log for PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
@@ -1673,16 +1684,17 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 	log.Printf("INFO: Txn %d: Received COMMIT request. Logging COMMIT record.", txnID)
 
 	// Log the COMMIT record
-	lsn, err := bt.logManager.Append(&wal.LogRecord{
-		TxnID:  txnID,
-		Type:   wal.LogRecordTypeCommitTxn,
-		PageID: InvalidPageID,
-	})
+	_, err := bt.logManager.AppendRecord(&wal.LogRecord{
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypeCommitTxn,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    InvalidPageID,
+	}, wal.LogTypeBtree)
 	if err != nil {
 		return fmt.Errorf("failed to log COMMIT record for txn %d: %w", txnID, err)
 	}
 	// Flush the log to ensure COMMIT record is durable
-	if err := bt.logManager.Flush(lsn); err != nil {
+	if err := bt.logManager.Sync(); err != nil {
 		return fmt.Errorf("failed to flush log for COMMIT record for txn %d: %w", txnID, err)
 	}
 
@@ -1711,16 +1723,17 @@ func (bt *BTree[K, V]) Abort(txnID uint64) error {
 	log.Printf("INFO: Txn %d: Received ABORT request. Logging ABORT record.", txnID)
 
 	// Log the ABORT record
-	lsn, err := bt.logManager.Append(&wal.LogRecord{
-		TxnID:  txnID,
-		Type:   wal.LogRecordTypeAbortTxn,
-		PageID: InvalidPageID,
-	})
+	_, err := bt.logManager.AppendRecord(&wal.LogRecord{
+		TxnID:     txnID,
+		Type:      wal.LogRecordTypeAbortTxn,
+		IndexType: indexing.BTreeIndexType,
+		PageID:    InvalidPageID,
+	}, wal.LogTypeBtree)
 	if err != nil {
 		return fmt.Errorf("failed to log ABORT record for txn %d: %w", txnID, err)
 	}
 	// Flush the log to ensure ABORT record is durable
-	if err := bt.logManager.Flush(lsn); err != nil {
+	if err := bt.logManager.Sync(); err != nil {
 		return fmt.Errorf("failed to flush log for ABORT record for txn %d: %w", txnID, err)
 	}
 

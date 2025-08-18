@@ -387,10 +387,9 @@ func processCommand(args []string) {
 			replicaNodeIDs := args[4] // Comma-separated
 			// Construct a dummy SlotRangeInfo to marshal for the value
 			slotInfo := fsm.SlotRangeInfo{
-				RangeID:        rangeID,
+				SlotRange:      rangeID,
 				PrimaryNodeID:  primaryNodeID,
 				ReplicaNodeIDs: strings.Split(replicaNodeIDs, ","),
-				Status:         "active", // Assume active status
 			}
 			slotInfoBytes, err := json.Marshal(slotInfo)
 			if err != nil {
@@ -465,9 +464,9 @@ func main() {
 	// Cool GojoDB Intro Text
 	fmt.Println(`
   ██████╗  ███████╗  ██████╗ ███████╗           ██████╗  ██████╗
-  ██╔════╝ ██    ██╔════╝ ██╔██║═╝ ██         ╔════╝ ██╔════╝
-  ██║  ███╗██║   ██╗██║   ██╗██║   ██╗           ███╗██║  ███╗
-  ██║   ██║██║   ██║██║   ██║██║   ██║          ██║   ██║██║   ██║
+  ██╔════╝ ██    ██╔════╝ ██╔██║═╝ ██         ╔════╝ ██╔═██═╝
+  ██║  ███╗██║   ██╗██║   ██╗██║   ██╗          ████╗██║ ██╗████╗
+  ██║   ██║██║   ██║██║   ██║██║   ██║          ██║  ██║ ██║   ██║
   ╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝
    ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝
     GojoDB CLI - Your data, unbound.

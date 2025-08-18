@@ -1,0 +1,286 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "./;proto";
+
+// --- Existing Messages (from original api/proto/api.proto) ---
+
+message PutRequest {
+    string key = 1;
+    bytes value = 2;
+}
+
+message PutResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetRequest {
+    string key = 1;
+}
+
+message GetResponse {
+    bytes value = 1;
+    bool found = 2;
+}
+
+message DeleteRequest {
+    string key = 1;
+}
+
+message DeleteResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetRangeRequest {
+    string start_key = 1;
+    string end_key = 2;
+    int32 limit = 3;
+}
+
+message KeyValuePair {
+    string key = 1;
+    bytes value = 2;
+}
+
+message GetRangeResponse {
+    repeated KeyValuePair entries = 1;
+}
+
+message TextSearchRequest {
+    string query = 1;
+    string index_name = 2;
+    int32 limit = 3;
+}
+
+message TextSearchResult {
+    string key = 1;
+    double score = 2;
+}
+
+message TextSearchResponse {
+    repeated TextSearchResult results = 1;
+}
+
+message BulkPutRequest {
+    repeated KeyValuePair entries = 1;
+}
+
+message BulkPutResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message BulkDeleteRequest {
+    repeated string keys = 1;
+}
+
+message BulkDeleteResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// --- New Messages for Cluster Management and Data Migration ---
+
+// StorageNode defines a storage node in the cluster
+message StorageNode {
+    string node_id = 1;
+    string address = 2; // gRPC address (host:port) for data operations
+    string status = 3; // e.g., "active", "down", "onboarding", "migrating"
+}
+
+// AddStorageNodeRequest requests to register a new storage node.
+// This doesn't actually start the node, but informs the controller of its expected presence.
+message AddStorageNodeRequest {
+    string node_id = 1;
+    string address = 2; // Address where the storage node will be listening
+}
+
+message AddStorageNodeResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// RemoveStorageNodeRequest requests to remove a storage node.
+message RemoveStorageNodeRequest {
+    string node_id = 1;
+}
+
+message RemoveStorageNodeResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ShardSlotAssignment represents a shard slot's primary and replicas.
+message ShardSlotAssignment {
+    uint32 slot_id = 1;
+    string primary_node_id = 2;
+    repeated string replica_node_ids = 3;
+}
+
+// AssignShardSlotRequest requests to assign a slot to a primary and replicas.
+message AssignShardSlotRequest {
+    uint32 slot_id = 1;
+    string primary_node_id = 2;
+    repeated string replica_node_ids = 3;
+}
+
+message AssignShardSlotResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// InitiateReplicaOnboardingRequest initiates a new replica's onboarding process.
+message InitiateReplicaOnboardingRequest {
+    uint32 slot_id = 1;
+    string replica_node_id = 2; // The node joining as a replica
+    string primary_node_id = 3; // The current primary to snapshot from
+    string replica_address = 4; // gRPC address of the replica for snapshot streaming
+    string primary_address = 5; // gRPC address of the primary for snapshot streaming
+}
+
+message InitiateReplicaOnboardingResponse {
+    bool success = 1;
+    string message = 2;
+    string onboarding_id = 3; // Unique ID for tracking this onboarding process
+}
+
+// UpdateReplicaOnboardingStateRequest updates the state of an ongoing replica onboarding.
+message UpdateReplicaOnboardingStateRequest {
+    string onboarding_id = 1;
+    string status = 2; // e.g., "in_progress", "snapshot_complete", "log_catchup", "completed", "failed"
+    uint64 current_lsn = 3; // Last Sequence Number processed by replica
+    uint64 target_lsn = 4; // Target LSN on primary at initiation
+    string error_message = 5;
+}
+
+message UpdateReplicaOnboardingStateResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// InitiateShardMigrationRequest initiates data migration for a shard.
+message InitiateShardMigrationRequest {
+    uint32 slot_id = 1;
+    string source_node_id = 2; // Current primary/replica holding the data
+    string target_node_id = 3; // New primary/replica to migrate data to
+    string source_address = 4; // gRPC address of the source node
+    string target_address = 5; // gRPC address of the target node
+}
+
+message InitiateShardMigrationResponse {
+    bool success = 1;
+    string message = 2;
+    string migration_id = 3; // Unique ID for tracking this migration process
+}
+
+// CommitShardMigrationRequest commits a pending shard migration.
+message CommitShardMigrationRequest {
+    uint32 slot_id = 1;
+    string new_primary_node_id = 2; // The node that will become the new primary
+    repeated string new_replica_node_ids = 3; // Optional: new set of replicas
+}
+
+message CommitShardMigrationResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// GetClusterStatusRequest requests the overall cluster status.
+message GetClusterStatusRequest {}
+
+message GetClusterStatusResponse {
+    repeated StorageNode active_nodes = 1;
+    repeated ShardSlotAssignment shard_assignments = 2;
+    repeated ReplicaOnboardingState onboarding_states = 3;
+    repeated ShardMigrationState migration_states = 4;
+}
+
+// ReplicaOnboardingState details an ongoing replica onboarding process.
+message ReplicaOnboardingState {
+    string onboarding_id = 1;
+    uint32 slot_id = 2;
+    string replica_node_id = 3;
+    string primary_node_id = 4;
+    string status = 5; // e.g., "snapshotting", "log_catching_up", "completed", "failed"
+    uint64 current_lsn = 6;
+    uint64 target_lsn = 7;
+    string error_message = 8;
+}
+
+// ShardMigrationState details an ongoing shard migration process.
+message ShardMigrationState {
+    string migration_id = 1;
+    uint32 slot_id = 2;
+    string source_node_id = 3;
+    string target_node_id = 4;
+    string status = 5; // e.g., "snapshotting", "log_catching_up", "completed", "failed"
+    uint64 current_lsn = 6;
+    uint64 target_lsn = 7;
+    string error_message = 8;
+}
+
+// GetShardMapRequest requests the current shard map.
+message GetShardMapRequest {}
+
+message GetShardMapResponse {
+    repeated ShardSlotAssignment shard_assignments = 1;
+}
+
+// --- New Service for Gateway (combining data and admin ops) ---
+
+service GatewayService {
+    // Data operations
+    rpc Put (PutRequest) returns (PutResponse);
+    rpc Get (GetRequest) returns (GetResponse);
+    rpc Delete (DeleteRequest) returns (DeleteResponse);
+    rpc GetRange (GetRangeRequest) returns (GetRangeResponse);
+    rpc TextSearch (TextSearchRequest) returns (TextSearchResponse);
+    rpc BulkPut (BulkPutRequest) returns (BulkPutResponse);
+    rpc BulkDelete (BulkDeleteRequest) returns (BulkDeleteResponse);
+
+    // Cluster management operations
+    rpc AddStorageNode (AddStorageNodeRequest) returns (AddStorageNodeResponse);
+    rpc RemoveStorageNode (RemoveStorageNodeRequest) returns (RemoveStorageNodeResponse);
+    rpc AssignShardSlot (AssignShardSlotRequest) returns (AssignShardSlotResponse);
+    rpc InitiateReplicaOnboarding (InitiateReplicaOnboardingRequest) returns (InitiateReplicaOnboardingResponse);
+    rpc UpdateReplicaOnboardingState (UpdateReplicaOnboardingStateRequest) returns (UpdateReplicaOnboardingStateResponse);
+    rpc InitiateShardMigration (InitiateShardMigrationRequest) returns (InitiateShardMigrationResponse);
+    rpc CommitShardMigration (CommitShardMigrationRequest) returns (CommitShardMigrationResponse);
+    rpc GetClusterStatus (GetClusterStatusRequest) returns (GetClusterStatusResponse);
+    rpc GetShardMap (GetShardMapRequest) returns (GetShardMapResponse);
+}
+
+// --- New Service for Snapshot Streaming (on Storage Nodes) ---
+// This service will be implemented by gojodb_server to serve snapshots
+
+message StreamSnapshotRequest {
+    uint32 slot_id = 1;
+    string index_type = 2; // e.g., "btree", "inverted", "spatial"
+    string snapshot_id = 3; // ID of the prepared snapshot on the source node
+}
+
+message StreamSnapshotResponse {
+    bytes chunk = 1;
+}
+
+service SnapshotService {
+    // StreamSnapshot streams a prepared snapshot from a storage node.
+    rpc StreamSnapshot (StreamSnapshotRequest) returns (stream StreamSnapshotResponse);
+}
+
+// In api/proto/api.proto
+service IndexedWriteService {
+    rpc Put (PutRequest) returns (PutResponse);
+    rpc Delete (DeleteRequest) returns (DeleteResponse);
+    rpc BulkPut (BulkPutRequest) returns (BulkPutResponse);
+    rpc BulkDelete (BulkDeleteRequest) returns (BulkDeleteResponse);
+}
+
+service IndexedReadService {
+    rpc Get (GetRequest) returns (GetResponse);
+    rpc GetRange (GetRangeRequest) returns (GetRangeResponse);
+    rpc TextSearch (TextSearchRequest) returns (TextSearchResponse);
+}

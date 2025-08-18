@@ -9,10 +9,12 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sushant-115/gojodb/core/indexing"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"go.uber.org/zap"
 )
 
 const (
@@ -99,14 +101,11 @@ type SpatialIndexManager struct {
 // 	return sim, nil
 // }
 
-func NewSpatialIndexManager(
-	uniqueSpatialIndexArchiveDir, uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath string,
-	logBufferSize, logSegmentSize, dbPageSize int,
-	maxEntries int, // Max entries per R-tree node
-	minEntries int, // Min entries per R-tree node
+func NewSpatialIndexManager(uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath string,
+	logBufferSize, dbPageSize int, logger *zap.Logger,
 ) (*SpatialIndexManager, error) {
 
-	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir, uniqueSpatialIndexArchiveDir, logBufferSize, int64(logSegmentSize))
+	logManager, err := wal.NewLogManager(uniqueSpatialIndexLogDir, logger, indexing.SpatialIndexType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LogManager for spatial index: %w", err)
 	}
