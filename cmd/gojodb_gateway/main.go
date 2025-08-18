@@ -40,9 +40,9 @@ type GatewayService struct {
 	pb.UnimplementedGatewayServiceServer // Embed for forward compatibility
 	controllerAddr                       string
 	mu                                   sync.RWMutex
-	slotAssignments                      map[uint32]*fsm.SlotAssignment
-	storageNodeAddresses                 map[string]string // nodeId -> gRPC address (e.g., "node1" -> "localhost:50052")
-	nodeConns                            sync.Map          // Mao to store Pool of gRPC client connections to storage nodes
+	slotAssignments                      sync.Map // map[uint32]*fsm.SlotAssignment
+	storageNodeAddresses                 sync.Map // map[string]string nodeId -> gRPC address (e.g., "node1" -> "localhost:50052")
+	nodeConns                            sync.Map // Mao to store Pool of gRPC client connections to storage nodes
 	quit                                 chan struct{}
 	httpClient                           *http.Client // HTTP client for controller API calls
 }
@@ -50,11 +50,9 @@ type GatewayService struct {
 // NewGatewayService creates a new GatewayService instance.
 func NewGatewayService(controllerAddr string) *GatewayService {
 	gs := &GatewayService{
-		controllerAddr:       controllerAddr,
-		slotAssignments:      make(map[uint32]*fsm.SlotAssignment),
-		storageNodeAddresses: make(map[string]string),
-		quit:                 make(chan struct{}),
-		httpClient:           &http.Client{Timeout: 10 * time.Second},
+		controllerAddr: controllerAddr,
+		quit:           make(chan struct{}),
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
 	}
 
 	// Initialize gRPC connection pool for storage nodes
@@ -71,6 +69,12 @@ func NewGatewayService(controllerAddr string) *GatewayService {
 
 	log.Printf("GojoDB Gateway Service initialized, controller address: %s", controllerAddr)
 	return gs
+}
+
+func copyToSyncMap[K comparable, V any](src map[K]V, dst *sync.Map) {
+	for k, v := range src {
+		dst.Store(k, v)
+	}
 }
 
 // monitorControllerCluster periodically fetches the cluster status and shard assignments from the controller.
@@ -144,10 +148,10 @@ func (gs *GatewayService) monitorControllerCluster() {
 				updatedNodeAddresses[nodeID] = nodeInfo.GrpcAddr
 			}
 
-			gs.mu.Lock()
-			gs.slotAssignments = updatedAssignments
-			gs.storageNodeAddresses = updatedNodeAddresses
-			gs.mu.Unlock()
+			copyToSyncMap(updatedAssignments, &gs.slotAssignments)
+			// gs.slotAssignments = updatedAssignments
+			copyToSyncMap(updatedNodeAddresses, &gs.storageNodeAddresses)
+			// gs.storageNodeAddresses = updatedNodeAddresses
 			log.Printf("Shard map and node addresses updated. %d assignments, %d nodes.", len(updatedAssignments), len(updatedNodeAddresses))
 
 		case <-gs.quit:
@@ -160,12 +164,11 @@ func (gs *GatewayService) monitorControllerCluster() {
 // getStorageNodeClient gets a gRPC client connection for a given node ID.
 // It tries to reuse from the pool or creates a new one.
 func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn, error) {
-	gs.mu.Lock()
-	addr, ok := gs.storageNodeAddresses[nodeID]
-	gs.mu.Unlock()
-	if !ok || addr == "" {
+	address, ok := gs.storageNodeAddresses.Load(nodeID)
+	if !ok || address == "" {
 		return nil, fmt.Errorf("address for storage node %s not found", nodeID)
 	}
+	addr := address.(string)
 	var pool *sync.Pool
 	connPool, ok := gs.nodeConns.Load(nodeID)
 	if ok {
@@ -210,20 +213,16 @@ func (gs *GatewayService) returnStorageNodeClient(nodeID string, conn *grpc.Clie
 // resolveResponsibleNode finds the primary or a replica for a given slot.
 // For writes, it always returns the primary. For reads, it can return primary or replica.
 func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (string, error) {
-	gs.mu.Lock()
-	assignment, ok := gs.slotAssignments[slotID]
-
-	if !ok || assignment == nil {
-		gs.mu.Unlock()
+	slotAssignment, ok := gs.slotAssignments.Load(slotID)
+	if !ok || slotAssignment == nil {
 		return "", fmt.Errorf("no assignment found for slot %d", slotID)
 	}
-
+	assignment := slotAssignment.(*fsm.SlotAssignment)
 	if isWrite {
 		if assignment.PrimaryNodeID == "" {
-			gs.mu.Unlock()
 			return "", fmt.Errorf("no primary assigned for slot %d", slotID)
 		}
-		gs.mu.Unlock()
+
 		return assignment.PrimaryNodeID, nil
 	} else {
 		targetNodes := []string{}
@@ -236,14 +235,14 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 
 		}
 		if len(targetNodes) == 0 {
-			gs.mu.Unlock()
+
 			return "", fmt.Errorf("no primary or replica assigned for slot %d", slotID)
 
 		}
 		index := rand.Intn(len(targetNodes))
 		targetNodeId := targetNodes[index]
 		log.Println("Picked for get: ", targetNodeId, slotID)
-		gs.mu.Unlock()
+
 		return targetNodeId, nil
 	}
 }
@@ -739,18 +738,18 @@ func (gs *GatewayService) GetClusterStatus(ctx context.Context, req *pb.GetClust
 
 // GetShardMap retrieves the current shard map from the gateway's cache.
 func (gs *GatewayService) GetShardMap(ctx context.Context, req *pb.GetShardMapRequest) (*pb.GetShardMapResponse, error) {
-	gs.mu.RLock()
-	defer gs.mu.RUnlock()
-
 	resp := &pb.GetShardMapResponse{}
-	for _, assign := range gs.slotAssignments {
+	gs.slotAssignments.Range(func(key, val any) bool {
+		assign := val.(*fsm.SlotAssignment)
 		replicaNodeIds := fsm.Keys(assign.ReplicaNodes)
 		resp.ShardAssignments = append(resp.ShardAssignments, &pb.ShardSlotAssignment{
 			SlotId:         uint32(assign.SlotID),
 			PrimaryNodeId:  assign.PrimaryNodeID,
 			ReplicaNodeIds: replicaNodeIds,
 		})
-	}
+		return true
+	})
+
 	return resp, nil
 }
 

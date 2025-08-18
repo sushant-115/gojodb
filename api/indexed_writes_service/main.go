@@ -2,13 +2,11 @@ package indexedwritesservice
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
 
 	pb "github.com/sushant-115/gojodb/api/proto"
-	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	"github.com/sushant-115/gojodb/core/indexmanager"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -48,40 +46,40 @@ func (s *IndexedWriteService) Put(ctx context.Context, req *pb.PutRequest) (*pb.
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Internal, "put failed (btree): %v", err)
 	}
 
-	// 2. Optionally, apply to inverted index if value contains text content (assuming JSON document)
-	var docContent struct {
-		Text string `json:"text"` // Example field for text content
-		ID   string `json:"id"`   // Example field for document ID
-	}
-	if err := json.Unmarshal(req.Value, &docContent); err == nil && docContent.Text != "" && docContent.ID != "" {
-		if invIdxMgr, ok := s.indexManagers["inverted"].(*indexmanager.InvertedIndexManager); ok {
-			err := invIdxMgr.AddDocument(docContent.ID, docContent.Text)
-			if err != nil {
-				log.Printf("Node %s, Slot %d: Warning: Failed to add document %s to inverted index: %v", s.nodeID, s.slotID, docContent.ID, err)
-				// Decide if this is a critical error or just a warning based on your design
-			}
-		}
-	}
+	// // 2. Optionally, apply to inverted index if value contains text content (assuming JSON document)
+	// var docContent struct {
+	// 	Text string `json:"text"` // Example field for text content
+	// 	ID   string `json:"id"`   // Example field for document ID
+	// }
+	// if err := json.Unmarshal(req.Value, &docContent); err == nil && docContent.Text != "" && docContent.ID != "" {
+	// 	if invIdxMgr, ok := s.indexManagers["inverted"].(*indexmanager.InvertedIndexManager); ok {
+	// 		err := invIdxMgr.AddDocument(docContent.ID, docContent.Text)
+	// 		if err != nil {
+	// 			log.Printf("Node %s, Slot %d: Warning: Failed to add document %s to inverted index: %v", s.nodeID, s.slotID, docContent.ID, err)
+	// 			// Decide if this is a critical error or just a warning based on your design
+	// 		}
+	// 	}
+	// }
 
-	// 3. Optionally, apply to spatial index if value contains spatial data (assuming JSON document)
-	var spatialData struct {
-		ID string  `json:"id"` // Example field for spatial object ID
-		X1 float64 `json:"x1"`
-		Y1 float64 `json:"y1"`
-		X2 float64 `json:"x2"`
-		Y2 float64 `json:"y2"`
-	}
-	if err := json.Unmarshal(req.Value, &spatialData); err == nil && spatialData.ID != "" {
-		if spatialIdxMgr, ok := s.indexManagers["spatial"].(*indexmanager.SpatialIndexManager); ok {
-			rect := spatial.Rect{
-				MinX: spatialData.X1, MinY: spatialData.Y1, MaxX: spatialData.X2, MaxY: spatialData.Y2,
-			}
-			err := spatialIdxMgr.InsertSpatial(rect, spatialData.ID)
-			if err != nil {
-				log.Printf("Node %s, Slot %d: Warning: Failed to insert spatial data %s to spatial index: %v", s.nodeID, s.slotID, spatialData.ID, err)
-			}
-		}
-	}
+	// // 3. Optionally, apply to spatial index if value contains spatial data (assuming JSON document)
+	// var spatialData struct {
+	// 	ID string  `json:"id"` // Example field for spatial object ID
+	// 	X1 float64 `json:"x1"`
+	// 	Y1 float64 `json:"y1"`
+	// 	X2 float64 `json:"x2"`
+	// 	Y2 float64 `json:"y2"`
+	// }
+	// if err := json.Unmarshal(req.Value, &spatialData); err == nil && spatialData.ID != "" {
+	// 	if spatialIdxMgr, ok := s.indexManagers["spatial"].(*indexmanager.SpatialIndexManager); ok {
+	// 		rect := spatial.Rect{
+	// 			MinX: spatialData.X1, MinY: spatialData.Y1, MaxX: spatialData.X2, MaxY: spatialData.Y2,
+	// 		}
+	// 		err := spatialIdxMgr.InsertSpatial(rect, spatialData.ID)
+	// 		if err != nil {
+	// 			log.Printf("Node %s, Slot %d: Warning: Failed to insert spatial data %s to spatial index: %v", s.nodeID, s.slotID, spatialData.ID, err)
+	// 		}
+	// 	}
+	// }
 
 	log.Printf("Node %s, Slot %d: Put key=%s (applied to multiple indexes)", s.nodeID, s.slotID, req.Key)
 	return &pb.PutResponse{Success: true, Message: "Key-value pair put successfully"}, nil
