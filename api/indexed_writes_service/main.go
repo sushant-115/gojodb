@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/sushant-115/gojodb/api/proto"
 	"github.com/sushant-115/gojodb/core/indexmanager"
+	commonutils "github.com/sushant-115/gojodb/internal/common_utils"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	// Use insecure for local testing
@@ -18,30 +19,35 @@ type IndexedWriteService struct {
 	pb.UnimplementedIndexedWriteServiceServer
 	nodeID        string
 	slotID        uint32
-	indexManagers map[string]indexmanager.IndexManager // indexType -> IndexManager
-	writeMutex    sync.Mutex                           // Protects write operations (and LSN updates)
+	indexManagers sync.Map // map[string]indexmanager.IndexManager // indexType -> IndexManager
 }
 
 // NewIndexedWriteService creates a new IndexedWriteService.
 func NewIndexedWriteService(nodeID string, slotID uint32, indexManagers map[string]indexmanager.IndexManager) *IndexedWriteService {
-	return &IndexedWriteService{
-		nodeID:        nodeID,
-		slotID:        slotID,
-		indexManagers: indexManagers,
+	idx := &IndexedWriteService{
+		nodeID: nodeID,
+		slotID: slotID,
+		// indexManagers: indexManagers,
 	}
+	commonutils.CopyToSyncMap(indexManagers, &idx.indexManagers)
+	return idx
 }
 
 // Put handles a single key-value put operation.
 func (s *IndexedWriteService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	s.writeMutex.Lock()
-	defer s.writeMutex.Unlock()
 
 	// Operations go to B-tree (primary K/V store) and potentially others.
 	// In a real system, WAL write happens first, then apply to in-memory/disk structures.
 	// For now, directly apply to B-tree, and then potentially other indexes.
 
 	// 1. Apply to B-tree
-	if err := s.indexManagers["btree"].Put(req.Key, req.Value); err != nil {
+	btreeIdx, ok := s.indexManagers.Load("btree")
+	if !ok {
+		return &pb.PutResponse{Success: false, Message: ""}, status.Errorf(codes.Internal, "put failed (btree): %v")
+	}
+	btreeIndex := btreeIdx.(indexmanager.IndexManager)
+
+	if err := btreeIndex.Put(req.Key, req.Value); err != nil {
 		log.Printf("Node %s, Slot %d: Failed to put key %s to btree: %v", s.nodeID, s.slotID, req.Key, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Internal, "put failed (btree): %v", err)
 	}
@@ -87,11 +93,14 @@ func (s *IndexedWriteService) Put(ctx context.Context, req *pb.PutRequest) (*pb.
 
 // Delete handles a single key delete operation.
 func (s *IndexedWriteService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	s.writeMutex.Lock()
-	defer s.writeMutex.Unlock()
 
 	// 1. Delete from B-tree
-	if err := s.indexManagers["btree"].Delete(req.Key); err != nil {
+	btreeIdx, ok := s.indexManagers.Load("btree")
+	if !ok {
+		return &pb.DeleteResponse{Success: false, Message: ""}, status.Errorf(codes.Internal, "put failed (btree): %v")
+	}
+	btreeIndex := btreeIdx.(indexmanager.IndexManager)
+	if err := btreeIndex.Delete(req.Key); err != nil {
 		log.Printf("Node %s, Slot %d: Failed to delete key %s from btree: %v", s.nodeID, s.slotID, req.Key, err)
 		return &pb.DeleteResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Internal, "delete failed (btree): %v", err)
 	}
@@ -99,19 +108,19 @@ func (s *IndexedWriteService) Delete(ctx context.Context, req *pb.DeleteRequest)
 	// 2. Optionally, delete from inverted index (assuming key is docID or associated with docID)
 	// You might need to fetch the original value to get the docID if it's not the key
 	// For simplicity, assume key is directly the docID for inverted/spatial indices
-	if _, ok := s.indexManagers["inverted"].(*indexmanager.InvertedIndexManager); ok {
-		// This requires a DeleteDocument method on InvertedIndex
-		// if err := invIdxMgr.Delete(req.Key); err != nil { // Assuming key is docID
-		// 	log.Printf("Node %s, Slot %d: Warning: Failed to delete document %s from inverted index: %v", s.nodeID, s.slotID, req.Key, err)
-		// }
-	}
+	// if _, ok := s.indexManagers["inverted"].(*indexmanager.InvertedIndexManager); ok {
+	// 	// This requires a DeleteDocument method on InvertedIndex
+	// 	// if err := invIdxMgr.Delete(req.Key); err != nil { // Assuming key is docID
+	// 	// 	log.Printf("Node %s, Slot %d: Warning: Failed to delete document %s from inverted index: %v", s.nodeID, s.slotID, req.Key, err)
+	// 	// }
+	// }
 
-	// 3. Optionally, delete from spatial index
-	if spatialIdxMgr, ok := s.indexManagers["spatial"].(*indexmanager.SpatialIndexManager); ok {
-		if err := spatialIdxMgr.DeleteSpatial(req.Key); err != nil { // Assuming key is dataID
-			log.Printf("Node %s, Slot %d: Warning: Failed to delete spatial data %s from spatial index: %v", s.nodeID, s.slotID, req.Key, err)
-		}
-	}
+	// // 3. Optionally, delete from spatial index
+	// if spatialIdxMgr, ok := s.indexManagers["spatial"].(*indexmanager.SpatialIndexManager); ok {
+	// 	if err := spatialIdxMgr.DeleteSpatial(req.Key); err != nil { // Assuming key is dataID
+	// 		log.Printf("Node %s, Slot %d: Warning: Failed to delete spatial data %s from spatial index: %v", s.nodeID, s.slotID, req.Key, err)
+	// 	}
+	// }
 
 	log.Printf("Node %s, Slot %d: Deleted key=%s (applied to multiple indexes)", s.nodeID, s.slotID, req.Key)
 	return &pb.DeleteResponse{Success: true, Message: "Key-value pair deleted successfully"}, nil
@@ -119,8 +128,6 @@ func (s *IndexedWriteService) Delete(ctx context.Context, req *pb.DeleteRequest)
 
 // BulkPut handles multiple key-value put operations.
 func (s *IndexedWriteService) BulkPut(ctx context.Context, req *pb.BulkPutRequest) (*pb.BulkPutResponse, error) {
-	s.writeMutex.Lock()
-	defer s.writeMutex.Unlock()
 
 	for _, entry := range req.Entries {
 		// Call the single Put method internally to reuse logic and ensure WAL/index updates
@@ -137,8 +144,6 @@ func (s *IndexedWriteService) BulkPut(ctx context.Context, req *pb.BulkPutReques
 
 // BulkDelete handles multiple key delete operations.
 func (s *IndexedWriteService) BulkDelete(ctx context.Context, req *pb.BulkDeleteRequest) (*pb.BulkDeleteResponse, error) {
-	s.writeMutex.Lock()
-	defer s.writeMutex.Unlock()
 
 	for _, key := range req.Keys {
 		// Call the single Delete method internally

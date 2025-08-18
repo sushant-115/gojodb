@@ -22,6 +22,7 @@ import (
 
 	pb "github.com/sushant-115/gojodb/api/proto" // Assuming your proto package is named 'proto'
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
+	commonutils "github.com/sushant-115/gojodb/internal/common_utils"
 )
 
 const (
@@ -69,12 +70,6 @@ func NewGatewayService(controllerAddr string) *GatewayService {
 
 	log.Printf("GojoDB Gateway Service initialized, controller address: %s", controllerAddr)
 	return gs
-}
-
-func copyToSyncMap[K comparable, V any](src map[K]V, dst *sync.Map) {
-	for k, v := range src {
-		dst.Store(k, v)
-	}
 }
 
 // monitorControllerCluster periodically fetches the cluster status and shard assignments from the controller.
@@ -148,9 +143,9 @@ func (gs *GatewayService) monitorControllerCluster() {
 				updatedNodeAddresses[nodeID] = nodeInfo.GrpcAddr
 			}
 
-			copyToSyncMap(updatedAssignments, &gs.slotAssignments)
+			commonutils.CopyToSyncMap(updatedAssignments, &gs.slotAssignments)
 			// gs.slotAssignments = updatedAssignments
-			copyToSyncMap(updatedNodeAddresses, &gs.storageNodeAddresses)
+			commonutils.CopyToSyncMap(updatedNodeAddresses, &gs.storageNodeAddresses)
 			// gs.storageNodeAddresses = updatedNodeAddresses
 			log.Printf("Shard map and node addresses updated. %d assignments, %d nodes.", len(updatedAssignments), len(updatedNodeAddresses))
 
