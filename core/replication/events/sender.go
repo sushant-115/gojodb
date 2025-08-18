@@ -15,15 +15,12 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/logging"
-	"github.com/quic-go/quic-go/qlog"
 )
 
 // Logger is a tiny interface to allow plugging your own logger (zap, slog, logrus).
@@ -134,39 +131,39 @@ type EventSender struct {
 func newQUICConfig() *quic.Config {
 	// This function defines how to create a log file (an io.WriteCloser)
 	// for each new QUIC connection.
-	newQlogWriter := func(p logging.Perspective, connID []byte) io.WriteCloser {
-		// Create a unique file name for each connection using its ID.
-		// This prevents connections from overwriting each other's logs.
-		filename := fmt.Sprintf("/tmp/connection_%x.qlog", connID)
+	// newQlogWriter := func(p logging.Perspective, connID []byte) io.WriteCloser {
+	// 	// Create a unique file name for each connection using its ID.
+	// 	// This prevents connections from overwriting each other's logs.
+	// 	filename := fmt.Sprintf("/tmp/connection_%x.qlog", connID)
 
-		// Differentiate between client and server logs if needed.
-		if p == logging.PerspectiveServer {
-			filename = fmt.Sprintf("/tmp/server_connection_%x.qlog", connID)
-		}
+	// 	// Differentiate between client and server logs if needed.
+	// 	if p == logging.PerspectiveServer {
+	// 		filename = fmt.Sprintf("/tmp/server_connection_%x.qlog", connID)
+	// 	}
 
-		// Create the file.
-		f, err := os.Create(filename)
-		if err != nil {
-			// If file creation fails, log the error and return nil.
-			// Returning nil will disable qlog for this specific connection.
-			fmt.Printf("Error creating qlog file %s: %v\n", filename, err)
-			return nil
-		}
+	// 	// Create the file.
+	// 	f, err := os.Create(filename)
+	// 	if err != nil {
+	// 		// If file creation fails, log the error and return nil.
+	// 		// Returning nil will disable qlog for this specific connection.
+	// 		fmt.Printf("Error creating qlog file %s: %v\n", filename, err)
+	// 		return nil
+	// 	}
 
-		fmt.Printf("Created qlog file: %s\n", filename)
-		// The returned *os.File implements the io.WriteCloser interface.
-		return f
-	}
+	// 	fmt.Printf("Created qlog file: %s\n", filename)
+	// 	// The returned *os.File implements the io.WriteCloser interface.
+	// 	return f
+	// }
 
 	// The quic.Config.Tracer field now expects a function that returns a new
 	// connection tracer for each new connection. This is a factory pattern.
 	return &quic.Config{
-		EnableDatagrams: true,
-		Tracer: func(ctx context.Context, p logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer {
-			// This function is called by quic-go for each new connection.
-			// We return a new tracer that uses our file-creating function.
-			return qlog.NewConnectionTracer(newQlogWriter(p, connID.Bytes()), p, connID)
-		},
+		// EnableDatagrams: true,
+		// Tracer: func(ctx context.Context, p logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer {
+		// 	// This function is called by quic-go for each new connection.
+		// 	// We return a new tracer that uses our file-creating function.
+		// 	return qlog.NewConnectionTracer(newQlogWriter(p, connID.Bytes()), p, connID)
+		// },
 	}
 }
 

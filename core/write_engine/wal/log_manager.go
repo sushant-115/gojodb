@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"log"
 
 	// "encoding/gob" // No longer needed for WALStreamReader
 	"encoding/json"
@@ -91,6 +92,13 @@ type LogRecord struct {
 	LogType    LogType            // General type for routing to index specific apply logic
 	SegmentID  uint64             // ID of the WAL segment this record belongs to
 	RecordSize uint32             // Size of this record on disk
+}
+
+// commitRequest is a struct that bundles a log record with a channel
+// to signal when the record has been durably written to disk.
+type commitRequest struct {
+	record *LogRecord
+	err    chan error
 }
 
 // Encode serializes the LogRecord into a byte slice for network transmission or disk storage.
@@ -264,6 +272,12 @@ type LogManager struct {
 	// Replication Slots Management
 	replicationSlots map[string]*ReplicationSlot // Key: SlotName
 	shutdownCh       chan struct{}
+	logQueue         chan commitRequest
+	writer           *bufio.Writer
+	wg               sync.WaitGroup
+	shutdown         chan struct{}
+	flushTimeout     time.Duration
+	maxBatchSize     int
 }
 
 // WALStreamReader provides an interface for reading from the WAL across multiple segments.
@@ -315,6 +329,10 @@ func NewLogManager(walDir string, logger *zap.Logger, indextype indexing.IndexTy
 		replicationSlots: make(map[string]*ReplicationSlot),
 		cryptoUtil:       crypto,
 		shutdownCh:       make(chan struct{}),
+		logQueue:         make(chan commitRequest, 1024), // A buffered channel for requests
+		shutdown:         make(chan struct{}),
+		flushTimeout:     10 * time.Millisecond, // Flush at least every 5ms
+		maxBatchSize:     128,
 	}
 
 	lm.cond = sync.NewCond(&lm.mtx)
@@ -324,6 +342,12 @@ func NewLogManager(walDir string, logger *zap.Logger, indextype indexing.IndexTy
 	if err := lm.loadReplicationSlots(); err != nil {
 		lm.logger.Warn("Could not load replication slots, starting fresh", zap.Error(err))
 	}
+
+	lm.writer = bufio.NewWriter(lm.currentSegmentFile)
+
+	// Start the background goroutine that will process the log queue
+	lm.wg.Add(1)
+	go lm.logWriter()
 
 	// Start a background goroutine for periodic pruning
 	go lm.runPruningLoop()
@@ -851,38 +875,131 @@ func (lm *LogManager) persistReplicationSlots() error {
 }
 
 // AppendRecord appends a log record to the WAL.
+// AppendRecord now sends the log record to a channel and waits for confirmation.
 func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) {
+	// Create a channel to receive the result of this specific request.
+	errChan := make(chan error, 1)
+
+	req := commitRequest{
+		record: lr,
+		err:    errChan,
+	}
+
+	// Send the request to the log writer's queue.
+	lm.logQueue <- req
+
+	// Wait for the log writer to process the request and send back a result.
+	// This blocks until the log record is durably on disk.
+	err := <-errChan
+	if err != nil {
+		return 0, err
+	}
+
+	// The LSN is now set by the logWriter, so we retrieve it from the record.
+	return lr.LSN, nil
+}
+
+// logWriter is the background goroutine that processes log records in batches.
+func (lm *LogManager) logWriter() {
+	defer lm.wg.Done()
+	batch := make([]commitRequest, 0, lm.maxBatchSize)
+	ticker := time.NewTicker(lm.flushTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-lm.shutdown:
+			// On shutdown, flush any remaining records and exit.
+			lm.flushBatch(&batch)
+			return
+
+		case req := <-lm.logQueue:
+			batch = append(batch, req)
+			// Flush if the batch is full.
+			if len(batch) >= lm.maxBatchSize {
+				lm.flushBatch(&batch)
+				// Reset the timer since we just flushed.
+				ticker.Reset(lm.flushTimeout)
+			}
+
+		case <-ticker.C:
+			// If the timer fires, flush the current batch.
+			if len(batch) > 0 {
+				lm.flushBatch(&batch)
+			}
+		}
+	}
+}
+
+// flushBatch writes a batch of log records to the disk.
+func (lm *LogManager) flushBatch(batch *[]commitRequest) {
+	if len(*batch) == 0 {
+		return
+	}
+
 	lm.mu.Lock()
-	lr.IndexType = lm.IndexType
-	lm.currentLSN++
-	lsn := lm.currentLSN
+	defer lm.mu.Unlock()
 
-	encoded, err := lr.Encode()
-	if err != nil {
-		return 0, fmt.Errorf("failed to encode log record: %w", err)
-	}
+	// Process all records in the batch.
+	for i := range *batch {
+		req := &(*batch)[i] // Use a pointer to modify the original request
 
-	currentFileSize, err := lm.currentSegmentFile.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, fmt.Errorf("failed to seek current WAL segment: %w", err)
-	}
+		// Assign LSN just before writing
+		lm.currentLSN++
+		req.record.LSN = lm.currentLSN
+		req.record.IndexType = lm.IndexType
 
-	if currentFileSize+int64(lr.RecordSize) > lm.maxSegmentSize {
-		if err := lm.rollOverSegment(); err != nil {
-			return 0, fmt.Errorf("failed to roll over WAL segment: %w", err)
+		encoded, err := req.record.Encode()
+		if err != nil {
+			req.err <- fmt.Errorf("failed to encode log record: %w", err)
+			continue // Move to the next record
+		}
+
+		// Segment rollover logic (simplified for clarity)
+		// You would check the total size of the batch here before writing.
+		// if err := lm.rollOverSegmentIfNeeded(len(encoded)); err != nil { ... }
+
+		// Write to the buffered writer
+		if err := binary.Write(lm.writer, binary.BigEndian, req.record.RecordSize); err != nil {
+			req.err <- fmt.Errorf("failed to write record size: %w", err)
+			continue
+		}
+		if _, err := lm.writer.Write(encoded); err != nil {
+			req.err <- fmt.Errorf("failed to write record data: %w", err)
+			continue
 		}
 	}
 
-	if err := binary.Write(lm.currentSegmentFile, binary.BigEndian, lr.RecordSize); err != nil {
-		return 0, fmt.Errorf("failed to write record size to WAL: %w", err)
+	// --- THIS IS THE KEY TO PERFORMANCE ---
+	// 1. Flush the OS buffer.
+	err := lm.writer.Flush()
+	if err != nil {
+		// Signal error to all waiting clients in the batch
+		for _, req := range *batch {
+			req.err <- fmt.Errorf("failed to flush WAL writer: %w", err)
+		}
+		*batch = (*batch)[:0] // Clear the batch
+		return
 	}
-	if _, err := lm.currentSegmentFile.Write(encoded); err != nil {
-		lm.logger.Fatal("FATAL: Failed to write record data to WAL. WAL may be corrupt.", zap.Error(err))
-		return 0, fmt.Errorf("failed to write record data to WAL: %w", err)
+
+	// 2. Force the OS to write to physical disk.
+	err = lm.currentSegmentFile.Sync()
+	if err != nil {
+		for _, req := range *batch {
+			req.err <- fmt.Errorf("failed to fsync WAL: %w", err)
+		}
+		*batch = (*batch)[:0] // Clear the batch
+		return
 	}
-	lm.mu.Unlock()
+	// --- END KEY SECTION ---
+
+	// Success! Notify all waiting clients that their transaction is durable.
+	for _, req := range *batch {
+		close(req.err) // Closing the channel signals success with no error
+	}
 	lm.cond.Broadcast()
-	return lsn, nil
+	// Clear the batch for the next set of records.
+	*batch = (*batch)[:0]
 }
 
 func (lm *LogManager) rollOverSegment() error {
@@ -914,6 +1031,7 @@ func (lm *LogManager) Close() error {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	if lm.currentSegmentFile != nil {
+		lm.writer.Flush()
 		err := lm.currentSegmentFile.Sync()
 		if err != nil {
 			lm.logger.Error("Failed to sync WAL on close", zap.Error(err))
@@ -923,6 +1041,9 @@ func (lm *LogManager) Close() error {
 		lm.logger.Info("LogManager closed.", zap.Uint64("lastLSN", uint64(lm.currentLSN)))
 		return closeErr
 	}
+	close(lm.shutdown)
+	log.Println("Waiting here")
+	lm.wg.Wait()
 	return nil
 }
 

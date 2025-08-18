@@ -195,7 +195,6 @@ func (sim *SpatialIndexManager) Query(queryRect Rect) ([]SpatialData, error) {
 func (sim *SpatialIndexManager) Close() error {
 	sim.mu.Lock()
 	defer sim.mu.Unlock()
-
 	log.Println("INFO: Closing SpatialIndexManager...")
 	if sim.rtree != nil {
 		if err := sim.rtree.Close(); err != nil {
