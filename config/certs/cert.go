@@ -44,7 +44,7 @@ func LoadCerts(dir string) (*tls.Config, *tls.Config) {
 	if err != nil {
 		log.Fatalf("Failed to load server TLS config: %v", err)
 	}
-	serverCert, err := fn("/Users/sushant/go/src/gojodb/config/certs/ca.crt", "/Users/sushant/go/src/gojodb/config/certs/server.crt", "/Users/sushant/go/src/gojodb/config/certs/server.key")
+	serverCert, err := fn("/etc/gojodb/certs/ca.crt", "/etc/gojodb/certs/server.crt", "/etc/gojodb/certs/server.key")
 	if err != nil {
 		log.Fatalf("Failed to load server TLS config: %v", err)
 	}
@@ -53,7 +53,7 @@ func LoadCerts(dir string) (*tls.Config, *tls.Config) {
 	if err != nil {
 		log.Fatalf("Failed to load server TLS config: %v", err)
 	}
-	clientCert, err := cfn("/Users/sushant/go/src/gojodb/config/certs/ca.crt", "/Users/sushant/go/src/gojodb/config/certs/client.crt", "/Users/sushant/go/src/gojodb/config/certs/client.key")
+	clientCert, err := cfn("/etc/gojodb/certs/ca.crt", "/etc/gojodb/certs/client.crt", "/etc/gojodb/certs/client.key")
 	if err != nil {
 		log.Fatalf("Failed to load server TLS config: %v", err)
 	}

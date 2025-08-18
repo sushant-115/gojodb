@@ -74,7 +74,7 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 		if page.GetLruElement() != nil { // Ensure it's in LRU list before moving
 			bpm.lruList.MoveToFront(page.GetLruElement())
 		}
-		log.Printf("DEBUG: Page %d found in buffer pool (frame %d), pinCount: %d", pageID, frameIdx, page.GetPinCount())
+		// log.Printf("DEBUG: Page %d found in buffer pool (frame %d), pinCount: %d", pageID, frameIdx, page.GetPinCount())
 		return page, nil
 	}
 
@@ -85,7 +85,7 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 		return nil, err
 	}
 	victimPage := bpm.pages[frameIdx]
-	log.Printf("DEBUG: Page %d not in buffer pool. Evicting frame %d (old page %d)", pageID, frameIdx, victimPage.GetPageID())
+	// log.Printf("DEBUG: Page %d not in buffer pool. Evicting frame %d (old page %d)", pageID, frameIdx, victimPage.GetPageID())
 
 	// 3. If victim page is dirty, flush it to disk
 	if victimPage.IsDirty() && victimPage.GetPageID() != pagemanager.InvalidPageID {
@@ -98,7 +98,7 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 				return nil, fmt.Errorf("failed to flush log for victim page %d: %w", victimPage.GetPageID(), err)
 			}
 		}
-		log.Printf("DEBUG: Flushing dirty victim page %d from frame %d to disk", victimPage.GetPageID(), frameIdx)
+		// log.Printf("DEBUG: Flushing dirty victim page %d from frame %d to disk", victimPage.GetPageID(), frameIdx)
 		if err := bpm.diskManager.WritePage(victimPage.GetPageID(), victimPage.GetData()); err != nil {
 			// If flush fails, we cannot reuse this frame safely.
 			return nil, fmt.Errorf("failed to flush dirty victim page %d: %w", victimPage.GetPageID(), err)
@@ -119,7 +119,7 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 	victimPage.Reset() // Clears data and metadata
 
 	// 6. Load new page data from disk
-	log.Printf("DEBUG: Reading page %d from disk into frame %d", pageID, frameIdx)
+	// log.Printf("DEBUG: Reading page %d from disk into frame %d", pageID, frameIdx)
 	if err := bpm.diskManager.ReadPage(pageID, victimPage.GetData()); err != nil {
 		// If read fails, return error. The frame is now empty and not tracked in pageTable.
 		return nil, fmt.Errorf("failed to read page %d from disk: %w", pageID, err)
@@ -134,7 +134,7 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 	bpm.pageTable[pageID] = frameIdx
 	victimPage.SetLruElement(bpm.lruList.PushFront(frameIdx)) // Add to front of LRU
 	bpm.lruMap[frameIdx] = victimPage.GetLruElement()
-	log.Printf("DEBUG: Page %d loaded into frame %d, pinCount: %d", pageID, frameIdx, victimPage.GetPinCount())
+	// log.Printf("DEBUG: Page %d loaded into frame %d, pinCount: %d", pageID, frameIdx, victimPage.GetPinCount())
 
 	return victimPage, nil
 }
@@ -146,7 +146,7 @@ func (bpm *BufferPoolManager) getVictimFrameInternal() (int, error) {
 	for e := bpm.lruList.Back(); e != nil; e = e.Prev() {
 		frameIdx := e.Value.(int)
 		if bpm.pages[frameIdx].GetPinCount() == 0 {
-			log.Printf("DEBUG: Found LRU victim frame %d (page %d)", frameIdx, bpm.pages[frameIdx].GetPageID())
+			// log.Printf("DEBUG: Found LRU victim frame %d (page %d)", frameIdx, bpm.pages[frameIdx].GetPageID())
 			return frameIdx, nil
 		}
 	}
@@ -155,7 +155,7 @@ func (bpm *BufferPoolManager) getVictimFrameInternal() (int, error) {
 	// This covers the initial state where frames are not yet holding valid pages or added to LRU.
 	for i := 0; i < bpm.poolSize; i++ {
 		if bpm.pages[i].GetPageID() == pagemanager.InvalidPageID { // A truly empty frame
-			log.Printf("DEBUG: Found empty frame %d as victim", i)
+			// log.Printf("DEBUG: Found empty frame %d as victim", i)
 			return i, nil
 		}
 	}
@@ -214,7 +214,7 @@ func (bpm *BufferPoolManager) UnpinPage(pageID pagemanager.PageID, isDirty bool)
 				page.SetLSN(pagemanager.LSN(lsn)) // Update the page's LSN to the LSN of this log record
 			}
 		}
-		log.Printf("DEBUG: Unpinned page %d (frame %d), new pinCount: %d, isDirty: %t, LSN: %d", pageID, frameIdx, page.GetPinCount(), page.IsDirty(), page.GetLSN())
+		// log.Printf("DEBUG: Unpinned page %d (frame %d), new pinCount: %d, isDirty: %t, LSN: %d", pageID, frameIdx, page.GetPinCount(), page.IsDirty(), page.GetLSN())
 		// If pin count becomes 0, it's now eligible for LRU eviction. Its LRU position
 		// is managed by FetchPage moving to front. No explicit LRU removal/addition needed here.
 		return nil
@@ -235,7 +235,7 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 		log.Printf("ERROR: Failed to allocate new page on disk: %v", err)
 		return nil, pagemanager.InvalidPageID, err
 	}
-	log.Printf("DEBUG: Allocated new page %d on disk.", newPageID)
+	// log.Printf("DEBUG: Allocated new page %d on disk.", newPageID)
 
 	// 2. Find a victim frame in the buffer pool for this new page
 	frameIdx, err := bpm.getVictimFrameInternal()
@@ -247,7 +247,7 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 		return nil, pagemanager.InvalidPageID, fmt.Errorf("failed to get frame for new page %d: %w", newPageID, err)
 	}
 	victimPage := bpm.pages[frameIdx]
-	log.Printf("DEBUG: New page %d getting frame %d (old page %d)", newPageID, frameIdx, victimPage.GetPageID())
+	// log.Printf("DEBUG: New page %d getting frame %d (old page %d)", newPageID, frameIdx, victimPage.GetPageID())
 
 	// 3. If victim page is dirty, flush it before reuse
 	if victimPage.IsDirty() && victimPage.GetPageID() != pagemanager.InvalidPageID {
@@ -258,7 +258,7 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 				return nil, pagemanager.InvalidPageID, fmt.Errorf("failed to flush log for victim page %d: %w", victimPage.GetPageID(), err)
 			}
 		}
-		log.Printf("DEBUG: Flushing dirty victim page %d for new page %d", victimPage.GetPageID(), newPageID)
+		// log.Printf("DEBUG: Flushing dirty victim page %d for new page %d", victimPage.GetPageID(), newPageID)
 		if err := bpm.diskManager.WritePage(victimPage.GetPageID(), victimPage.GetData()); err != nil {
 			return nil, pagemanager.InvalidPageID, fmt.Errorf("failed to flush dirty victim %d for new page: %w", victimPage.GetPageID(), err)
 		}
@@ -285,7 +285,7 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 	bpm.pageTable[newPageID] = frameIdx
 	victimPage.SetLruElement(bpm.lruList.PushFront(frameIdx)) // Add to front of LRU
 	bpm.lruMap[frameIdx] = victimPage.GetLruElement()
-	log.Printf("DEBUG: New page %d loaded into frame %d, pinCount: %d, isDirty: %t", newPageID, frameIdx, victimPage.GetPinCount(), victimPage.IsDirty())
+	// log.Printf("DEBUG: New page %d loaded into frame %d, pinCount: %d, isDirty: %t", newPageID, frameIdx, victimPage.GetPinCount(), victimPage.IsDirty())
 
 	// WAL INTEGRATION: Append a log record for the allocation of this new page.
 	if bpm.logManager != nil {
@@ -323,7 +323,7 @@ func (bpm *BufferPoolManager) FlushPage(pageID pagemanager.PageID) error {
 					return fmt.Errorf("failed to flush log for page %d: %w", pageID, err)
 				}
 			}
-			log.Printf("DEBUG: Flushing page %d (frame %d) to disk", pageID, frameIdx)
+			// log.Printf("DEBUG: Flushing page %d (frame %d) to disk", pageID, frameIdx)
 			if err := bpm.diskManager.WritePage(page.GetPageID(), page.GetData()); err != nil {
 				log.Printf("ERROR: Failed to flush page %d: %v", pageID, err)
 				return err
@@ -337,7 +337,7 @@ func (bpm *BufferPoolManager) FlushPage(pageID pagemanager.PageID) error {
 
 			page.SetDirty(false) // Mark clean after successful flush
 		} else {
-			log.Printf("DEBUG: Page %d (frame %d) is clean, no flush needed.", pageID, frameIdx)
+			// log.Printf("DEBUG: Page %d (frame %d) is clean, no flush needed.", pageID, frameIdx)
 		}
 		return nil
 	}
@@ -354,14 +354,14 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 
 	// WAL INTEGRATION: Before flushing all pages, ensure all pending log records are flushed.
 	if bpm.logManager != nil {
-		log.Println("DEBUG: Flushing all pending log records before flushing all pages.")
+		// log.Println("DEBUG: Flushing all pending log records before flushing all pages.")
 		if firstErr = bpm.logManager.Sync(); firstErr != nil { // Flush all logs
 			log.Printf("ERROR: Failed to flush all log records before flushing all pages: %v", firstErr)
 		}
 	}
 
-	log.Println("DEBUG: Flushing all dirty pages from buffer pool...")
-	for i, page := range bpm.pages { // Iterate over all frames in the pool
+	// log.Println("DEBUG: Flushing all dirty pages from buffer pool...")
+	for _, page := range bpm.pages { // Iterate over all frames in the pool
 		if page.GetPageID() != pagemanager.InvalidPageID && page.IsDirty() {
 			// WAL INTEGRATION: Although logs should be flushed above, this is a redundant check
 			// for safety if a page's LSN is somehow higher than what was flushed.
@@ -374,7 +374,7 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 				}
 			}
 
-			log.Printf("DEBUG: Flushing page %d (frame %d) during FlushAllPages", page.GetPageID(), i)
+			// log.Printf("DEBUG: Flushing page %d (frame %d) during FlushAllPages", page.GetPageID(), i)
 			err := bpm.diskManager.WritePage(page.GetPageID(), page.GetData())
 			if err != nil {
 				if firstErr == nil {
@@ -393,7 +393,7 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 		}
 		fmt.Fprintf(os.Stderr, "Error syncing disk manager during FlushAllPages: %v\n", err)
 	}
-	log.Println("DEBUG: Finished FlushAllPages.")
+	// log.Println("DEBUG: Finished FlushAllPages.")
 	return firstErr
 }
 
@@ -429,9 +429,9 @@ func (bpm *BufferPoolManager) InvalidatePage(pageID pagemanager.PageID) {
 		// This is important because the replacer holds state about pinned/unpinned frames.
 		bpm.UnpinPage(pageID, true)
 
-		log.Printf("DEBUG: Invalidated page %d (frame %d) from buffer pool.", pageID, frameID)
+		// log.Printf("DEBUG: Invalidated page %d (frame %d) from buffer pool.", pageID, frameID)
 	} else {
-		log.Printf("DEBUG: Attempted to invalidate page %d not found in buffer pool. No action taken.", pageID)
+		// log.Printf("DEBUG: Attempted to invalidate page %d not found in buffer pool. No action taken.", pageID)
 	}
 }
 

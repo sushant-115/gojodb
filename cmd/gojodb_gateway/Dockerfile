@@ -20,10 +20,6 @@ ARG COMPONENT_PATH
 
 # Build the Go application binary
 # The output binary will be named 'app' and placed in /usr/local/bin/
-
-RUN apk add curl && curl -L https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.21/grpc_health_probe-linux-amd64 \
-    -o /bin/grpc_health_probe && chmod +x /bin/grpc_health_probe
-
 RUN go build -o /usr/local/bin/app ${COMPONENT_PATH}
 
 # Use a minimal Alpine Linux image for the final stage
@@ -35,8 +31,6 @@ WORKDIR /app
 
 # Copy the compiled binary from the builder stage
 COPY --from=builder /usr/local/bin/app .
-COPY --from=builder /app/config/certs /etc/gojodb/certs
-COPY --from=builder /bin/grpc_health_probe /bin/
 
 # Expose the ports that the application will listen on.
 # You will need to uncomment and adjust these lines based on the specific component:

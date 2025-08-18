@@ -69,7 +69,7 @@ func (r *ReplicationOrchestrator) Stop() {
 }
 
 func (r *ReplicationOrchestrator) handleInboundStream() {
-	log.Println("Orch Handle inbound stream")
+	// log.Println("Orch Handle inbound stream")
 	eventsCh := r.EventReceiver.Events()
 	for {
 		select {
@@ -80,7 +80,7 @@ func (r *ReplicationOrchestrator) handleInboundStream() {
 				return
 			}
 
-			log.Println("Received event: ", len(event))
+			// log.Println("Received event: ", len(event))
 			lr, err := wal.DecodeLogRecord(event)
 			if err != nil || lr == nil {
 				log.Println("Error: Couldn't decode the log record: ", string(event))
@@ -97,7 +97,7 @@ func (r *ReplicationOrchestrator) handleInboundStream() {
 			}
 
 			if err := replMgr.ApplyLogRecord(*lr); err != nil {
-				log.Println("Error: Couldn't apply the log record: ", lr, err)
+				log.Println("Error: Couldn't apply the log record: ", lr.PageID, err)
 			}
 		case <-r.stopChan:
 			log.Println("Received stop signal, stopping inbound stream handler.")

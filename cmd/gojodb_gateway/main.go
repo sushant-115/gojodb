@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -33,6 +34,10 @@ const (
 	ShardMapUpdateInterval = 5 * time.Second
 	// NumShardSlots defines the total number of hash slots for sharding.
 	NumShardSlots = 1024 // Must match fsm.NumShardSlots
+)
+
+var (
+	controllerAddr = flag.String("controller_addr", "127.0.0.1:8080", "Controller address for joining Raft cluster and fetching shard map")
 )
 
 // GatewayService implements the gRPC GatewayService.
@@ -756,6 +761,7 @@ func (gs *GatewayService) GetShardMap(ctx context.Context, req *pb.GetShardMapRe
 
 // Main function to start the gateway service.
 func main() {
+	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 	lis, err := net.Listen("tcp", DefaultGatewayPort)
 	if err != nil {
@@ -763,7 +769,7 @@ func main() {
 	}
 
 	s := grpc.NewServer()
-	gatewayService := NewGatewayService(DefaultControllerAddr)
+	gatewayService := NewGatewayService(*controllerAddr)
 	pb.RegisterGatewayServiceServer(s, gatewayService)
 
 	log.Printf("GojoDB Gateway server listening at %v", lis.Addr())

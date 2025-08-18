@@ -86,7 +86,7 @@ func (m *BTreeIndexManager) GetRange(startKey, endKey string, limit int32) ([]*p
 		for {
 			key, val, isNext, iterErr := iterator.Next()
 			if iterErr != nil || !isNext {
-				log.Println("ITERATOR NEXT: ", isNext, iterErr)
+				// log.Println("ITERATOR NEXT: ", isNext, iterErr)
 				break
 			}
 			results = append(results, &pb.KeyValuePair{Key: key, Value: []byte(val)})
