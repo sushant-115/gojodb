@@ -96,7 +96,7 @@ type Transaction struct {
 	// on this shard, or at least the pages/keys it modified.
 	// For V1, we'll rely on WAL for recovery.
 	// LocksHeld: Keep track of locks held by this transaction.
-	locksHeld map[string]struct{} // Set of keys locked by this transaction
+	locksHeld sync.Map // Set of keys locked by this transaction
 }
 
 // --- END NEW ---
@@ -121,8 +121,8 @@ type BTree[K any, V any] struct {
 	logManager   *wal.LogManager // Placeholder for *LogManager
 
 	// --- NEW: 2PC Participant State ---
-	transactionTable       map[uint64]*Transaction // TxnID -> Transaction (in-memory state of active txns)
-	keyLocks               map[string]uint64       // Key (string representation) -> TxnID (ID of txn holding lock)
+	transactionTable       sync.Map // TxnID -> Transaction (in-memory state of active txns)
+	keyLocks               sync.Map // Key (string representation) -> TxnID (ID of txn holding lock)
 	keyLocksMu             sync.RWMutex
 	transactionTableLockMu sync.RWMutex // Protects keyLocks map
 	// --- END NEW ---
@@ -167,8 +167,8 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
 		kvSerializer: kvSerializer, bpm: bpm, diskManager: dm, logManager: logManager,
 		// --- NEW: Initialize 2PC Participant State ---
-		transactionTable: make(map[uint64]*Transaction),
-		keyLocks:         make(map[string]uint64),
+		// transactionTable: make(map[uint64]*Transaction),
+		// keyLocks:         make(map[string]uint64),
 		// --- END NEW ---
 	}
 
@@ -259,8 +259,8 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 		diskManager:  dm,
 		logManager:   logManager,
 		// --- NEW: Initialize 2PC Participant State ---
-		transactionTable: make(map[uint64]*Transaction),
-		keyLocks:         make(map[string]uint64),
+		// transactionTable: make(map[uint64]*Transaction),
+		// keyLocks:         make(map[string]uint64),
 		// --- END NEW ---
 	}
 
@@ -1598,37 +1598,38 @@ func (bt *BTree[K, V]) mergeChildrenAndKey(
 // Prepare handles the PREPARE phase of a 2PC transaction.
 // It attempts to acquire locks for all keys involved in the operations and logs a PREPARE record.
 func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) error {
-	bt.transactionTableLockMu.Lock()
-	defer bt.transactionTableLockMu.Unlock()
+	// bt.transactionTableLockMu.Lock()
+	// defer bt.transactionTableLockMu.Unlock()
 	// bt.keyLocksMu.Lock()
 	// defer bt.keyLocksMu.Unlock()
 
-	if _, ok := bt.transactionTable[txnID]; ok {
+	if _, ok := bt.transactionTable.Load(txnID); ok {
 		return fmt.Errorf("%w: transaction %d already exists", ErrTxnAlreadyExists, txnID)
 	}
 
 	txn := &Transaction{
-		ID:        txnID,
-		State:     TxnStateRunning, // Initially running
-		locksHeld: make(map[string]struct{}),
+		ID:    txnID,
+		State: TxnStateRunning, // Initially running
+		// locksHeld: make(map[string]struct{}),
 		Operation: operations,
 	}
-	bt.transactionTable[txnID] = txn
+	bt.transactionTable.Store(txnID, txn)
 
 	log.Printf("INFO: Txn %d: Received PREPARE request. Attempting to acquire locks.", txnID)
 	log.Println("DEBUG Operations: ", operations)
 	// Acquire locks for all keys involved in the transaction on this shard
 	for _, op := range operations {
-		keyStr := fmt.Sprintf("%v", op.Key) // Convert K to string for map key
-		log.Println("KeyStr: ", keyStr, txnID)
-		if err := bt.acquireLockInternal(keyStr, txnID); err != nil {
+		// keyStr := fmt.Sprintf("%v", op.Key) // Convert K to string for map key
+		log.Println("KeyStr: ", op.Key, txnID)
+		if err := bt.acquireLockInternal(op.Key, txnID); err != nil {
 			// If lock acquisition fails, abort the transaction on this participant.
 			log.Printf("ERROR: Txn %d: Failed to acquire lock for key %v during PREPARE: %v. Aborting locally.", txnID, op.Key, err)
-			bt.releaseAllLocksForTxn(txnID)    // Release any locks already held
-			delete(bt.transactionTable, txnID) // Remove from table
+			bt.releaseAllLocksForTxn(txnID)   // Release any locks already held
+			bt.transactionTable.Delete(txnID) // Remove from table
 			return fmt.Errorf("%w: failed to acquire lock for key %v", ErrPrepareFailed, op.Key)
 		}
-		txn.locksHeld[keyStr] = struct{}{} // Track locks held by this transaction
+		txn.locksHeld.Store(op.Key, struct{}{})
+		// txn.locksHeld[op.Key] = struct{}{} // Track locks held by this transaction
 		log.Printf("DEBUG: Txn %d: Acquired lock for key %v.", txnID, op.Key)
 	}
 
@@ -1651,13 +1652,13 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 	}, wal.LogTypeBtree)
 	if err != nil {
 		bt.releaseAllLocksForTxn(txnID)
-		delete(bt.transactionTable, txnID)
+		bt.transactionTable.Delete(txnID)
 		return fmt.Errorf("%w: failed to log PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
 	}
 	// Flush the log to ensure the PREPARE record is durable before voting COMMIT
 	if err := bt.logManager.Sync(); err != nil {
 		bt.releaseAllLocksForTxn(txnID)
-		delete(bt.transactionTable, txnID)
+		bt.transactionTable.Delete(txnID)
 		return fmt.Errorf("%w: failed to flush log for PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
 	}
 
@@ -1670,13 +1671,14 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 // It logs a COMMIT record and releases locks.
 func (bt *BTree[K, V]) Commit(txnID uint64) error {
 	log.Println("COMMIT DEBUG: unlock tx: ", txnID)
-	bt.keyLocksMu.Lock()
-	defer bt.keyLocksMu.Unlock()
+	// bt.keyLocksMu.Lock()
+	// defer bt.keyLocksMu.Unlock()
 	log.Println("COMMIT DEBUG: lock tx: ", txnID)
-	txn, ok := bt.transactionTable[txnID]
+	t, ok := bt.transactionTable.Load(txnID)
 	if !ok {
 		return fmt.Errorf("%w: transaction %d not found in table", ErrTxnNotFound, txnID)
 	}
+	txn := t.(*Transaction)
 	if txn.State != TxnStatePrepared && txn.State != TxnStateRunning { // Can commit from Running if coordinator crashed before prepare log
 		log.Printf("WARNING: Txn %d: Attempted to COMMIT from state %v. Expected PREPARED or RUNNING. Proceeding.", txnID, txn.State)
 	}
@@ -1698,9 +1700,10 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 		return fmt.Errorf("failed to flush log for COMMIT record for txn %d: %w", txnID, err)
 	}
 
-	txn.State = TxnStateCommitted      // Transition state to COMMITTED
-	bt.releaseAllLocksForTxn(txnID)    // Release all locks held by this transaction
-	delete(bt.transactionTable, txnID) // Remove from in-memory table
+	txn.State = TxnStateCommitted // Transition state to COMMITTED
+	bt.releaseAllLocksForTxn(txnID)
+	bt.transactionTable.Delete(txnID) // Release all locks held by this transaction
+	// delete(bt.transactionTable, txnID) // Remove from in-memory table
 
 	log.Printf("INFO: Txn %d: COMMITTED. Locks released.", txnID)
 	return nil
@@ -1709,13 +1712,14 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 // Abort handles the ABORT phase of a 2PC transaction.
 // It logs an ABORT record, releases locks, and rolls back changes (V1: conceptual).
 func (bt *BTree[K, V]) Abort(txnID uint64) error {
-	bt.keyLocksMu.Lock()
-	defer bt.keyLocksMu.Unlock()
+	// bt.keyLocksMu.Lock()
+	// defer bt.keyLocksMu.Unlock()
 
-	txn, ok := bt.transactionTable[txnID]
+	t, ok := bt.transactionTable.Load(txnID)
 	if !ok {
 		return fmt.Errorf("%w: transaction %d not found in table", ErrTxnNotFound, txnID)
 	}
+	txn := t.(*Transaction)
 	if txn.State != TxnStatePrepared && txn.State != TxnStateRunning {
 		log.Printf("WARNING: Txn %d: Attempted to ABORT from state %v. Expected PREPARED or RUNNING. Proceeding.", txnID, txn.State)
 	}
@@ -1742,9 +1746,10 @@ func (bt *BTree[K, V]) Abort(txnID uint64) error {
 	// and applying OldData to reverse changes. For V1, this is conceptual.
 	log.Printf("WARNING: Txn %d: Rollback logic is conceptual for V1. Changes are not actively undone.", txnID)
 
-	txn.State = TxnStateAborted        // Transition state to ABORTED
-	bt.releaseAllLocksForTxn(txnID)    // Release all locks held by this transaction
-	delete(bt.transactionTable, txnID) // Remove from in-memory table
+	txn.State = TxnStateAborted     // Transition state to ABORTED
+	bt.releaseAllLocksForTxn(txnID) // Release all locks held by this transaction
+	bt.transactionTable.Delete(txnID)
+	// delete(bt.transactionTable, txnID) // Remove from in-memory table
 
 	log.Printf("INFO: Txn %d: ABORTED. Locks released.", txnID)
 	return nil
@@ -1793,35 +1798,33 @@ func (bt *BTree[K, V]) acquireLock(key K, txnID uint64) error {
 func (bt *BTree[K, V]) acquireLockInternal(keyStr string, txnID uint64) error {
 	// bt.keyLocksMu.Lock()
 	// defer bt.keyLocksMu.Unlock()
-
-	for {
-		bt.keyLocksMu.Lock()
-		log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, bt.keyLocks[keyStr])
-		if ownerTxnID, ok := bt.keyLocks[keyStr]; ok {
-			if ownerTxnID == txnID {
-				// Already locked by this transaction, idempotent.
-				bt.keyLocksMu.Unlock()
-				return nil
-			}
-			// Locked by another transaction, wait.
-			log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, ownerTxnID)
-			// For V1, simple blocking wait. In production, use condition variables or timeout.
-			// This is a busy-wait loop, which is inefficient.
-			// A production system would use a condition variable or a lock manager with queues.
-			// For now, we'll just return ErrKeyLocked to avoid indefinite blocking in a simple test.
-			// If this is called from Prepare, the Prepare will fail.
-			bt.keyLocksMu.Unlock()
-			return ErrKeyLocked
-		} else {
-			// Lock available, acquire it.
-			bt.keyLocks[keyStr] = txnID
-			if txn, ok := bt.transactionTable[txnID]; ok {
-				txn.locksHeld[keyStr] = struct{}{}
-			}
-			log.Printf("DEBUG: Txn %d: Acquired lock for key '%s'.", txnID, keyStr)
-			bt.keyLocksMu.Unlock()
+	// bt.keyLocksMu.Lock()
+	// log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, bt.keyLocks[keyStr])
+	if ownerTxnID, ok := bt.keyLocks.Load(keyStr); ok {
+		if ownerTxnID == txnID {
+			// Already locked by this transaction, idempotent.
+			// bt.keyLocksMu.Unlock()
 			return nil
 		}
+		// Locked by another transaction, wait.
+		log.Printf("DEBUG: Txn %d: Key '%s' is locked by Txn %d. Waiting...", txnID, keyStr, ownerTxnID)
+		// For V1, simple blocking wait. In production, use condition variables or timeout.
+		// This is a busy-wait loop, which is inefficient.
+		// A production system would use a condition variable or a lock manager with queues.
+		// For now, we'll just return ErrKeyLocked to avoid indefinite blocking in a simple test.
+		// If this is called from Prepare, the Prepare will fail.
+		// bt.keyLocksMu.Unlock()
+		return ErrKeyLocked
+	} else {
+		// Lock available, acquire it.
+		bt.keyLocks.Store(keyStr, txnID)
+		if t, ok := bt.transactionTable.Load(txnID); ok {
+			txn := t.(*Transaction)
+			txn.locksHeld.Store(keyStr, struct{}{})
+		}
+		log.Printf("DEBUG: Txn %d: Acquired lock for key '%s'.", txnID, keyStr)
+		// bt.keyLocksMu.Unlock()
+		return nil
 	}
 }
 
@@ -1833,14 +1836,14 @@ func (bt *BTree[K, V]) releaseLock(key K, txnID uint64) {
 
 // releaseLockInternal is the internal, string-key based lock release.
 func (bt *BTree[K, V]) releaseLockInternal(keyStr string, txnID uint64) {
-	bt.keyLocksMu.Lock()
-	defer bt.keyLocksMu.Unlock()
-
-	if ownerTxnID, ok := bt.keyLocks[keyStr]; ok {
+	// bt.keyLocksMu.Lock()
+	// defer bt.keyLocksMu.Unlock()
+	if ownerTxnID, ok := bt.keyLocks.Load(keyStr); ok {
 		if ownerTxnID == txnID {
-			delete(bt.keyLocks, keyStr)
-			if txn, ok := bt.transactionTable[txnID]; ok {
-				delete(txn.locksHeld, keyStr)
+			bt.keyLocks.Delete(keyStr)
+			if t, ok := bt.transactionTable.Load(txnID); ok {
+				txn := t.(*Transaction)
+				txn.locksHeld.Delete(keyStr)
 			}
 			log.Printf("DEBUG: Txn %d: Released lock for key '%s'.", txnID, keyStr)
 		} else {
@@ -1854,25 +1857,28 @@ func (bt *BTree[K, V]) releaseLockInternal(keyStr string, txnID uint64) {
 // releaseAllLocksForTxn releases all locks held by a given transaction.
 func (bt *BTree[K, V]) releaseAllLocksForTxn(txnID uint64) {
 	log.Println("DEBUG: Release all locks for txn unlock")
-	bt.transactionTableLockMu.Lock()
-	defer bt.transactionTableLockMu.Unlock()
+	// bt.transactionTableLockMu.Lock()
+	// defer bt.transactionTableLockMu.Unlock()
 	log.Println("DEBUG: Release all locks for txn lock")
 
-	txn, ok := bt.transactionTable[txnID]
+	t, ok := bt.transactionTable.Load(txnID)
 	if !ok {
 		log.Printf("WARNING: Attempted to release locks for non-existent Txn %d.", txnID)
 		return
 	}
+	txn := t.(*Transaction)
 
-	for keyStr := range txn.locksHeld {
-		if ownerTxnID, held := bt.keyLocks[keyStr]; held && ownerTxnID == txnID {
-			delete(bt.keyLocks, keyStr)
-			log.Printf("DEBUG: Txn %d: Released lock for key '%s' during bulk release.", txnID, keyStr)
+	txn.locksHeld.Range(func(key, val any) bool {
+		if ownerTxnID, held := bt.keyLocks.Load(key); held && ownerTxnID == txnID {
+			bt.keyLocks.Delete(key)
+			log.Printf("DEBUG: Txn %d: Released lock for key '%s' during bulk release.", txnID, key)
 		} else {
-			log.Printf("WARNING: Txn %d: Expected to hold lock for key '%s' but it was not held or owned by another txn %d.", txnID, keyStr, ownerTxnID)
+			log.Printf("WARNING: Txn %d: Expected to hold lock for key '%s' but it was not held or owned by another txn %d.", txnID, key, ownerTxnID)
 		}
-	}
-	txn.locksHeld = make(map[string]struct{}) // Clear the transaction's record of held locks
+		return true
+	})
+
+	txn.locksHeld = sync.Map{} // Clear the transaction's record of held locks
 }
 
 // Close flushes all dirty pages and closes the database file.

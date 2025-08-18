@@ -17,6 +17,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/sushant-115/gojodb/api/proto" // Assuming your proto package is named 'proto'
@@ -41,7 +42,7 @@ type GatewayService struct {
 	mu                                   sync.RWMutex
 	slotAssignments                      map[uint32]*fsm.SlotAssignment
 	storageNodeAddresses                 map[string]string // nodeId -> gRPC address (e.g., "node1" -> "localhost:50052")
-	nodeConns                            *sync.Pool        // Pool of gRPC client connections to storage nodes
+	nodeConns                            sync.Map          // Mao to store Pool of gRPC client connections to storage nodes
 	quit                                 chan struct{}
 	httpClient                           *http.Client // HTTP client for controller API calls
 }
@@ -57,13 +58,13 @@ func NewGatewayService(controllerAddr string) *GatewayService {
 	}
 
 	// Initialize gRPC connection pool for storage nodes
-	gs.nodeConns = &sync.Pool{
-		New: func() interface{} {
-			// This function will be called when a new connection is needed in the pool.
-			// The actual connection will be established dynamically when needed in getStorageNodeClient.
-			return nil // Return nil, connection will be established on demand
-		},
-	}
+	// gs.nodeConns = &sync.Pool{
+	// 	New: func() interface{} {
+	// 		// This function will be called when a new connection is needed in the pool.
+	// 		// The actual connection will be established dynamically when needed in getStorageNodeClient.
+	// 		return nil // Return nil, connection will be established on demand
+	// 	},
+	// }
 
 	// Start goroutine to monitor the controller cluster for shard map updates
 	go gs.monitorControllerCluster()
@@ -165,31 +166,44 @@ func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn,
 	if !ok || addr == "" {
 		return nil, fmt.Errorf("address for storage node %s not found", nodeID)
 	}
-	// TO DO
-	// The sync.Pool stores grpc.ClientConn directly
-	// if conn, ok := gs.nodeConns.Get().(*grpc.ClientConn); ok && conn != nil && conn.GetState() != (connectivity.TransientFailure) && conn.GetState() != (connectivity.Shutdown) {
-	// 	// Verify if the connection is still valid and for the correct address
-	// 	// This is a simple check, a more robust solution might involve connection wrappers
-	// 	// For simplicity, we just return it. If it's broken, the subsequent RPC will fail.
+	var pool *sync.Pool
+	connPool, ok := gs.nodeConns.Load(nodeID)
+	if ok {
+		pool = connPool.(*sync.Pool)
+		if conn, ok := pool.Get().(*grpc.ClientConn); ok && conn != nil && conn.GetState() != (connectivity.TransientFailure) && conn.GetState() != (connectivity.Shutdown) {
+			log.Println("Picked connection from the pool", nodeID)
+			return conn, nil
+		}
 
-	// 	log.Println("Picked connection from pool: ", nodeID, addr, conn.Target())
-	// 	return conn, nil
-	// }
+	} else {
+		pool = &sync.Pool{
+			New: func() interface{} {
+				// This function will be called when a new connection is needed in the pool.
+				// The actual connection will be established dynamically when needed in getStorageNodeClient.
+				return nil // Return nil, connection will be established on demand
+			},
+		}
+		gs.nodeConns.Store(nodeID, pool)
+	}
 
 	// No valid connection in pool, create a new one
 	log.Printf("Establishing new gRPC connection to storage node %s at %s", nodeID, addr)
 	conn, err := grpc.NewClient(addr, grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
 	if err != nil {
-		gs.nodeConns.Put(nil) // Put nil back to signal it's unusable
+		pool.Put(nil) // Put nil back to signal it's unusable
 		return nil, fmt.Errorf("failed to dial storage node %s at %s: %v", nodeID, addr, err)
 	}
 	return conn, nil
 }
 
 // returnStorageNodeClient returns a gRPC client connection to the pool.
-func (gs *GatewayService) returnStorageNodeClient(conn *grpc.ClientConn) {
-	if conn != nil {
-		gs.nodeConns.Put(conn)
+func (gs *GatewayService) returnStorageNodeClient(nodeID string, conn *grpc.ClientConn) {
+	connPool, ok := gs.nodeConns.Load(nodeID)
+	if conn != nil && ok {
+		pool, ok := connPool.(*sync.Pool)
+		if ok {
+			pool.Put(conn)
+		}
 	}
 }
 
@@ -250,7 +264,7 @@ func (gs *GatewayService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutR
 		log.Printf("Error getting client for node %s: %v", nodeID, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Unavailable, "failed to get storage client: %v", err)
 	}
-	defer gs.returnStorageNodeClient(conn)
+	defer gs.returnStorageNodeClient(nodeID, conn)
 
 	client := pb.NewIndexedWriteServiceClient(conn)
 	putResp, err := client.Put(ctx, req)
@@ -275,7 +289,7 @@ func (gs *GatewayService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetR
 		log.Printf("Error getting client for node %s: %v", nodeID, err)
 		return &pb.GetResponse{Found: false, Value: nil}, status.Errorf(codes.Unavailable, "failed to get storage client: %v", err)
 	}
-	defer gs.returnStorageNodeClient(conn)
+	defer gs.returnStorageNodeClient(nodeID, conn)
 
 	client := pb.NewIndexedReadServiceClient(conn)
 	getResp, err := client.Get(ctx, req)
@@ -300,7 +314,7 @@ func (gs *GatewayService) Delete(ctx context.Context, req *pb.DeleteRequest) (*p
 		log.Printf("Error getting client for node %s: %v", nodeID, err)
 		return &pb.DeleteResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Unavailable, "failed to get storage client: %v", err)
 	}
-	defer gs.returnStorageNodeClient(conn)
+	defer gs.returnStorageNodeClient(nodeID, conn)
 
 	client := pb.NewIndexedWriteServiceClient(conn)
 	deleteResp, err := client.Delete(ctx, req)
@@ -327,7 +341,7 @@ func (gs *GatewayService) GetRange(ctx context.Context, req *pb.GetRangeRequest)
 		log.Printf("Error getting client for node %s: %v", nodeID, err)
 		return &pb.GetRangeResponse{}, status.Errorf(codes.Unavailable, "failed to get storage client: %v", err)
 	}
-	defer gs.returnStorageNodeClient(conn)
+	defer gs.returnStorageNodeClient(nodeID, conn)
 
 	client := pb.NewIndexedReadServiceClient(conn)
 	getRangeResp, err := client.GetRange(ctx, req)
@@ -356,7 +370,7 @@ func (gs *GatewayService) TextSearch(ctx context.Context, req *pb.TextSearchRequ
 		log.Printf("Error getting client for node %s: %v", nodeID, err)
 		return &pb.TextSearchResponse{}, status.Errorf(codes.Unavailable, "failed to get storage client: %v", err)
 	}
-	defer gs.returnStorageNodeClient(conn)
+	defer gs.returnStorageNodeClient(nodeID, conn)
 
 	client := pb.NewIndexedReadServiceClient(conn)
 	textSearchResp, err := client.TextSearch(ctx, req)
@@ -393,7 +407,7 @@ func (gs *GatewayService) BulkPut(ctx context.Context, req *pb.BulkPutRequest) (
 				errCh <- fmt.Errorf("failed to get client for node %s: %v", node, err)
 				return
 			}
-			defer gs.returnStorageNodeClient(conn)
+			defer gs.returnStorageNodeClient(nodeID, conn)
 
 			client := pb.NewIndexedWriteServiceClient(conn)
 			bulkReq := &pb.BulkPutRequest{Entries: entries}
@@ -445,7 +459,7 @@ func (gs *GatewayService) BulkDelete(ctx context.Context, req *pb.BulkDeleteRequ
 				errCh <- fmt.Errorf("failed to get client for node %s: %v", node, err)
 				return
 			}
-			defer gs.returnStorageNodeClient(conn)
+			defer gs.returnStorageNodeClient(nodeID, conn)
 
 			client := pb.NewIndexedWriteServiceClient(conn)
 			bulkReq := &pb.BulkDeleteRequest{Keys: keys}
