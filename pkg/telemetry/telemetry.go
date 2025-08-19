@@ -10,6 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -17,9 +18,12 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	// THE FIX: Updated to a newer, compatible semantic conventions version.
 	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
 	"go.opentelemetry.io/otel/trace"
 	nooptrace "go.opentelemetry.io/otel/trace/noop"
+	"google.golang.org/grpc"
 )
 
 // Config holds all the configuration for the telemetry system.
@@ -33,6 +37,9 @@ type Config struct {
 	// TraceSampleRatio is the fraction of traces to sample (e.g., 0.01 for 1%).
 	// Defaults to 1.0 (always sample) if not set or invalid.
 	TraceSampleRatio float64 `yaml:"trace_sample_ratio"`
+	// OtlpEndpoint is the gRPC endpoint of the OpenTelemetry collector (e.g., "localhost:4317").
+	// If empty, tracing will be initialized but no spans will be exported.
+	OtlpEndpoint string `yaml:"otlp_endpoint"`
 }
 
 // Telemetry represents the active telemetry components.
@@ -47,8 +54,7 @@ type Telemetry struct {
 type ShutdownFunc func(ctx context.Context) error
 
 // New initializes the OpenTelemetry SDK for metrics and tracing.
-// It sets up a Prometheus exporter for metrics. It returns a Telemetry struct
-// containing the active components and a shutdown function.
+// It sets up a Prometheus exporter for metrics and an OTLP exporter for traces.
 func New(config Config) (*Telemetry, ShutdownFunc, error) {
 	if !config.Enabled {
 		// If telemetry is disabled, return no-op providers.
@@ -73,14 +79,14 @@ func New(config Config) (*Telemetry, ShutdownFunc, error) {
 	}
 
 	// --- Metrics Setup (Prometheus) ---
-	exporter, err := prometheus.New()
+	prometheusExporter, err := prometheus.New()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create prometheus exporter: %w", err)
 	}
 
 	meterProvider := sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(exporter),
+		sdkmetric.WithReader(prometheusExporter),
 	)
 
 	// Expose the Prometheus metrics endpoint.
@@ -93,16 +99,32 @@ func New(config Config) (*Telemetry, ShutdownFunc, error) {
 	}()
 
 	// --- Tracing Setup ---
-	// Set a default sampling ratio if not provided or invalid.
 	sampleRatio := config.TraceSampleRatio
 	if sampleRatio <= 0 || sampleRatio > 1 {
 		sampleRatio = 1.0 // Default to always sampling
 	}
 
+	// Create the OTLP trace exporter if an endpoint is configured.
+	var traceExporter sdktrace.SpanExporter
+	if config.OtlpEndpoint != "" {
+		ctx := context.Background()
+		traceExporter, err = otlptracegrpc.New(ctx,
+			otlptracegrpc.WithInsecure(), // Use WithTLSCredentials in production
+			otlptracegrpc.WithEndpoint(config.OtlpEndpoint),
+			otlptracegrpc.WithDialOption(grpc.WithBlock()),
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
+		}
+	}
+
+	// Create the TracerProvider with the configured sampler and exporter.
 	tracerProvider := sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
-		// Use the ratio-based sampler for production use.
 		sdktrace.WithSampler(sdktrace.TraceIDRatioBased(sampleRatio)),
+		// Use a BatchSpanProcessor for production.
+		// It batches spans before sending them to the exporter.
+		sdktrace.WithBatcher(traceExporter),
 	)
 
 	// Set the global providers.

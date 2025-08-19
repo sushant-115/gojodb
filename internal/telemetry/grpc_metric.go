@@ -9,7 +9,7 @@ import (
 type GrpcGatewayMetrics struct {
 	RpcsStartedCounter      metric.Int64Counter
 	RpcsHandledCounter      metric.Int64Counter
-	RpcLatencyHistogram     metric.Float64Histogram
+	RpcLatencyHistogram     metric.Int64Histogram
 	ActiveRpcsUpDownCounter metric.Int64UpDownCounter
 	// You could also add msgSentCounter and msgReceivedCounter for streaming RPCs
 }
@@ -34,10 +34,10 @@ func NewGrpcGatewayMetrics(meter metric.Meter) (*GrpcGatewayMetrics, error) {
 		return nil, err
 	}
 
-	rpcLatencyHistogram, err := meter.Float64Histogram(
-		"gojodb.grpc.server.duration_seconds",
+	rpcLatencyHistogram, err := meter.Int64Histogram(
+		"gojodb.grpc.server.duration",
 		metric.WithDescription("The latency of RPCs."),
-		metric.WithUnit("us"),
+		metric.WithUnit("ms"),
 	)
 	if err != nil {
 		return nil, err

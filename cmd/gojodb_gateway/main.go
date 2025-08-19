@@ -47,6 +47,7 @@ const (
 
 var (
 	controllerAddr = flag.String("controller_addr", "127.0.0.1:8080", "Controller address for joining Raft cluster and fetching shard map")
+	oltpEndpoint   = flag.String("oltp_endpoint", "127.0.0.1:4317", "OLTP collector endpoint to send traces")
 )
 
 // GatewayService implements the gRPC GatewayService.
@@ -809,7 +810,7 @@ func (s *GatewayService) StartMetricsAndTrace(ctx context.Context, fullMethodNam
 
 // EndMetricsAndTrace completes the telemetry recording for a gRPC method.
 func (s *GatewayService) EndMetricsAndTrace(ctx context.Context, span trace.Span, startTime time.Time, fullMethodName string, statusCode otelcodes.Code) {
-	latency := time.Since(startTime).Seconds()
+	latency := time.Since(startTime).Milliseconds()
 
 	// Set span status based on the final gRPC code
 	if statusCode != otelcodes.Ok {
@@ -845,10 +846,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
+	log.Println("OLTP endpoint: ", *oltpEndpoint)
 	tel, shutdown, err := telemetry.New(telemetry.Config{
 		Enabled:        true,
 		ServiceName:    "gojodb_gateway",
 		PrometheusPort: 9112,
+		OtlpEndpoint:   *oltpEndpoint,
 	})
 	if err != nil {
 		log.Fatal("Couldn't create telemetry. Error: ", err)
