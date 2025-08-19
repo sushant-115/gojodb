@@ -15,6 +15,7 @@ import (
 	"github.com/sushant-115/gojodb/core/write_engine/memtable"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"go.uber.org/zap"
 )
 
 // --- Configuration & Constants ---
@@ -119,6 +120,7 @@ type BTree[K any, V any] struct {
 	bpm          *memtable.BufferPoolManager
 	diskManager  *flushmanager.DiskManager
 	logManager   *wal.LogManager // Placeholder for *LogManager
+	logger       *zap.Logger
 
 	// --- NEW: 2PC Participant State ---
 	transactionTable       sync.Map // TxnID -> Transaction (in-memory state of active txns)
@@ -129,7 +131,7 @@ type BTree[K any, V any] struct {
 }
 
 // NewBTreeFile creates a new database file and initializes a new B-tree within it.
-func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, logManager *wal.LogManager) (*BTree[K, V], error) {
+func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
 	if degree < 2 {
 		return nil, fmt.Errorf("%w: got %d", ErrInvalidDegree, degree)
 	}
@@ -161,7 +163,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		return nil, fmt.Errorf("failed to open/create database file: %w", err)
 	}
 
-	bpm := memtable.NewBufferPoolManager(poolSize, dm, logManager)
+	bpm := memtable.NewBufferPoolManager(poolSize, dm, logManager, logger)
 
 	bt := &BTree[K, V]{
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
@@ -216,13 +218,13 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		_ = os.Remove(filePath)
 		return nil, fmt.Errorf("failed to update header with root page ID: %w", err)
 	}
-
+	bt.logger.Info("New B-tree database created at", zap.String("path", filePath))
 	// log.Printf("INFO: New B-tree database created at %s with root pagemanager.PageID %d, Degree %d", filePath, rootPageIDForNew, degree)
 	return bt, nil
 }
 
 // OpenBTreeFile opens an existing database file and initializes the B-tree from its header.
-func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, logManager *wal.LogManager) (*BTree[K, V], error) {
+func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
 	if keyOrder == nil {
 		return nil, ErrNilKeyOrder
 	}
@@ -244,11 +246,12 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 
 	// Ensure the DiskManager's page size matches the file's page size
 	if dm.GetPageSize() != int(header.PageSize) {
-		// log.Printf("WARNING: DiskManager initialized with page size %d, but file header specifies %d. Adjusting DiskManager's pageSize.", dm.GetPageSize(), header.PageSize)
+
+		log.Printf("WARNING: DiskManager initialized with page size %d, but file header specifies %d. Adjusting DiskManager's pageSize.", dm.GetPageSize(), header.PageSize)
 		dm.SetPageSize(int(header.PageSize)) // Adjust DM's page size to match the file's
 	}
 
-	bpm := memtable.NewBufferPoolManager(poolSize, dm, logManager)
+	bpm := memtable.NewBufferPoolManager(poolSize, dm, logManager, logger)
 
 	bt := &BTree[K, V]{
 		rootPageID:   header.RootPageID,
@@ -258,6 +261,7 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 		bpm:          bpm,
 		diskManager:  dm,
 		logManager:   logManager,
+		logger:       logger,
 		// --- NEW: Initialize 2PC Participant State ---
 		// transactionTable: make(map[uint64]*Transaction),
 		// keyLocks:         make(map[string]uint64),
@@ -270,7 +274,7 @@ func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerialize
 	// 2. Redo Pass (replay WAL records for committed changes not on disk, ensuring pageLSN consistency)
 	// 3. Undo Pass (rollback uncommitted transactions if any)
 	if logManager != nil {
-		log.Println("INFO: Starting database recovery process...")
+		bt.logger.Info("INFO: Starting database recovery process...")
 		// Pass the BTree instance to recovery so it can interact with its locking and transaction table
 		// if err := logManager.Recover(dm, wal.LSN(header.LastLSN)); err != nil {
 		// 	dm.Close()

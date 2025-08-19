@@ -106,7 +106,7 @@ func NewInvertedIndex(filePath, logDir, archiveDir string, logger *zap.Logger) (
 
 	// 3. Initialize BufferPoolManager for the inverted index data file
 	// THIS MUST BE DONE BEFORE ANY OPERATIONS THAT USE BPM (like readHeader)
-	idx.bpm = memtable.NewBufferPoolManager(invertedIndexBufferPoolSize, idx.dm, idx.lm)
+	idx.bpm = memtable.NewBufferPoolManager(invertedIndexBufferPoolSize, idx.dm, idx.lm, logger)
 
 	// 4. Open or create the inverted index data file and read/write header
 	// Attempt to open the file first. If it doesn't exist, create it.

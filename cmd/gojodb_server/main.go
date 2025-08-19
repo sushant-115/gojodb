@@ -33,6 +33,7 @@ import (
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 	"github.com/sushant-115/gojodb/core/storage_engine/tiered_storage"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"github.com/sushant-115/gojodb/pkg/logger"
 
 	// GojoDB API services
 	// basic_api "github.com/sushant-115/gojodb/api/basic"
@@ -44,7 +45,6 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	// Protobufs (ensure these paths are correct for your project structure)
 	// Assuming a common proto package
@@ -106,10 +106,8 @@ func main() {
 	host := strings.Split(*grpcAddr, ":")[0]
 	myStorageNodeAddr = fmt.Sprintf("%s:%s", host, *replicationAddr)
 
-	var err error
 	// Initialize logger
-
-	zlogger = NewErrorLevelLogger() // Or zap.NewProduction() for structured logging
+	zlogger, err := logger.New(logger.Config{})
 	if err != nil {
 		log.Fatalf("CRITICAL: Can't initialize zap logger: %v", err)
 	}
@@ -162,25 +160,6 @@ func main() {
 
 	globalWG.Wait() // Wait for all essential goroutines to finish
 	zlogger.Info("GojoDB storage node shut down gracefully.")
-}
-
-func NewErrorLevelLogger() *zap.Logger {
-	// Set log level to ERROR
-	level := zap.NewAtomicLevelAt(zapcore.ErrorLevel)
-
-	// Configure encoder (console or JSON)
-	encoderCfg := zap.NewProductionEncoderConfig()
-	encoderCfg.TimeKey = "timestamp"
-	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
-
-	// Create core with stderr output and error level
-	core := zapcore.NewCore(
-		zapcore.NewConsoleEncoder(encoderCfg), // or zapcore.NewJSONEncoder
-		zapcore.Lock(zapcore.AddSync(os.Stderr)),
-		level,
-	)
-
-	return zap.New(core, zap.AddCaller())
 }
 
 func initStorageNode(logger *zap.Logger) error {
@@ -959,18 +938,18 @@ func addMuxHandler(mux *http.ServeMux) error {
 			return
 		}
 
-		log.Printf("received join request for node %s at %s", req.NodeID, req.RaftAddr)
+		zlogger.Debug("received join request for node", zap.String("nodeID", req.NodeID), zap.String("raftAddr", req.RaftAddr))
 
 		// Check if the node is already a part of the cluster
 		configFuture := raftNode.GetConfiguration()
 		if err := configFuture.Error(); err != nil {
-			log.Printf("failed to get raft configuration: %v", err)
+			zlogger.Error("failed to get raft configuration", zap.Error(err))
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 		for _, srv := range configFuture.Configuration().Servers {
 			if srv.ID == raft.ServerID(req.NodeID) {
-				log.Printf("node %s already a member of the cluster, ignoring join request", req.NodeID)
+				zlogger.Info("node already a member of the cluster, ignoring join request", zap.String("nodeID", req.NodeID))
 				w.WriteHeader(http.StatusOK)
 				return
 			}
@@ -979,12 +958,12 @@ func addMuxHandler(mux *http.ServeMux) error {
 		// Add the new node as a voter to the Raft cluster
 		addVoterFuture := raftNode.AddVoter(raft.ServerID(req.NodeID), raft.ServerAddress(req.RaftAddr), 0, 0)
 		if err := addVoterFuture.Error(); err != nil {
-			log.Printf("failed to add voter: %v", err)
+			zlogger.Error("failed to add voter", zap.Error(err))
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 
-		log.Printf("node %s at %s joined successfully", req.NodeID, req.RaftAddr)
+		zlogger.Info("node joined successfully", zap.String("nodeID", req.NodeID), zap.String("raftAddr", req.RaftAddr))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})
@@ -1020,8 +999,5 @@ func addMuxHandler(mux *http.ServeMux) error {
 			json.NewEncoder(w).Encode(shardmap)
 		}
 	})
-
-	// Generic Raft command handler
-	//mux.HandleFunc("/raft/command", handleRaftCommand)
 	return nil
 }
