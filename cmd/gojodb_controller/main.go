@@ -93,7 +93,7 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	address := r.URL.Query().Get("address") // gRPC address of the storage node
 	replicationAddr := r.URL.Query().Get("replication_addr")
 	grpcAddr := r.URL.Query().Get("grpc_addr")
-	log.Print("Received heartbeat: ", nodeID, address)
+	// ("Received heartbeat: ", nodeID, address)
 	if nodeID == "" || address == "" {
 		http.Error(w, "nodeId and address are required", http.StatusBadRequest)
 		return

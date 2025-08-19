@@ -167,7 +167,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 
 	bt := &BTree[K, V]{
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
-		kvSerializer: kvSerializer, bpm: bpm, diskManager: dm, logManager: logManager,
+		kvSerializer: kvSerializer, bpm: bpm, diskManager: dm, logManager: logManager, logger: logger,
 		// --- NEW: Initialize 2PC Participant State ---
 		// transactionTable: make(map[uint64]*Transaction),
 		// keyLocks:         make(map[string]uint64),
@@ -1620,11 +1620,9 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 	bt.transactionTable.Store(txnID, txn)
 
 	// log.Printf("INFO: Txn %d: Received PREPARE request. Attempting to acquire locks.", txnID)
-	log.Println("DEBUG Operations: ", operations)
 	// Acquire locks for all keys involved in the transaction on this shard
 	for _, op := range operations {
 		// keyStr := fmt.Sprintf("%v", op.Key) // Convert K to string for map key
-		log.Println("KeyStr: ", op.Key, txnID)
 		if err := bt.acquireLockInternal(op.Key, txnID); err != nil {
 			// If lock acquisition fails, abort the transaction on this participant.
 			// log.Printf("ERROR: Txn %d: Failed to acquire lock for key %v during PREPARE: %v. Aborting locally.", txnID, op.Key, err)
@@ -1639,7 +1637,6 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 
 	err := bt.ProcessOperations(txnID, operations)
 	if err != nil {
-		log.Println("PROCESS OPERATION ERROR: ", err)
 		return fmt.Errorf("%w: failed to process transaction %v", ErrPrepareFailed, operations)
 
 	}

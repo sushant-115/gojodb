@@ -107,16 +107,12 @@ func main() {
 	myStorageNodeAddr = fmt.Sprintf("%s:%s", host, *replicationAddr)
 
 	// Initialize logger
-	zlogger, err := logger.New(logger.Config{})
+	var err error
+	zlogger, err = logger.New(logger.Config{})
 	if err != nil {
-		log.Fatalf("CRITICAL: Can't initialize zap logger: %v", err)
+		log.Fatalf("CRITICAL: Could't initialize zap logger: %v", err)
 	}
-	defer func() {
-		// if err := zlogger.Sync(); err != nil && !strings.Contains(err.Error(), "inappropriate ioctl for device") {
-		// 	log.Printf("Failed to sync logger: %v", err)
-		// }
-	}() // flushes buffer, if any
-
+	zap.RedirectStdLog(zlogger)
 	zlogger.Info("Starting GojoDB storage node",
 		zap.String("nodeID", myStorageNodeID),
 		zap.String("raftAddr", *raftAddr),
@@ -129,7 +125,7 @@ func main() {
 	)
 
 	// Initialize database components
-	if err := initStorageNode(zlogger); err != nil {
+	if err := initStorageNode(); err != nil {
 		zlogger.Fatal("CRITICAL: Failed to initialize storage node", zap.Error(err))
 	}
 
@@ -162,7 +158,7 @@ func main() {
 	zlogger.Info("GojoDB storage node shut down gracefully.")
 }
 
-func initStorageNode(logger *zap.Logger) error {
+func initStorageNode() error {
 	zlogger.Info("Initializing storage components...")
 	var err error
 
@@ -180,7 +176,7 @@ func initStorageNode(logger *zap.Logger) error {
 	if err := os.MkdirAll(walPath, 0750); err != nil {
 		return fmt.Errorf("failed to create WAL directory %s: %w", walPath, err)
 	}
-	logManager, err = wal.NewLogManager(walPath, logger, indexing.BTreeIndexType)
+	logManager, err = wal.NewLogManager(walPath, zlogger, indexing.BTreeIndexType)
 	if err != nil {
 		return fmt.Errorf("failed to create main log manager: %w", err)
 	}
@@ -200,6 +196,7 @@ func initStorageNode(logger *zap.Logger) error {
 		10000,
 		4096,
 		logManager,
+		zlogger.Named("btree_index"),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create B-tree instance: %w", err)
@@ -225,7 +222,7 @@ func initStorageNode(logger *zap.Logger) error {
 	// For replication, it should ideally manage its own WAL file stream or use distinct log types in a shared WAL.
 	// Assuming it uses the main logManager for now for its WAL records relevant to replication.
 	// If it has its OWN WAL that needs replicating, its GetLogManager() should return that.
-	invertedIndexInstance, err = inverted_index.NewInvertedIndex(invertedIndexDBPath, invertedIndexLogPath, invertedIndexArchiveLogPath, logger.Named("inverted_index")) // Pass main logManager
+	invertedIndexInstance, err = inverted_index.NewInvertedIndex(invertedIndexDBPath, invertedIndexLogPath, invertedIndexArchiveLogPath, zlogger.Named("inverted_index")) // Pass main logManager
 	if err != nil {
 		return fmt.Errorf("failed to create inverted index instance: %w", err)
 	}
@@ -243,11 +240,11 @@ func initStorageNode(logger *zap.Logger) error {
 	if err := os.MkdirAll(spatialLogManagerPath, 0750); err != nil {
 		return fmt.Errorf("failed to create spatial WAL directory %s: %w", spatialLogManagerPath, err)
 	}
-	spatialLm, err := wal.NewLogManager(spatialLogManagerPath, logger, indexing.SpatialIndexType) // Spatial index gets its own WAL
+	spatialLm, err := wal.NewLogManager(spatialLogManagerPath, zlogger, indexing.SpatialIndexType) // Spatial index gets its own WAL
 	if err != nil {
 		return fmt.Errorf("failed to create spatial log manager: %w", err)
 	}
-	spatialIdx, err = spatial.NewSpatialIndexManager(spatialLogManagerPath, spatialIndexDBPath, 10, 4096, logger.Named("spatial_index")) // Pass path and its own LM
+	spatialIdx, err = spatial.NewSpatialIndexManager(spatialLogManagerPath, spatialIndexDBPath, 10, 4096, zlogger.Named("spatial_index")) // Pass path and its own LM
 	if err != nil {
 		return fmt.Errorf("failed to create spatial index instance: %w", err)
 	}
@@ -331,7 +328,7 @@ func initAndStartRaft() error {
 	zlogger.Info("Initializing Raft...")
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(myStorageNodeID) // Use myStorageNodeID directly
-	config.Logger = hclog.Default()
+	config.Logger = fsm.NewZapRaftLogger(zlogger)
 	// Adjust Raft timings if needed, defaults are generally okay for testing
 	// config.HeartbeatTimeout = 1000 * time.Millisecond
 	// config.ElectionTimeout = 1000 * time.Millisecond
