@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
-	"log"
 
 	// "encoding/gob" // No longer needed for WALStreamReader
 	"encoding/json"
@@ -1042,7 +1041,6 @@ func (lm *LogManager) Close() error {
 		return closeErr
 	}
 	close(lm.shutdown)
-	log.Println("Waiting here")
 	lm.wg.Wait()
 	return nil
 }

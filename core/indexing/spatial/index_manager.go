@@ -133,7 +133,7 @@ func NewSpatialIndexManager(uniqueSpatialIndexLogDir, uniqueSpatialIndexFilePath
 		}
 	}
 
-	bufferPoolManager := memtable.NewBufferPoolManager(logBufferSize, diskManager, logManager)
+	bufferPoolManager := memtable.NewBufferPoolManager(logBufferSize, diskManager, logManager, logger)
 
 	sim := &SpatialIndexManager{
 		diskManager:       diskManager,

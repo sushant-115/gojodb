@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 )
@@ -30,13 +29,6 @@ type Node[K any, V any] struct {
 	childPageIDs []pagemanager.PageID
 	tree         *BTree[K, V] // Reference to the parent BTree for BPM/DiskManager access
 }
-
-// func NewNode(pageID PageID, data []byte) *Node[any, any] {
-// 	return &Node[any, any]{
-// 		pageID: pageID,
-// 		isLeaf: false,
-// 	}
-// }
 
 func (n *Node[K, V]) GetPageID() pagemanager.PageID {
 	return n.pageID
@@ -130,28 +122,10 @@ func (n *Node[K, V]) serialize(page *pagemanager.Page, keySerializer func(K) ([]
 	checksum := crc32.ChecksumIEEE(pageData[:pageSize-checksumSize])
 	binary.LittleEndian.PutUint32(pageData[pageSize-checksumSize:], checksum)
 
-	// Logging for debugging serialization (can be extensive)
-	log.Printf("SER: PageID %d, numKeys %d, isLeaf %v, serializedLen: %d, calculatedChecksum: 0x%x",
-		n.pageID, len(n.keys), n.isLeaf, len(serializedData), checksum)
-	// log.Printf("SER: Page %d data (first 64 bytes): %x", n.pageID, page.GetData()[:64])
-	// log.Printf("SER: Page %d data (last %d bytes, includes checksum): %x", n.pageID, checksumSize+32, page.GetData()[pageSize-checksumSize-32:])
-
 	// Mark the page as dirty, so it will be flushed to disk by the BufferPoolManager
 	page.SetDirty(true)
 	return nil
 }
-
-// func (n *Node[K, V]) Deserialize(page *Page, keyDeserializer func([]byte) (K, error), valueDeserializer func([]byte) (V, error)) error {
-// 	return n.deserialize(page, keyDeserializer, valueDeserializer)
-// }
-
-// func (n *Node[K, V]) Keys() []K {
-// 	return n.keys
-// }
-
-// func (n *Node[K, V]) Values() []V {
-// 	return n.values
-// }
 
 // deserialize reads node data from the provided Page's data buffer and reconstructs the Node.
 // It also verifies the checksum.
@@ -173,14 +147,7 @@ func (n *Node[K, V]) deserialize(page *pagemanager.Page, keyDeserializer func([]
 	// Calculate checksum from the rest of the page data
 	calculatedChecksum := crc32.ChecksumIEEE(pageData[:pageSize-checksumSize])
 
-	log.Printf("DESER: PageID %d. Stored Checksum: 0x%x, Calculated Checksum: 0x%x",
-		page.GetPageID(), storedChecksum, calculatedChecksum)
-	// log.Printf("DESER: Page %d data (first 64 bytes for checksum): %x", page.GetPageID(), pageData[:64])
-	// log.Printf("DESER: Page %d data (last %d bytes, includes checksum): %x", page.GetPageID(), checksumSize+32, pageData[pageSize-checksumSize-32:])
-
 	if storedChecksum != calculatedChecksum {
-		log.Printf("ERROR: CHECKSUM MISMATCH DETECTED for PageID %d: Stored=0x%x, Calculated=0x%x. Raw page data (first 64 bytes for debug): %x",
-			page.GetPageID(), storedChecksum, calculatedChecksum, pageData[:64])
 		// Initialize node slices to empty to prevent using corrupt data
 		n.keys = make([]K, 0)
 		n.values = make([]V, 0)
@@ -258,6 +225,5 @@ func (n *Node[K, V]) deserialize(page *pagemanager.Page, keyDeserializer func([]
 	}
 
 	n.pageID = page.GetPageID() // Set the node's page ID from the page object
-	log.Printf("DESER: Successfully deserialized PageID %d, isLeaf: %v, numKeys: %d", n.pageID, n.isLeaf, len(n.keys))
 	return nil
 }
