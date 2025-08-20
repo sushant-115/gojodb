@@ -36,7 +36,7 @@ type BTreeIndexManager struct {
 func NewBTreeIndexManager(tree *btree.BTree[string, string], tel *telemetry.Telemetry) *BTreeIndexManager {
 	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
 	if err != nil {
-		fmt.Printf("failed to create gRPC metrics: %w", err)
+		fmt.Println("failed to create gRPC metrics:", err)
 	}
 	return &BTreeIndexManager{
 		tree:         tree,
@@ -50,8 +50,6 @@ func NewBTreeIndexManager(tree *btree.BTree[string, string], tel *telemetry.Tele
 func (m *BTreeIndexManager) Name() string { return "btree" }
 
 func (m *BTreeIndexManager) Put(ctx context.Context, key string, value []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	metricCtx, span, startTime := m.StartMetricsAndTrace(ctx, "Put")
 	var statusCode otelcodes.Code = otelcodes.Ok
 	defer func() {
@@ -68,8 +66,6 @@ func (m *BTreeIndexManager) Put(ctx context.Context, key string, value []byte) e
 }
 
 func (m *BTreeIndexManager) Get(ctx context.Context, key string) ([]byte, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	metricCtx, span, startTime := m.StartMetricsAndTrace(ctx, "Get")
 	var statusCode otelcodes.Code = otelcodes.Ok
 	defer func() {

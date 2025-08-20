@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync"
 
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 )
@@ -28,6 +29,7 @@ type Node[K any, V any] struct {
 	values       []V
 	childPageIDs []pagemanager.PageID
 	tree         *BTree[K, V] // Reference to the parent BTree for BPM/DiskManager access
+	mu           sync.Mutex
 }
 
 func (n *Node[K, V]) GetPageID() pagemanager.PageID {

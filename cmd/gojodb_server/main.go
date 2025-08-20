@@ -85,6 +85,7 @@ var (
 	replicationAddr   = flag.String("replication_addr", "127.0.0.1:6000", "Port for replication data exchange between storage nodes") // Clarified purpose
 	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes")   // Clarified purpose
 	oltpEndpoint      = flag.String("oltp_endpoint", "127.0.0.1:4317", "OLTP collector endpoint to send traces")
+	logfile           = flag.String("log_file", "/tmp/"+*nodeID, "OLTP collector endpoint to send traces")
 	myStorageNodeID   string // Set from nodeID flag
 	myStorageNodeAddr string // Address this node is reachable at by other storage nodes (e.g. for replication)
 	raftTransport     *raft.NetworkTransport
@@ -115,7 +116,7 @@ func main() {
 
 	// Initialize logger
 	var err error
-	zlogger, err = logger.New(logger.Config{})
+	zlogger, err = logger.New(logger.Config{Level: "debug"})
 	if err != nil {
 		log.Fatalf("CRITICAL: Could't initialize zap logger: %v", err)
 	}

@@ -46,6 +46,7 @@ services:
     command:
       - "/app/app"
       - "--node_id=node-1"
+      - "--log_file=/tmp/node1"
       - "--grpc_addr=gojodb-server-1:8001"
       - "--raft_addr=gojodb-server-1:7001"
       - "--http_addr=gojodb-server-1:9001"
@@ -81,6 +82,7 @@ services:
     command:
       - "/app/app"
       - "--node_id=node-2"
+      - "--log_file=/tmp/node2"
       - "--grpc_addr=gojodb-server-2:8002"
       - "--raft_addr=gojodb-server-2:7002"
       - "--http_addr=gojodb-server-2:9002"
@@ -117,6 +119,7 @@ services:
     command:
       - "/app/app"
       - "--node_id=node-3"
+      - "--log_file=/tmp/node3"
       - "--grpc_addr=gojodb-server-3:8003"
       - "--raft_addr=gojodb-server-3:7003"
       - "--http_addr=gojodb-server-3:9003"
