@@ -1,6 +1,7 @@
 package indexmanager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,6 +14,12 @@ import (
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	internaltelemetry "github.com/sushant-115/gojodb/internal/telemetry"
+	"github.com/sushant-115/gojodb/pkg/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type BTreeIndexManager struct {
@@ -21,38 +28,62 @@ type BTreeIndexManager struct {
 	latestLSN uint64 // Local LSN for this index
 	// For snapshotting (in-memory dummy for now, needs disk persistence)
 	snapshotData map[string][]byte // snapshotID -> serialized data
+	tracer       trace.Tracer
+	metrics      *internaltelemetry.GrpcGatewayMetrics
+	serviceName  string
 }
 
-func NewBTreeIndexManager(tree *btree.BTree[string, string]) *BTreeIndexManager {
+func NewBTreeIndexManager(tree *btree.BTree[string, string], tel *telemetry.Telemetry) *BTreeIndexManager {
+	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
+	if err != nil {
+		fmt.Printf("failed to create gRPC metrics: %w", err)
+	}
 	return &BTreeIndexManager{
 		tree:         tree,
 		snapshotData: make(map[string][]byte),
+		tracer:       tel.Tracer,
+		metrics:      grpcMetrics,
+		serviceName:  "btree_indexmanager",
 	}
 }
 
 func (m *BTreeIndexManager) Name() string { return "btree" }
 
-func (m *BTreeIndexManager) Put(key string, value []byte) error {
+func (m *BTreeIndexManager) Put(ctx context.Context, key string, value []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	metricCtx, span, startTime := m.StartMetricsAndTrace(ctx, "Put")
+	var statusCode otelcodes.Code = otelcodes.Ok
+	defer func() {
+		m.EndMetricsAndTrace(metricCtx, span, startTime, "Put", statusCode)
+	}()
+
 	err := m.tree.Insert(key, string(value), 0)
-	if err == nil {
-		m.latestLSN++
+	if err != nil {
+		statusCode = otelcodes.Error
+		return err
 	}
-	return err
+	m.latestLSN++
+	return nil
 }
 
-func (m *BTreeIndexManager) Get(key string) ([]byte, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (m *BTreeIndexManager) Get(ctx context.Context, key string) ([]byte, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	metricCtx, span, startTime := m.StartMetricsAndTrace(ctx, "Get")
+	var statusCode otelcodes.Code = otelcodes.Ok
+	defer func() {
+		m.EndMetricsAndTrace(metricCtx, span, startTime, "Get", statusCode)
+	}()
+
 	value, found, err := m.tree.Search(key)
 	if err != nil {
-
+		statusCode = otelcodes.Error
 	}
 	return []byte(value), found
 }
 
-func (m *BTreeIndexManager) Delete(key string) error {
+func (m *BTreeIndexManager) Delete(ctx context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	err := m.tree.Delete(key, 0)
@@ -63,7 +94,7 @@ func (m *BTreeIndexManager) Delete(key string) error {
 }
 
 // Assuming btree.BTree has a ScanRange equivalent, or implementing here.
-func (m *BTreeIndexManager) GetRange(startKey, endKey string, limit int32) ([]*pb.KeyValuePair, error) {
+func (m *BTreeIndexManager) GetRange(ctx context.Context, startKey, endKey string, limit int32) ([]*pb.KeyValuePair, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var results []*pb.KeyValuePair
@@ -102,27 +133,27 @@ func (m *BTreeIndexManager) GetRange(startKey, endKey string, limit int32) ([]*p
 }
 
 // TextSearch is not applicable for a pure B-tree.
-func (m *BTreeIndexManager) TextSearch(query, indexName string, limit int32) ([]*pb.TextSearchResult, error) {
+func (m *BTreeIndexManager) TextSearch(ctx context.Context, query, indexName string, limit int32) ([]*pb.TextSearchResult, error) {
 	return nil, fmt.Errorf("TextSearch not supported on BTreeIndexManager")
 }
 
 // AddDocument is not applicable for B-tree.
-func (m *BTreeIndexManager) AddDocument(docID string, content string) error {
+func (m *BTreeIndexManager) AddDocument(ctx context.Context, docID string, content string) error {
 	return fmt.Errorf("AddDocument not supported on BTreeIndexManager")
 }
 
 // InsertSpatial is not applicable for B-tree.
-func (m *BTreeIndexManager) InsertSpatial(rect spatial.Rect, dataID string) error {
+func (m *BTreeIndexManager) InsertSpatial(ctx context.Context, rect spatial.Rect, dataID string) error {
 	return fmt.Errorf("InsertSpatial not supported on BTreeIndexManager")
 }
 
 // DeleteSpatial is not applicable for B-tree.
-func (m *BTreeIndexManager) DeleteSpatial(dataID string) error {
+func (m *BTreeIndexManager) DeleteSpatial(ctx context.Context, dataID string) error {
 	return fmt.Errorf("DeleteSpatial not supported on BTreeIndexManager")
 }
 
 // PrepareSnapshot for BTreeIndexManager (dummy in-memory serialization).
-func (m *BTreeIndexManager) PrepareSnapshot() (string, error) {
+func (m *BTreeIndexManager) PrepareSnapshot(ctx context.Context) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	// In a real B-tree, you'd serialize its internal structure to disk.
@@ -145,7 +176,7 @@ func (m *BTreeIndexManager) PrepareSnapshot() (string, error) {
 }
 
 // StreamSnapshot for BTreeIndexManager.
-func (m *BTreeIndexManager) StreamSnapshot(snapshotID string, chunkChan chan []byte) error {
+func (m *BTreeIndexManager) StreamSnapshot(ctx context.Context, snapshotID string, chunkChan chan []byte) error {
 	defer close(chunkChan)
 	m.mu.RLock()
 	snapshotBytes, ok := m.snapshotData[snapshotID] // Get from in-memory map for dummy
@@ -174,7 +205,7 @@ func (m *BTreeIndexManager) StreamSnapshot(snapshotID string, chunkChan chan []b
 }
 
 // ApplySnapshot for BTreeIndexManager.
-func (m *BTreeIndexManager) ApplySnapshot(snapshotID string, chunkChan <-chan []byte) error {
+func (m *BTreeIndexManager) ApplySnapshot(ctx context.Context, snapshotID string, chunkChan <-chan []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -208,7 +239,7 @@ func (m *BTreeIndexManager) GetLatestLSN() uint64 {
 }
 
 // ApplyLogRecord for BTreeIndexManager.
-func (m *BTreeIndexManager) ApplyLogRecord(entry *wal.LogRecord) error {
+func (m *BTreeIndexManager) ApplyLogRecord(ctx context.Context, entry *wal.LogRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if entry.LogType != wal.LogTypeBtree {
@@ -230,4 +261,58 @@ func (m *BTreeIndexManager) ApplyLogRecord(entry *wal.LogRecord) error {
 	default:
 		return fmt.Errorf("unsupported log entry type for BTreeIndexManager: %v", entry.Type)
 	}
+}
+
+// StartMetricsAndTrace begins the telemetry recording for a gRPC method.
+// It returns a new context, the trace span, and the start time.
+func (s *BTreeIndexManager) StartMetricsAndTrace(ctx context.Context, fullMethodName string) (context.Context, trace.Span, time.Time) {
+	startTime := time.Now()
+
+	// Increment active RPCs and started counter
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+	s.metrics.RpcsStartedCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Start a new trace span
+	ctx, span := s.tracer.Start(ctx, fullMethodName, trace.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	return ctx, span, startTime
+}
+
+// EndMetricsAndTrace completes the telemetry recording for a gRPC method.
+func (s *BTreeIndexManager) EndMetricsAndTrace(ctx context.Context, span trace.Span, startTime time.Time, fullMethodName string, statusCode otelcodes.Code) {
+	latency := time.Since(startTime).Milliseconds()
+
+	// Set span status based on the final gRPC code
+	if statusCode != otelcodes.Ok {
+		span.SetStatus(otelcodes.Error, statusCode.String())
+	} else {
+		span.SetStatus(otelcodes.Ok, "Success")
+	}
+	span.End()
+
+	// Decrement active RPCs
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, -1, metric.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Define attributes for the completed RPC.
+	metricAttributes := attribute.NewSet(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+		attribute.String("grpc.code", statusCode.String()),
+	)
+
+	// Record latency and increment handled counter
+	s.metrics.RpcLatencyHistogram.Record(ctx, latency, metric.WithAttributeSet(metricAttributes))
+	s.metrics.RpcsHandledCounter.Add(ctx, 1, metric.WithAttributeSet(metricAttributes))
 }

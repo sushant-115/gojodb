@@ -331,9 +331,9 @@ func initStorageNode() error {
 	)
 	zlogger.Info("Raft FSM initialized")
 	zlogger.Info("Initializing IndexManager")
-	btreeIdxMgr := indexmanager.NewBTreeIndexManager(dbInstance)
-	spatialIdxMgr := indexmanager.NewSpatialIndexManager(spatialIdx)
-	invertedIdxMgr := indexmanager.NewInvertedIndexManager(invertedIndexInstance)
+	btreeIdxMgr := indexmanager.NewBTreeIndexManager(dbInstance, tel)
+	spatialIdxMgr := indexmanager.NewSpatialIndexManager(spatialIdx, tel)
+	invertedIdxMgr := indexmanager.NewInvertedIndexManager(invertedIndexInstance, tel)
 	indexManagers = make(map[string]indexmanager.IndexManager)
 	indexManagers["btree"] = btreeIdxMgr
 	indexManagers["spatial"] = spatialIdxMgr

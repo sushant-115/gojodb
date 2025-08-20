@@ -39,7 +39,7 @@ type IndexedWriteService struct {
 func NewIndexedWriteService(nodeID string, slotID uint32, indexManagers map[string]indexmanager.IndexManager, tel *telemetry.Telemetry) *IndexedWriteService {
 	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
 	if err != nil {
-		fmt.Printf("failed to create gRPC metrics: %w", err)
+		log.Printf("failed to create gRPC metrics: %w", err)
 	}
 	idx := &IndexedWriteService{
 		nodeID: nodeID,
@@ -73,7 +73,7 @@ func (s *IndexedWriteService) Put(ctx context.Context, req *pb.PutRequest) (*pb.
 	}
 	btreeIndex := btreeIdx.(indexmanager.IndexManager)
 
-	if err := btreeIndex.Put(req.Key, req.Value); err != nil {
+	if err := btreeIndex.Put(metricCtx, req.Key, req.Value); err != nil {
 		statusCode = otelcodes.Error
 		log.Printf("Node %s, Slot %d: Failed to put key %s to btree: %v", s.nodeID, s.slotID, req.Key, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Internal, "put failed (btree): %v", err)
@@ -120,14 +120,20 @@ func (s *IndexedWriteService) Put(ctx context.Context, req *pb.PutRequest) (*pb.
 
 // Delete handles a single key delete operation.
 func (s *IndexedWriteService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-
+	metricCtx, span, startTime := s.StartMetricsAndTrace(ctx, "Delete")
+	var statusCode otelcodes.Code
+	defer func() {
+		s.EndMetricsAndTrace(metricCtx, span, startTime, "Delete", statusCode)
+	}()
 	// 1. Delete from B-tree
 	btreeIdx, ok := s.indexManagers.Load("btree")
 	if !ok {
+		statusCode = otelcodes.Error
 		return &pb.DeleteResponse{Success: false, Message: ""}, status.Errorf(codes.Internal, "put failed (btree): %v")
 	}
 	btreeIndex := btreeIdx.(indexmanager.IndexManager)
-	if err := btreeIndex.Delete(req.Key); err != nil {
+	if err := btreeIndex.Delete(metricCtx, req.Key); err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Node %s, Slot %d: Failed to delete key %s from btree: %v", s.nodeID, s.slotID, req.Key, err)
 		return &pb.DeleteResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Internal, "delete failed (btree): %v", err)
 	}
@@ -155,12 +161,17 @@ func (s *IndexedWriteService) Delete(ctx context.Context, req *pb.DeleteRequest)
 
 // BulkPut handles multiple key-value put operations.
 func (s *IndexedWriteService) BulkPut(ctx context.Context, req *pb.BulkPutRequest) (*pb.BulkPutResponse, error) {
-
+	metricCtx, span, startTime := s.StartMetricsAndTrace(ctx, "BulkPut")
+	var statusCode otelcodes.Code
+	defer func() {
+		s.EndMetricsAndTrace(metricCtx, span, startTime, "BulkPut", statusCode)
+	}()
 	for _, entry := range req.Entries {
 		// Call the single Put method internally to reuse logic and ensure WAL/index updates
 		// This also ensures each Put is logged (if WAL is implemented).
 		_, err := s.Put(ctx, &pb.PutRequest{Key: entry.Key, Value: entry.Value})
 		if err != nil {
+			statusCode = otelcodes.Error
 			log.Printf("Node %s, Slot %d: Failed to bulk put entry %s: %v", s.nodeID, s.slotID, entry.Key, err)
 			return &pb.BulkPutResponse{Success: false, Message: fmt.Sprintf("Bulk put failed for key %s: %v", entry.Key, err)}, status.Errorf(codes.Internal, "bulk put failed")
 		}
@@ -171,11 +182,16 @@ func (s *IndexedWriteService) BulkPut(ctx context.Context, req *pb.BulkPutReques
 
 // BulkDelete handles multiple key delete operations.
 func (s *IndexedWriteService) BulkDelete(ctx context.Context, req *pb.BulkDeleteRequest) (*pb.BulkDeleteResponse, error) {
-
+	metricCtx, span, startTime := s.StartMetricsAndTrace(ctx, "BulkDelete")
+	var statusCode otelcodes.Code
+	defer func() {
+		s.EndMetricsAndTrace(metricCtx, span, startTime, "BulkDelete", statusCode)
+	}()
 	for _, key := range req.Keys {
 		// Call the single Delete method internally
 		_, err := s.Delete(ctx, &pb.DeleteRequest{Key: key})
 		if err != nil {
+			statusCode = otelcodes.Error
 			log.Printf("Node %s, Slot %d: Failed to bulk delete key %s: %v", s.nodeID, s.slotID, key, err)
 			return &pb.BulkDeleteResponse{Success: false, Message: fmt.Sprintf("Bulk delete failed for key %s: %v", key, err)}, status.Errorf(codes.Internal, "bulk delete failed")
 		}
