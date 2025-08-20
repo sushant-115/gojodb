@@ -170,6 +170,28 @@ func (gs *GatewayService) monitorControllerCluster() {
 	}
 }
 
+// Unary interceptor
+func loggingInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply interface{},
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	log.Printf("👉 gRPC call: %s, req=%v", method, req)
+
+	// invoke the actual RPC
+	err := invoker(ctx, method, req, reply, cc, opts...)
+
+	if err != nil {
+		log.Printf("❌ gRPC error: %v", err)
+	} else {
+		log.Printf("✅ gRPC reply: %v", reply)
+	}
+	return err
+}
+
 // getStorageNodeClient gets a gRPC client connection for a given node ID.
 // It tries to reuse from the pool or creates a new one.
 func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn, error) {
@@ -200,7 +222,9 @@ func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn,
 
 	// No valid connection in pool, create a new one
 	log.Printf("Establishing new gRPC connection to storage node %s at %s", nodeID, addr)
-	conn, err := grpc.NewClient(addr, grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
+	conn, err := grpc.NewClient(addr, grpc.WithInsecure(),
+		grpc.WithUnaryInterceptor(loggingInterceptor),
+	) // Use WithInsecure for now, but in production use mTLS
 	if err != nil {
 		pool.Put(nil) // Put nil back to signal it's unusable
 		return nil, fmt.Errorf("failed to dial storage node %s at %s: %v", nodeID, addr, err)

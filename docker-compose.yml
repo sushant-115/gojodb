@@ -53,6 +53,7 @@ services:
       - "--heartbeat_addr=gojodb-server-1:8083"
       - "--controller_addr=gojodb-server-1:9001"
       - "--bootstrap"
+      - "--oltp_endpoint=jaeger-all-in-one:4317"
       # First node, so no --join argument
     healthcheck:
       test: ["CMD", "sh", "-c", "sleep 1"]
@@ -86,6 +87,7 @@ services:
       - "--replication_addr=gojodb-server-2:6002"
       - "--heartbeat_addr=gojodb-server-2:8084"
       - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
+      - "--oltp_endpoint=jaeger-all-in-one:4317"
     depends_on:
       gojodb-server-1:
         condition: service_healthy
@@ -121,6 +123,7 @@ services:
       - "--replication_addr=gojodb-server-3:6003"
       - "--heartbeat_addr=gojodb-server-3:8085"
       - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
+      - "--oltp_endpoint=jaeger-all-in-one:4317"
     depends_on:
       gojodb-server-1:
         condition: service_healthy

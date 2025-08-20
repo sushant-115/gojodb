@@ -335,12 +335,12 @@ func (bt *BTree[K, V]) SetRootPageID(newRootPageID pagemanager.PageID, txnID uin
 	}
 
 	// Flush the log immediately to ensure durability of the root change record
-	if err := bt.logManager.Sync(); err != nil {
-		// log.Printf("ERROR: Failed to flush log for root page ID change LSN %d: %v", lsn, err)
-		// This is also critical.
-		bt.rootPageID = oldRootPageID
-		return fmt.Errorf("failed to flush root page ID change log: %w", err)
-	}
+	// if err := bt.logManager.Sync(); err != nil {
+	// 	// log.Printf("ERROR: Failed to flush log for root page ID change LSN %d: %v", lsn, err)
+	// 	// This is also critical.
+	// 	bt.rootPageID = oldRootPageID
+	// 	return fmt.Errorf("failed to flush root page ID change log: %w", err)
+	// }
 
 	// Update the file header with the new root page ID
 	if err := bt.diskManager.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
@@ -1657,11 +1657,11 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 		return fmt.Errorf("%w: failed to log PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
 	}
 	// Flush the log to ensure the PREPARE record is durable before voting COMMIT
-	if err := bt.logManager.Sync(); err != nil {
-		bt.releaseAllLocksForTxn(txnID)
-		bt.transactionTable.Delete(txnID)
-		return fmt.Errorf("%w: failed to flush log for PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
-	}
+	// if err := bt.logManager.Sync(); err != nil {
+	// 	bt.releaseAllLocksForTxn(txnID)
+	// 	bt.transactionTable.Delete(txnID)
+	// 	return fmt.Errorf("%w: failed to flush log for PREPARE record for txn %d: %v", ErrPrepareFailed, txnID, err)
+	// }
 
 	txn.State = TxnStatePrepared // Transition state to PREPARED
 	// log.Printf("INFO: Txn %d: PREPARED. All locks acquired and PREPARE record logged.", txnID)
@@ -1695,9 +1695,9 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 		return fmt.Errorf("failed to log COMMIT record for txn %d: %w", txnID, err)
 	}
 	// Flush the log to ensure COMMIT record is durable
-	if err := bt.logManager.Sync(); err != nil {
-		return fmt.Errorf("failed to flush log for COMMIT record for txn %d: %w", txnID, err)
-	}
+	// if err := bt.logManager.Sync(); err != nil {
+	// 	return fmt.Errorf("failed to flush log for COMMIT record for txn %d: %w", txnID, err)
+	// }
 
 	txn.State = TxnStateCommitted // Transition state to COMMITTED
 	bt.releaseAllLocksForTxn(txnID)
@@ -1736,9 +1736,9 @@ func (bt *BTree[K, V]) Abort(txnID uint64) error {
 		return fmt.Errorf("failed to log ABORT record for txn %d: %w", txnID, err)
 	}
 	// Flush the log to ensure ABORT record is durable
-	if err := bt.logManager.Sync(); err != nil {
-		return fmt.Errorf("failed to flush log for ABORT record for txn %d: %w", txnID, err)
-	}
+	// if err := bt.logManager.Sync(); err != nil {
+	// 	return fmt.Errorf("failed to flush log for ABORT record for txn %d: %w", txnID, err)
+	// }
 
 	// TODO: Rollback changes made by this transaction.
 	// This would involve reading the WAL backwards from the PREPARE record

@@ -6,6 +6,7 @@ require (
 	github.com/99designs/gqlgen v0.17.73
 	github.com/chzyer/readline v1.5.1
 	github.com/google/uuid v1.6.0
+	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb v0.0.0-20250528070419-144f8b0a1edb
@@ -13,6 +14,7 @@ require (
 	github.com/quic-go/quic-go v0.54.0
 	github.com/stretchr/testify v1.10.0
 	github.com/vektah/gqlparser/v2 v2.5.26
+	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.62.0
 	go.opentelemetry.io/otel v1.37.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.37.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.59.1
@@ -38,6 +40,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.2.1 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.1 // indirect

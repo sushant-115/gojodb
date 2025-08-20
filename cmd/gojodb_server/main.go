@@ -19,6 +19,8 @@ import (
 	"time"
 
 	// GojoDB core packages
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_zap "github.com/grpc-ecosystem/go-grpc-middleware/logging/zap"
 	indexedreadsservice "github.com/sushant-115/gojodb/api/indexed_reads_service"
 	indexedwritesservice "github.com/sushant-115/gojodb/api/indexed_writes_service"
 	pb "github.com/sushant-115/gojodb/api/proto"
@@ -34,6 +36,8 @@ import (
 	"github.com/sushant-115/gojodb/core/storage_engine/tiered_storage"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"github.com/sushant-115/gojodb/pkg/logger"
+	"github.com/sushant-115/gojodb/pkg/telemetry"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 
 	// GojoDB API services
 	// basic_api "github.com/sushant-115/gojodb/api/basic"
@@ -80,11 +84,14 @@ var (
 	controllerAddr    = flag.String("controller_addr", "127.0.0.1:8080", "Controller address for joining Raft cluster and fetching shard map")
 	replicationAddr   = flag.String("replication_addr", "127.0.0.1:6000", "Port for replication data exchange between storage nodes") // Clarified purpose
 	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes")   // Clarified purpose
-	myStorageNodeID   string                                                                                                          // Set from nodeID flag
-	myStorageNodeAddr string                                                                                                          // Address this node is reachable at by other storage nodes (e.g. for replication)
+	oltpEndpoint      = flag.String("oltp_endpoint", "127.0.0.1:4317", "OLTP collector endpoint to send traces")
+	myStorageNodeID   string // Set from nodeID flag
+	myStorageNodeAddr string // Address this node is reachable at by other storage nodes (e.g. for replication)
 	raftTransport     *raft.NetworkTransport
 	// Global wait group to manage graceful shutdown of goroutines
-	globalWG sync.WaitGroup
+	globalWG    sync.WaitGroup
+	tel         *telemetry.Telemetry
+	telShutdown telemetry.ShutdownFunc
 )
 
 const (
@@ -123,6 +130,16 @@ func main() {
 		zap.Bool("bootstrap", *bootstrap),
 		zap.String("controllerAddr", *controllerAddr),
 	)
+	tel, telShutdown, err = telemetry.New(telemetry.Config{
+		Enabled:        true,
+		ServiceName:    "gojodb_gateway",
+		PrometheusPort: 9112,
+		OtlpEndpoint:   *oltpEndpoint,
+	})
+	if err != nil {
+		log.Fatal("Couldn't create telemetry. Error: ", err)
+	}
+	defer telShutdown(context.Background())
 
 	// Initialize database components
 	if err := initStorageNode(); err != nil {
@@ -785,16 +802,16 @@ func startGRPCServer() {
 
 	// Create gRPC server with interceptors for logging and recovery
 	grpcServer = grpc.NewServer(
-	// grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-	// 	grpc_zap.UnaryServerInterceptor(zlogger),
-	// 	// Add other interceptors like recovery, auth, etc.
-	// )),
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			grpc_zap.UnaryServerInterceptor(zlogger),
+		)),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 
 	// Register services
-	pb.RegisterIndexedWriteServiceServer(grpcServer, indexedwritesservice.NewIndexedWriteService(myStorageNodeID, 0, indexManagers))
+	pb.RegisterIndexedWriteServiceServer(grpcServer, indexedwritesservice.NewIndexedWriteService(myStorageNodeID, 0, indexManagers, tel))
 	// Register the IndexedReadService to handle Get, GetRange, TextSearch
-	pb.RegisterIndexedReadServiceServer(grpcServer, indexedreadsservice.NewIndexedReadService(myStorageNodeID, 0, indexManagers))
+	pb.RegisterIndexedReadServiceServer(grpcServer, indexedreadsservice.NewIndexedReadService(myStorageNodeID, 0, indexManagers, tel))
 	// pb.RegisterBasicServiceServer(grpcServer, basic_api.NewBasicServer(dbInstance, zlogger))
 	// pb.RegisterGatewayServiceServer(grpcServer, indwrite_api.NewIndexedWriteServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))
 	// pb.RegisterSnapshotServiceServer(grpcServer, indread_api.NewIndexedReadServer(dbInstance, invertedIndexInstance, spatialIdx, zlogger))

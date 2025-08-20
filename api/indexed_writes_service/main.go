@@ -5,13 +5,24 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	pb "github.com/sushant-115/gojodb/api/proto"
 	"github.com/sushant-115/gojodb/core/indexmanager"
 	commonutils "github.com/sushant-115/gojodb/internal/common_utils"
+	internaltelemetry "github.com/sushant-115/gojodb/internal/telemetry"
+	"github.com/sushant-115/gojodb/pkg/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	// Use insecure for local testing
+)
+
+const (
+	serviceName = "gojodb_server"
 )
 
 // IndexedWriteService implements the gRPC IndexedWriteService.
@@ -20,14 +31,22 @@ type IndexedWriteService struct {
 	nodeID        string
 	slotID        uint32
 	indexManagers sync.Map // map[string]indexmanager.IndexManager // indexType -> IndexManager
+	tracer        trace.Tracer
+	metrics       *internaltelemetry.GrpcGatewayMetrics
 }
 
 // NewIndexedWriteService creates a new IndexedWriteService.
-func NewIndexedWriteService(nodeID string, slotID uint32, indexManagers map[string]indexmanager.IndexManager) *IndexedWriteService {
+func NewIndexedWriteService(nodeID string, slotID uint32, indexManagers map[string]indexmanager.IndexManager, tel *telemetry.Telemetry) *IndexedWriteService {
+	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
+	if err != nil {
+		fmt.Printf("failed to create gRPC metrics: %w", err)
+	}
 	idx := &IndexedWriteService{
 		nodeID: nodeID,
 		slotID: slotID,
 		// indexManagers: indexManagers,
+		tracer:  tel.Tracer,
+		metrics: grpcMetrics,
 	}
 	commonutils.CopyToSyncMap(indexManagers, &idx.indexManagers)
 	return idx
@@ -40,14 +59,22 @@ func (s *IndexedWriteService) Put(ctx context.Context, req *pb.PutRequest) (*pb.
 	// In a real system, WAL write happens first, then apply to in-memory/disk structures.
 	// For now, directly apply to B-tree, and then potentially other indexes.
 
+	metricCtx, span, startTime := s.StartMetricsAndTrace(ctx, "Put")
+	var statusCode otelcodes.Code
+	defer func() {
+		s.EndMetricsAndTrace(metricCtx, span, startTime, "Put", statusCode)
+	}()
+
 	// 1. Apply to B-tree
 	btreeIdx, ok := s.indexManagers.Load("btree")
 	if !ok {
-		return &pb.PutResponse{Success: false, Message: ""}, status.Errorf(codes.Internal, "put failed (btree): %v")
+		statusCode = otelcodes.Error
+		return &pb.PutResponse{Success: false, Message: ""}, status.Errorf(codes.Internal, "put failed (btree)")
 	}
 	btreeIndex := btreeIdx.(indexmanager.IndexManager)
 
 	if err := btreeIndex.Put(req.Key, req.Value); err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Node %s, Slot %d: Failed to put key %s to btree: %v", s.nodeID, s.slotID, req.Key, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Internal, "put failed (btree): %v", err)
 	}
@@ -86,7 +113,7 @@ func (s *IndexedWriteService) Put(ctx context.Context, req *pb.PutRequest) (*pb.
 	// 		}
 	// 	}
 	// }
-
+	statusCode = otelcodes.Ok
 	log.Printf("Node %s, Slot %d: Put key=%s (applied to multiple indexes)", s.nodeID, s.slotID, req.Key)
 	return &pb.PutResponse{Success: true, Message: "Key-value pair put successfully"}, nil
 }
@@ -155,4 +182,58 @@ func (s *IndexedWriteService) BulkDelete(ctx context.Context, req *pb.BulkDelete
 	}
 	log.Printf("Node %s, Slot %d: Bulk deleted %d keys completed.", s.nodeID, s.slotID, len(req.Keys))
 	return &pb.BulkDeleteResponse{Success: true, Message: "Bulk delete completed successfully"}, nil
+}
+
+// StartMetricsAndTrace begins the telemetry recording for a gRPC method.
+// It returns a new context, the trace span, and the start time.
+func (s *IndexedWriteService) StartMetricsAndTrace(ctx context.Context, fullMethodName string) (context.Context, trace.Span, time.Time) {
+	startTime := time.Now()
+
+	// Increment active RPCs and started counter
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+	s.metrics.RpcsStartedCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Start a new trace span
+	ctx, span := s.tracer.Start(ctx, fullMethodName, trace.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	return ctx, span, startTime
+}
+
+// EndMetricsAndTrace completes the telemetry recording for a gRPC method.
+func (s *IndexedWriteService) EndMetricsAndTrace(ctx context.Context, span trace.Span, startTime time.Time, fullMethodName string, statusCode otelcodes.Code) {
+	latency := time.Since(startTime).Milliseconds()
+
+	// Set span status based on the final gRPC code
+	if statusCode != otelcodes.Ok {
+		span.SetStatus(otelcodes.Error, statusCode.String())
+	} else {
+		span.SetStatus(otelcodes.Ok, "Success")
+	}
+	span.End()
+
+	// Decrement active RPCs
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, -1, metric.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Define attributes for the completed RPC.
+	metricAttributes := attribute.NewSet(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+		attribute.String("grpc.code", statusCode.String()),
+	)
+
+	// Record latency and increment handled counter
+	s.metrics.RpcLatencyHistogram.Record(ctx, latency, metric.WithAttributeSet(metricAttributes))
+	s.metrics.RpcsHandledCounter.Add(ctx, 1, metric.WithAttributeSet(metricAttributes))
 }
