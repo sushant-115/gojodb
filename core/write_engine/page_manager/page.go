@@ -4,6 +4,8 @@ import (
 	"container/list" // For LRU
 	"sync"           // For sync.RWMutex
 	"time"
+
+	commonutils "github.com/sushant-115/gojodb/internal/common_utils"
 )
 
 // --- Page Management ---
@@ -96,11 +98,17 @@ func (p *Page) RUnlock() {
 
 // Lock acquires a write (exclusive) latch on the page.
 func (p *Page) Lock() {
+	commonutils.PrintCaller("Page lock from", uint64(p.id), 2)
 	p.latch.Lock()
+}
+
+func (p *Page) TryLock() bool {
+	return p.latch.TryLock()
 }
 
 // Unlock releases a write (exclusive) latch on the page.
 func (p *Page) Unlock() {
+	commonutils.PrintCaller("Page unlock from", uint64(p.id), 2)
 	p.latch.Unlock()
 }
 
