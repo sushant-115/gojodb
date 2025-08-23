@@ -100,6 +100,7 @@ func (p *Page) RUnlock() {
 func (p *Page) Lock() {
 	commonutils.PrintCaller("Page lock from", uint64(p.id), 2)
 	p.latch.Lock()
+	commonutils.PrintCaller("Page locked from", uint64(p.id), 2)
 }
 
 func (p *Page) TryLock() bool {
@@ -110,6 +111,7 @@ func (p *Page) TryLock() bool {
 func (p *Page) Unlock() {
 	commonutils.PrintCaller("Page unlock from", uint64(p.id), 2)
 	p.latch.Unlock()
+	commonutils.PrintCaller("Page unlocked from", uint64(p.id), 2)
 }
 
 // --- END NEW ---

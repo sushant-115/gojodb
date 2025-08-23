@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sync" // For sync.RWMutex and sync.Map
+	"sync/atomic"
 
 	"github.com/sushant-115/gojodb/core/indexing"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
@@ -130,6 +131,8 @@ type BTree[K any, V any] struct {
 	transactionTableLockMu sync.RWMutex // Protects keyLocks map
 	lock                   sync.RWMutex
 	pagesLocked            sync.Map
+	dbSize                 atomic.Uint64
+	dbSizeLock             sync.Mutex
 	// --- END NEW ---
 }
 
@@ -177,50 +180,50 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 		// --- END NEW ---
 	}
 
-	// // Create the initial root node page
-	// rootPageForNew, rootPageIDForNew, err := bpm.NewPage()
-	// if err != nil {
-	// 	dm.Close()
-	// 	_ = os.Remove(filePath) // Clean up file on failure to create root page
-	// 	return nil, fmt.Errorf("failed to create initial root page for B-tree: %w", err)
-	// }
-	// bt.rootPageID = rootPageIDForNew // Set the tree's root to the newly allocated page
+	// Create the initial root node page
+	rootPageForNew, rootPageIDForNew, err := bpm.NewPage()
+	if err != nil {
+		dm.Close()
+		_ = os.Remove(filePath) // Clean up file on failure to create root page
+		return nil, fmt.Errorf("failed to create initial root page for B-tree: %w", err)
+	}
+	bt.rootPageID = rootPageIDForNew // Set the tree's root to the newly allocated page
 
-	// // Initialize the root node as a leaf
-	// rootNode := &Node[K, V]{
-	// 	pageID:       rootPageIDForNew,
-	// 	isLeaf:       true,
-	// 	tree:         bt,
-	// 	keys:         make([]K, 0),
-	// 	values:       make([]V, 0),
-	// 	childPageIDs: make([]pagemanager.PageID, 0),
-	// }
+	// Initialize the root node as a leaf
+	rootNode := &Node[K, V]{
+		pageID:       rootPageIDForNew,
+		isLeaf:       true,
+		tree:         bt,
+		keys:         make([]K, 0),
+		values:       make([]V, 0),
+		childPageIDs: make([]pagemanager.PageID, 0),
+	}
 
-	// // Serialize the new empty root node to its page
-	// if err := rootNode.serialize(rootPageForNew, kvSerializer.SerializeKey, kvSerializer.SerializeValue); err != nil {
-	// 	bpm.UnpinPage(rootPageIDForNew, false) // Unpin, not dirty if serialization failed
-	// 	dm.Close()
-	// 	_ = os.Remove(filePath) // Clean up file on serialization failure
-	// 	return nil, fmt.Errorf("failed to serialize initial root node: %w", err)
-	// }
+	// Serialize the new empty root node to its page
+	if err := rootNode.serialize(rootPageForNew, kvSerializer.SerializeKey, kvSerializer.SerializeValue); err != nil {
+		bpm.UnpinPage(rootPageIDForNew, false) // Unpin, not dirty if serialization failed
+		dm.Close()
+		_ = os.Remove(filePath) // Clean up file on serialization failure
+		return nil, fmt.Errorf("failed to serialize initial root node: %w", err)
+	}
 
-	// // Unpin the root page, marking it dirty as it's new content
-	// if err := bpm.UnpinPage(rootPageIDForNew, true); err != nil {
-	// 	dm.Close()
-	// 	_ = os.Remove(filePath)
-	// 	return nil, fmt.Errorf("failed to unpin initial root page: %w", err)
-	// }
+	// Unpin the root page, marking it dirty as it's new content
+	if err := bpm.UnpinPage(rootPageIDForNew, true); err != nil {
+		dm.Close()
+		_ = os.Remove(filePath)
+		return nil, fmt.Errorf("failed to unpin initial root page: %w", err)
+	}
 
-	// // Update the file header with the new root page ID and other metadata
-	// if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
-	// 	h.RootPageID = rootPageIDForNew
-	// 	h.TreeSize = 0 // Initially empty tree
-	// 	h.Degree = uint32(degree)
-	// }); err != nil {
-	// 	dm.Close()
-	// 	_ = os.Remove(filePath)
-	// 	return nil, fmt.Errorf("failed to update header with root page ID: %w", err)
-	// }
+	// Update the file header with the new root page ID and other metadata
+	if err := dm.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
+		h.RootPageID = rootPageIDForNew
+		h.TreeSize = 0 // Initially empty tree
+		h.Degree = uint32(degree)
+	}); err != nil {
+		dm.Close()
+		_ = os.Remove(filePath)
+		return nil, fmt.Errorf("failed to update header with root page ID: %w", err)
+	}
 	bt.logger.Info("New B-tree database created at", zap.String("path", filePath))
 	// log.Printf("INFO: New B-tree database created at %s with root pagemanager.PageID %d, Degree %d", filePath, rootPageIDForNew, degree)
 	return bt, nil
@@ -314,8 +317,6 @@ func (bt *BTree[K, V]) GetRootPageID() pagemanager.PageID {
 // SetRootPageID updates the B-tree's in-memory rootPageID and logs the change.
 // It also updates the disk header immediately to ensure durability of root changes.
 func (bt *BTree[K, V]) SetRootPageID(newRootPageID pagemanager.PageID, txnID uint64) error {
-	bt.lock.Lock()
-	defer bt.lock.Unlock()
 	oldRootPageID := bt.rootPageID
 	bt.rootPageID = newRootPageID
 
@@ -442,22 +443,63 @@ func (bt *BTree[K, V]) GetSize() (uint64, error) {
 	return header.TreeSize, nil
 }
 
+// FlushSizeToDisk persists the final in-memory TreeSize to the database file header.
+// This is designed to be called during a graceful shutdown or checkpoint.
+func (bt *BTree[K, V]) FlushSizeToDisk() error {
+	// Atomically load the final, up-to-date size from memory.
+	finalSize := bt.dbSize.Load()
+
+	// Update the header field on disk with the final value.
+	return bt.diskManager.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
+		h.TreeSize = finalSize
+	})
+}
+
 // updatePersistedSize updates the TreeSize field in the file header.
 // NOTE: This is inefficient for frequent updates. In a real DB, size is often
 // updated in memory and flushed periodically or at shutdown/checkpoint.
-func (bt *BTree[K, V]) updatePersistedSize(delta int64) error {
-	return bt.diskManager.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
-		if delta > 0 {
-			h.TreeSize += uint64(delta)
-		} else if delta < 0 {
-			// Ensure TreeSize doesn't underflow
-			if h.TreeSize >= uint64(-delta) {
-				h.TreeSize -= uint64(-delta)
-			} else {
-				h.TreeSize = 0 // Should not happen if logic is correct
+// updateInMemorySize updates the TreeSize in-memory for high efficiency.
+// This should be called on every operation that changes the total size.
+func (bt *BTree[K, V]) updateInMemorySize(delta int64) error {
+	if delta > 0 {
+		bt.dbSize.Add(uint64(delta))
+		return nil
+	}
+
+	if delta < 0 {
+		absDelta := uint64(-delta)
+		// Use a Compare-And-Swap (CAS) loop to safely subtract atomically.
+		// This prevents race conditions and underflow issues.
+		for {
+			currentSize := bt.dbSize.Load()
+			if currentSize < absDelta {
+				// This condition should ideally not be met if the logic for deltas
+				// is correct, but as a safeguard, we prevent underflow.
+				bt.dbSize.Store(0)
+				return nil
 			}
+			newSize := currentSize - absDelta
+			if bt.dbSize.CompareAndSwap(currentSize, newSize) {
+				// Successfully updated the size.
+				return nil
+			}
+			// If the swap failed, another goroutine modified the size.
+			// The loop will retry with the new currentSize.
 		}
-	})
+	}
+	return nil
+	// return bt.diskManager.UpdateHeaderField(func(h *flushmanager.DBFileHeader) {
+	// 	if delta > 0 {
+	// 		h.TreeSize += uint64(delta)
+	// 	} else if delta < 0 {
+	// 		// Ensure TreeSize doesn't underflow
+	// 		if h.TreeSize >= uint64(-delta) {
+	// 			h.TreeSize -= uint64(-delta)
+	// 		} else {
+	// 			h.TreeSize = 0 // Should not happen if logic is correct
+	// 		}
+	// 	}
+	// })
 }
 
 // Search for a key in the B-tree.
@@ -563,7 +605,9 @@ func (bt *BTree[K, V]) unlockPageID(pageID pagemanager.PageID) {
 // Insert inserts a key-value pair into the B-tree. If txnID is 0, it's an auto-commit operation.
 func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 	// Acquire lock for the key
+	bt.lock.Lock()
 	if err := bt.acquireLock(key, txnID); err != nil {
+		bt.lock.Unlock()
 		return fmt.Errorf("failed to acquire lock for key %v: %w", key, err)
 	}
 	defer func() {
@@ -587,22 +631,25 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		// log.Printf("DEBUG: Txn %d: Inserting first key %v. Creating initial root page.", txnID, key)
 		rootPg, rootPgID, err := bt.bpm.NewPage() // Allocates a new page and pins it
 		if err != nil {
+			bt.lock.Unlock()
 			return fmt.Errorf("failed to create first root page for insert: %w", err)
 		}
-		rootPg.Lock()
+		// rootPg.Lock()
 		// Use SetRootPageID to update and log the change
 		if err := bt.SetRootPageID(rootPgID, txnID); err != nil {
 			bt.bpm.UnpinPage(rootPgID, false)           // Unpin even on error
 			_ = bt.diskManager.DeallocatePage(rootPgID) // Try to free the orphaned page
-			rootPg.Unlock()
+			// rootPg.Unlock()
+			bt.lock.Unlock()
 			return fmt.Errorf("failed to set initial root page ID: %w", err)
 		}
 		rootNode := &Node[K, V]{pageID: rootPgID, isLeaf: true, tree: bt, keys: make([]K, 0), values: make([]V, 0), childPageIDs: make([]pagemanager.PageID, 0)}
-		rootPg.Unlock()
+		// rootPg.Unlock()
 		// TODO: WAL Log creation of new root page with TxnID
+		bt.lock.Unlock()
 		return bt.insertNonFull(rootNode, rootPg, key, value, !exists, txnID) // insertNonFull unpins rootPg
 	}
-	// bt.lock.Lock()
+
 	// lock root pageID
 	rpID := bt.rootPageID
 	bt.lockPageID(rpID)
@@ -610,6 +657,8 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 	rootNode, rootPage, err := bt.fetchNode(bt.rootPageID)
 	if err != nil {
 		bt.unlockPageID(rpID)
+		bt.lock.Unlock()
+		// rootPage.Unlock()
 		return fmt.Errorf("failed to fetch root node during insert: %w", err)
 	}
 	rootPage.Lock()
@@ -621,6 +670,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 			bt.bpm.UnpinPage(rootPage.GetPageID(), false) // Unpin old root on error
 			rootPage.Unlock()
 			bt.unlockPageID(rpID)
+			bt.lock.Unlock()
 			return fmt.Errorf("failed to create new root page during split: %w", err)
 		}
 		newRootDiskPage.Lock()
@@ -646,6 +696,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 			newRootDiskPage.Unlock()
 			rootPage.Unlock()
 			bt.unlockPageID(rpID)
+			bt.lock.Unlock()
 			return fmt.Errorf("failed to split root node: %w", err)
 		}
 		// log.Printf("DEBUG: Txn %d: Root split complete. New root %d, Old root %d", txnID, newRootPageID, oldRootPageID)
@@ -660,6 +711,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 			newRootDiskPage.Unlock()
 			rootPage.Unlock()
 			bt.unlockPageID(rpID)
+			bt.lock.Unlock()
 			return fmt.Errorf("failed to serialize new root node %d after split: %w", newRootPageID, errS)
 		}
 		// Unpin newRootDiskPage here, as it's now serialized and dirty.
@@ -668,9 +720,10 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 			newRootDiskPage.Unlock()
 			rootPage.Unlock()
 			bt.unlockPageID(rpID)
+			bt.lock.Unlock()
 			return fmt.Errorf("failed to unpin new root page %d after serialization: %w", newRootPageID, errU)
 		}
-		bt.unlockPageID(rpID)
+
 		// Use SetRootPageID to update and log the change
 		if err := bt.SetRootPageID(newRootPageID, txnID); err != nil {
 			bt.bpm.UnpinPage(rootPage.GetPageID(), false)        // Unpin old root
@@ -678,6 +731,8 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 			_ = bt.diskManager.DeallocatePage(newRootPageID)     // Try to free orphaned new root page
 			newRootDiskPage.Unlock()
 			rootPage.Unlock()
+			bt.unlockPageID(rpID)
+			bt.lock.Unlock()
 			return fmt.Errorf("failed to set new root page ID during split: %w", err)
 		}
 		// --- END CRITICAL FIX ---
@@ -689,9 +744,13 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		reloadedNewRootNode, reloadedNewRootPage, fetchErr := bt.fetchNode(newRootPageID)
 		if fetchErr != nil {
 			bt.unlockPageID(newRootPageID)
+			bt.unlockPageID(rpID)
+			bt.lock.Unlock()
 			return fetchErr
 		}
+		bt.lock.Unlock()
 		newRootDiskPage.Unlock()
+		bt.unlockPageID(rpID)
 		rootPage.Unlock()
 		bt.unlockPageID(newRootPageID)
 		return bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists, txnID) // Recursive call unpins
@@ -699,6 +758,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		// Root node is not full, just insert into it directly.
 		rootPage.Unlock()
 		bt.unlockPageID(rpID)
+		bt.lock.Unlock()
 		return bt.insertNonFull(rootNode, rootPage, key, value, !exists, txnID) // insertNonFull unpins rootPage
 	}
 }
@@ -709,7 +769,6 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 	// Find the correct insertion position
 	pID := node.pageID
 	bt.lockPageID(pID)
-
 	page.Lock()
 	bt.logger.Debug("Here 735", zap.Int64("GID", commonutils.GoID()))
 	idx := slices.IndexFunc(node.keys, func(k K) bool { return bt.keyOrder(key, k) <= 0 })
@@ -762,7 +821,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 		}
 
 		if incrementSize {
-			if err := bt.updatePersistedSize(1); err != nil {
+			if err := bt.updateInMemorySize(1); err != nil {
 				// page.Unlock()
 				// log.Printf("ERROR: Failed to update tree size after insert: %v", err)
 				// This is a soft error; data is inserted, but size count might be off.
@@ -804,19 +863,19 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 
 		// Key not found in current internal node, descend to child
 		childPageIDToDescend := node.childPageIDs[idx]
+		bt.lockPageID(childPageIDToDescend)
 		childNode, childPage, err := bt.fetchNode(childPageIDToDescend) // Child is now pinned
 		if err != nil {
 
 			bt.bpm.UnpinPage(page.GetPageID(), false) // Unpin parent
 			page.Unlock()
 			bt.unlockPageID(pID)
+			bt.unlockPageID(childPageIDToDescend)
 			return fmt.Errorf("failed to fetch child node %d from parent %d: %w", childPageIDToDescend, node.pageID, err)
 		}
 
-		bt.unlockPageID(pID)
-
 		chID := childNode.pageID
-		bt.lockPageID(chID)
+
 		childPage.Lock()
 
 		// If the child node is full, split it
@@ -830,6 +889,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 				childPage.Unlock()
 				page.Unlock()
 				bt.unlockPageID(chID)
+				bt.unlockPageID(pID)
 				return fmt.Errorf("failed to split child node %d: %w", childNode.pageID, err)
 			}
 
@@ -851,6 +911,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 					childPage.Unlock()
 					page.Unlock()
 					bt.unlockPageID(chID)
+					bt.unlockPageID(pID)
 					return fmt.Errorf("failed to serialize parent node %d after updating promoted key value: %w", node.pageID, errS)
 				}
 
@@ -858,6 +919,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 				childPage.Unlock()
 				page.Unlock()
 				bt.unlockPageID(chID)
+				bt.unlockPageID(pID)
 				// Size not incremented as it's an update of a key that was part of the structure.
 				return err // Unpin, mark dirty
 			}
@@ -870,6 +932,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 				childPage.Unlock()
 				page.Unlock()
 				bt.unlockPageID(chID)
+				bt.unlockPageID(pID)
 				return fmt.Errorf("failed to serialize parent node %d after split: %w", node.pageID, errS)
 			}
 
@@ -878,14 +941,20 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 				childPage.Unlock()
 				page.Unlock()
 				bt.unlockPageID(chID)
+				bt.unlockPageID(pID)
 				return fmt.Errorf("failed to unpin parent node %d after serialization: %w", node.pageID, errU)
 			}
 
 			// Fetch the correct child to descend into (it's now `node.childPageIDs[idx]`)
 			descendChildPageID := node.childPageIDs[idx]
-			bt.unlockPageID(chID)
 
-			bt.lockPageID(descendChildPageID)
+			if chID == descendChildPageID {
+				bt.unlockPageID(chID)
+				bt.lockPageID(descendChildPageID)
+			} else {
+				bt.lockPageID(descendChildPageID)
+				bt.unlockPageID(chID)
+			}
 
 			descendChildNode, descendChildPage, fetchErr := bt.fetchNode(descendChildPageID) // New child is pinned
 			if fetchErr != nil {
@@ -893,11 +962,12 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 				page.Unlock()
 				return fmt.Errorf("failed to fetch correct child %d after split: %w", descendChildPageID, fetchErr)
 			}
-
 			childPage.Unlock()
 			page.Unlock()
+			// childPage.Unlock()
+			// page.Unlock()
 			bt.unlockPageID(descendChildPageID)
-
+			bt.unlockPageID(pID)
 			return bt.insertNonFull(descendChildNode, descendChildPage, key, value, incrementSize, txnID) // Recursive call unpins
 		} else {
 			// Child has space. Unpin current parent node before descending.
@@ -909,6 +979,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 				childPage.Unlock()
 				page.Unlock()
 				bt.unlockPageID(chID)
+				bt.unlockPageID(pID)
 				return fmt.Errorf("failed to unpin parent page %d before descending: %w", page.GetPageID(), unpinErr)
 			}
 			// Recurse into the child
@@ -916,6 +987,7 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 			childPage.Unlock()
 			page.Unlock()
 			bt.unlockPageID(chID)
+			bt.unlockPageID(pID)
 			return bt.insertNonFull(childNode, childPage, key, value, incrementSize, txnID) // Recursive call unpins
 		}
 	}
@@ -928,6 +1000,9 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 // The caller (`insertNonFull`) is responsible for serializing and unpinning `parentPage`.
 func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *pagemanager.Page, childIdx int, childToSplitNode *Node[K, V], childToSplitPage *pagemanager.Page, txnID uint64) error {
 	t := bt.degree // B-tree degree/order
+	// parentPage.Lock()
+	// defer parentPage.Unlock()
+	// childToSplitPage.Lock()
 
 	// 1. Create a new page for the new sibling node
 	newSiblingDiskPage, newSiblingPageID, err := bt.bpm.NewPage() // Allocates and pins
@@ -935,7 +1010,7 @@ func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *pagemanage
 		bt.bpm.UnpinPage(childToSplitPage.GetPageID(), false) // Unpin child on error
 		return fmt.Errorf("failed to create new sibling page during split: %w", err)
 	}
-	newSiblingDiskPage.Lock()
+	// newSiblingDiskPage.Lock()
 	// 2. Create the new in-memory sibling node
 	newSiblingNode := &Node[K, V]{
 		pageID: newSiblingPageID,
@@ -977,6 +1052,7 @@ func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *pagemanage
 	// log.Printf("DEBUG: Txn %d: Split child %d into new sibling %d. Promoted key %v to parent %d.",
 	// txnID, childToSplitNode.pageID, newSiblingPageID, middleKey, parentNode.pageID)
 
+	// childToSplitPage.Unlock()
 	// 7. Serialize the modified child and the new sibling node
 	var firstErr error
 	if errS := childToSplitNode.serialize(childToSplitPage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
@@ -998,7 +1074,7 @@ func (bt *BTree[K, V]) splitChild(parentNode *Node[K, V], parentPage *pagemanage
 
 	// Mark parent page dirty. It will be serialized and unpinned by the caller (insertNonFull).
 	parentPage.SetDirty(true)
-	newSiblingDiskPage.Unlock()
+	// newSiblingDiskPage.Unlock()
 	return firstErr
 }
 
@@ -1092,7 +1168,7 @@ func (bt *BTree[K, V]) Delete(key K, txnID uint64) error {
 
 	// If a key was successfully deleted from the tree structure, update the persisted size.
 	if wasDeleted {
-		if err := bt.updatePersistedSize(-1); err != nil {
+		if err := bt.updateInMemorySize(-1); err != nil {
 			// log.Printf("ERROR: Failed to update tree size after deletion: %v", err)
 		}
 	}
@@ -2036,6 +2112,9 @@ func (bt *BTree[K, V]) Close() error {
 	// if err := bt.diskManager.UpdateHeaderField(func(h *DBFileHeader){ h.TreeSize = bt.sizeInMemory }); err != nil {
 	// 	fmt.Fprintf(os.Stderr, "Error updating tree size in header on close: %v\n", err)
 	// }
+	if sizeErr := bt.FlushSizeToDisk(); sizeErr != nil {
+		// log the error
+	}
 
 	// Flush all dirty pages from the buffer pool to disk
 	flushErr := bt.bpm.FlushAllPages()

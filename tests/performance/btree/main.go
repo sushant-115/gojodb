@@ -4,6 +4,7 @@ import (
 	"log"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing"
@@ -17,7 +18,7 @@ func main() {
 	baseDataDir := "/tmp/gojodb"
 	dbPath := filepath.Join(baseDataDir, "btree.db")
 	walPath := filepath.Join(baseDataDir, "wal")
-	zlogger, _ := logger.New(logger.Config{Level: "debug"})
+	zlogger, _ := logger.New(logger.Config{Level: "error"})
 	logManager, err := wal.NewLogManager(walPath, zlogger, indexing.BTreeIndexType)
 	if err != nil {
 		log.Fatalf("failed to create main log manager: %w", err)
@@ -36,24 +37,60 @@ func main() {
 		logManager,
 		zlogger.Named("btree_index"),
 	)
-	// errChan := make(chan error, 100)
-	// wg := sync.WaitGroup{}
-	for i := 6000; i < 10000; i++ {
+	write(dbInstance)
+
+	read(dbInstance)
+}
+
+func read(dbInstance *btree.BTree[string, string]) {
+	wg := sync.WaitGroup{}
+	maxWorkers := 10
+	sem := make(chan struct{}, maxWorkers)
+	for i := 9000; i < 11000; i++ {
+		sem <- struct{}{}
 		key := "key-" + strconv.Itoa(i)
 		value := "value-" + strconv.Itoa(i)
-		// wg.Add(1)
-		// go func() {
-		// 	defer wg.Done()
-		err := dbInstance.Insert(key, value, 0)
-		log.Println("Error: ", err)
-		// 	errChan <- err
-		// }()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			v, found, err := dbInstance.Search(key)
+			if err != nil {
+				log.Println("1000011000 Search Error: ", err)
+				return
+			}
+			if !found {
+				log.Println("1000011000 NOT FOUND: ", key)
+				return
+			}
+			if v != value {
+				log.Println("1000011000 MISMATCH: ", key)
+				return
+			}
+		}()
 	}
-	// go func() {
-	// 	for er := range errChan {
-	// 		log.Println("Error: ", er)
-	// 	}
-	// }()
-	// wg.Wait()
-	time.Sleep(500 * time.Microsecond)
+	wg.Wait()
+	time.Sleep(1000 * time.Millisecond)
+}
+
+func write(dbInstance *btree.BTree[string, string]) {
+	wg := sync.WaitGroup{}
+	maxWorkers := 20
+	sem := make(chan struct{}, maxWorkers)
+	for i := 9000; i < 11000; i++ {
+		sem <- struct{}{}
+		key := "key-" + strconv.Itoa(i)
+		value := "value-" + strconv.Itoa(i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := dbInstance.Insert(key, value, 0)
+			if err != nil {
+				log.Println("1000011000 Write Error: ", err)
+			}
+		}()
+	}
+	wg.Wait()
+	time.Sleep(1000 * time.Millisecond)
 }
