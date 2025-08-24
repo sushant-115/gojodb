@@ -39,7 +39,7 @@ func main() {
 	)
 	write(dbInstance)
 
-	read(dbInstance)
+	//read(dbInstance)
 }
 
 func read(dbInstance *btree.BTree[string, string]) {
@@ -75,7 +75,7 @@ func read(dbInstance *btree.BTree[string, string]) {
 
 func write(dbInstance *btree.BTree[string, string]) {
 	wg := sync.WaitGroup{}
-	maxWorkers := 20
+	maxWorkers := 10
 	sem := make(chan struct{}, maxWorkers)
 	for i := 9000; i < 11000; i++ {
 		sem <- struct{}{}
@@ -88,6 +88,19 @@ func write(dbInstance *btree.BTree[string, string]) {
 			err := dbInstance.Insert(key, value, 0)
 			if err != nil {
 				log.Println("1000011000 Write Error: ", err)
+			}
+			v, found, err := dbInstance.Search(key)
+			if err != nil {
+				log.Println("1000011000 Search Error: ", err)
+				return
+			}
+			if !found {
+				log.Println("1000011000 NOT FOUND: ", key)
+				return
+			}
+			if v != value {
+				log.Println("1000011000 MISMATCH: ", key)
+				return
 			}
 		}()
 	}

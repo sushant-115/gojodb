@@ -514,12 +514,13 @@ func (bt *BTree[K, V]) Search(key K) (V, bool, error) {
 	if err != nil {
 		return zeroV, false, fmt.Errorf("failed to fetch root node for search: %w", err)
 	}
-
+	rootPage.RLock()
 	// Call the recursive search function
 	val, found, searchErr := bt.searchRecursive(rootNode, rootPage, key)
 	// The recursive search function is responsible for unpinning pages on both success and error paths.
 	if searchErr != nil {
 		// log.Printf("ERROR: Recursive search failed: %v", searchErr)
+		rootPage.Unlock()
 		return zeroV, false, searchErr
 	}
 	return val, found, nil
@@ -748,16 +749,18 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 			bt.lock.Unlock()
 			return fetchErr
 		}
-		bt.lock.Unlock()
 		newRootDiskPage.Unlock()
-		bt.unlockPageID(rpID)
 		rootPage.Unlock()
 		bt.unlockPageID(newRootPageID)
+		bt.unlockPageID(rpID)
+		bt.lock.Unlock()
+		bt.lockPageID(reloadedNewRootNode.pageID)
+		reloadedNewRootPage.Lock()
 		return bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists, txnID) // Recursive call unpins
 	} else {
 		// Root node is not full, just insert into it directly.
-		rootPage.Unlock()
-		bt.unlockPageID(rpID)
+		// rootPage.Unlock()
+		// bt.unlockPageID(rpID)
 		bt.lock.Unlock()
 		return bt.insertNonFull(rootNode, rootPage, key, value, !exists, txnID) // insertNonFull unpins rootPage
 	}
@@ -768,8 +771,8 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, key K, value V, incrementSize bool, txnID uint64) error {
 	// Find the correct insertion position
 	pID := node.pageID
-	bt.lockPageID(pID)
-	page.Lock()
+	// bt.lockPageID(pID)
+	// page.Lock()
 	bt.logger.Debug("Here 735", zap.Int64("GID", commonutils.GoID()))
 	idx := slices.IndexFunc(node.keys, func(k K) bool { return bt.keyOrder(key, k) <= 0 })
 	if idx == -1 { // Key is larger than all existing keys
@@ -966,8 +969,9 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 			page.Unlock()
 			// childPage.Unlock()
 			// page.Unlock()
-			bt.unlockPageID(descendChildPageID)
+			// bt.unlockPageID(descendChildPageID)
 			bt.unlockPageID(pID)
+			descendChildPage.Lock()
 			return bt.insertNonFull(descendChildNode, descendChildPage, key, value, incrementSize, txnID) // Recursive call unpins
 		} else {
 			// Child has space. Unpin current parent node before descending.
@@ -984,9 +988,9 @@ func (bt *BTree[K, V]) insertNonFull(node *Node[K, V], page *pagemanager.Page, k
 			}
 			// Recurse into the child
 
-			childPage.Unlock()
+			// childPage.Unlock()
 			page.Unlock()
-			bt.unlockPageID(chID)
+			// bt.unlockPageID(chID)
 			bt.unlockPageID(pID)
 			return bt.insertNonFull(childNode, childPage, key, value, incrementSize, txnID) // Recursive call unpins
 		}
