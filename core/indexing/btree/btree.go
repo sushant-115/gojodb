@@ -514,13 +514,13 @@ func (bt *BTree[K, V]) Search(key K) (V, bool, error) {
 	if err != nil {
 		return zeroV, false, fmt.Errorf("failed to fetch root node for search: %w", err)
 	}
+	bt.rLockPageID(rootNode.pageID)
 	rootPage.RLock()
 	// Call the recursive search function
 	val, found, searchErr := bt.searchRecursive(rootNode, rootPage, key)
 	// The recursive search function is responsible for unpinning pages on both success and error paths.
 	if searchErr != nil {
 		// log.Printf("ERROR: Recursive search failed: %v", searchErr)
-		rootPage.Unlock()
 		return zeroV, false, searchErr
 	}
 	return val, found, nil
@@ -530,7 +530,6 @@ func (bt *BTree[K, V]) Search(key K) (V, bool, error) {
 // It takes ownership of currNode and currPage, unpinning currPage before returning.
 func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *pagemanager.Page, key K) (V, bool, error) {
 	var zeroV V
-
 	// Find the index where the key *could* be or where it should be if not found
 	idx, foundKeyInCurrNode := slices.BinarySearchFunc(currNode.keys, key, bt.keyOrder)
 
@@ -541,6 +540,8 @@ func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *pagemanag
 		if unpinErr != nil {
 			// log.Printf("WARNING: Error unpinning page %d after successful search: %v", currPage.GetPageID(), unpinErr)
 		}
+		currPage.RUnlock()
+		bt.rUnlockPageID(currNode.pageID)
 		return val, true, unpinErr
 	}
 
@@ -550,6 +551,8 @@ func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *pagemanag
 		if unpinErr != nil {
 			// log.Printf("WARNING: Error unpinning page %d after failed search (leaf): %v", currPage.GetPageID(), unpinErr)
 		}
+		currPage.RUnlock()
+		bt.rUnlockPageID(currNode.pageID)
 		return zeroV, false, unpinErr
 	}
 
@@ -569,21 +572,27 @@ func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *pagemanag
 	childNode, childPage, fetchErr := bt.fetchNode(childPageIDToSearch)
 	if fetchErr != nil {
 		// log.Printf("ERROR: Failed to fetch child page %d during search from parent %d: %v", childPageIDToSearch, currNode.GetPageID(), fetchErr)
+		currPage.RUnlock()
+		bt.rUnlockPageID(currNode.pageID)
 		return zeroV, false, fetchErr
 	}
-
+	// childPage.RLock()
 	// Recursively call search on the child node. The recursive call will handle unpinning childPage.
+	bt.rLockPageID(childNode.pageID)
+	childPage.RLock()
+	currPage.RUnlock()
+	bt.rUnlockPageID(currNode.pageID)
 	return bt.searchRecursive(childNode, childPage, key)
 }
 
 func (bt *BTree[K, V]) lockPageID(pageID pagemanager.PageID) {
 	commonutils.PrintCaller("lockingpage", uint64(pageID), 2)
 	if mu, ok := bt.pagesLocked.Load(pageID); ok {
-		m := mu.(*sync.Mutex)
+		m := mu.(*sync.RWMutex)
 		m.Lock()
 		commonutils.PrintCaller("lockedfoundpage", uint64(pageID), 2)
 	} else {
-		m := &sync.Mutex{}
+		m := &sync.RWMutex{}
 		bt.pagesLocked.Store(pageID, m)
 		m.Lock()
 		commonutils.PrintCaller("lockednewpage", uint64(pageID), 2)
@@ -593,11 +602,36 @@ func (bt *BTree[K, V]) lockPageID(pageID pagemanager.PageID) {
 func (bt *BTree[K, V]) unlockPageID(pageID pagemanager.PageID) {
 	commonutils.PrintCaller("unlockingkpage", uint64(pageID), 2)
 	if mu, ok := bt.pagesLocked.Load(pageID); ok {
-		m := mu.(*sync.Mutex)
+		m := mu.(*sync.RWMutex)
 		m.Unlock()
 		commonutils.PrintCaller("unlockedkpage", uint64(pageID), 2)
 	} else {
 		commonutils.PrintCaller("didnotunlock", uint64(pageID), 2)
+	}
+}
+
+func (bt *BTree[K, V]) rLockPageID(pageID pagemanager.PageID) {
+	commonutils.PrintCaller("lockingpage", uint64(pageID), 2)
+	if mu, ok := bt.pagesLocked.Load(pageID); ok {
+		m := mu.(*sync.RWMutex)
+		m.RLock()
+		commonutils.PrintCaller("rlockedfoundpage", uint64(pageID), 2)
+	} else {
+		m := &sync.RWMutex{}
+		bt.pagesLocked.Store(pageID, m)
+		m.RLock()
+		commonutils.PrintCaller("rlockednewpage", uint64(pageID), 2)
+	}
+}
+
+func (bt *BTree[K, V]) rUnlockPageID(pageID pagemanager.PageID) {
+	commonutils.PrintCaller("runlockingkpage", uint64(pageID), 2)
+	if mu, ok := bt.pagesLocked.Load(pageID); ok {
+		m := mu.(*sync.RWMutex)
+		m.RUnlock()
+		commonutils.PrintCaller("runlockedkpage", uint64(pageID), 2)
+	} else {
+		commonutils.PrintCaller("didnotrunlock", uint64(pageID), 2)
 	}
 }
 

@@ -39,7 +39,7 @@ func main() {
 	)
 	write(dbInstance)
 
-	//read(dbInstance)
+	read(dbInstance)
 }
 
 func read(dbInstance *btree.BTree[string, string]) {
@@ -89,19 +89,19 @@ func write(dbInstance *btree.BTree[string, string]) {
 			if err != nil {
 				log.Println("1000011000 Write Error: ", err)
 			}
-			v, found, err := dbInstance.Search(key)
-			if err != nil {
-				log.Println("1000011000 Search Error: ", err)
-				return
-			}
-			if !found {
-				log.Println("1000011000 NOT FOUND: ", key)
-				return
-			}
-			if v != value {
-				log.Println("1000011000 MISMATCH: ", key)
-				return
-			}
+			// v, found, err := dbInstance.Search(key)
+			// if err != nil {
+			// 	log.Println("1000011000 Search Error: ", err)
+			// 	return
+			// }
+			// if !found {
+			// 	log.Println("1000011000 NOT FOUND: ", key)
+			// 	return
+			// }
+			// if v != value {
+			// 	log.Println("1000011000 MISMATCH: ", key)
+			// 	return
+			// }
 		}()
 	}
 	wg.Wait()
