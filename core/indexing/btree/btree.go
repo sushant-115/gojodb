@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync" // For sync.RWMutex and sync.Map
 	"sync/atomic"
+	"time"
 
 	"github.com/sushant-115/gojodb/core/indexing"
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
@@ -17,6 +18,7 @@ import (
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	commonutils "github.com/sushant-115/gojodb/internal/common_utils"
+	"github.com/sushant-115/gojodb/pkg/lru"
 	"go.uber.org/zap"
 )
 
@@ -133,6 +135,7 @@ type BTree[K any, V any] struct {
 	pagesLocked            sync.Map
 	dbSize                 atomic.Uint64
 	dbSizeLock             sync.Mutex
+	lru                    *lru.Cache[string, []byte]
 	// --- END NEW ---
 }
 
@@ -174,6 +177,13 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 	bt := &BTree[K, V]{
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
 		kvSerializer: kvSerializer, bpm: bpm, diskManager: dm, logManager: logManager, logger: logger,
+		lru: lru.New[string, []byte](1024,
+			lru.WithDefaultTTL[string, []byte](0), // no default TTL
+			lru.WithOnEvict[string, []byte](func(k string, v []byte, reason lru.EvictReason) {
+				fmt.Printf("evicted %q reason=%s\n", k, reason)
+			}),
+			lru.WithJanitor[string, []byte](time.Minute), // optional background expiry sweeper
+		),
 		// --- NEW: Initialize 2PC Participant State ---
 		// transactionTable: make(map[uint64]*Transaction),
 		// keyLocks:         make(map[string]uint64),
@@ -509,6 +519,11 @@ func (bt *BTree[K, V]) Search(key K) (V, bool, error) {
 		log.Println("DEBUG: Search on empty or uninitialized B-tree.")
 		return zeroV, false, nil
 	}
+	k, _ := bt.kvSerializer.SerializeKey(key)
+	if val, found := bt.lru.Get(string(k)); found {
+		v, _ := bt.kvSerializer.DeserializeValue(val)
+		return v, true, nil
+	}
 	// Fetch the root node to start the search
 	rootNode, rootPage, err := bt.fetchNode(bt.rootPageID)
 	if err != nil {
@@ -682,7 +697,13 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		// rootPg.Unlock()
 		// TODO: WAL Log creation of new root page with TxnID
 		bt.lock.Unlock()
-		return bt.insertNonFull(rootNode, rootPg, key, value, !exists, txnID) // insertNonFull unpins rootPg
+		err = bt.insertNonFull(rootNode, rootPg, key, value, !exists, txnID) // insertNonFull unpins rootPg
+		if err == nil {
+			k, _ := bt.kvSerializer.SerializeKey(key)
+			v, _ := bt.kvSerializer.SerializeValue(value)
+			bt.lru.Set(string(k), v)
+		}
+		return err
 	}
 
 	// lock root pageID
@@ -790,13 +811,25 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		bt.lock.Unlock()
 		bt.lockPageID(reloadedNewRootNode.pageID)
 		reloadedNewRootPage.Lock()
-		return bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists, txnID) // Recursive call unpins
+		err = bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists, txnID) // Recursive call unpins
+		if err == nil {
+			k, _ := bt.kvSerializer.SerializeKey(key)
+			v, _ := bt.kvSerializer.SerializeValue(value)
+			bt.lru.Set(string(k), v)
+		}
+		return err
 	} else {
 		// Root node is not full, just insert into it directly.
 		// rootPage.Unlock()
 		// bt.unlockPageID(rpID)
 		bt.lock.Unlock()
-		return bt.insertNonFull(rootNode, rootPage, key, value, !exists, txnID) // insertNonFull unpins rootPage
+		err = bt.insertNonFull(rootNode, rootPage, key, value, !exists, txnID) // insertNonFull unpins rootPage
+		if err == nil {
+			k, _ := bt.kvSerializer.SerializeKey(key)
+			v, _ := bt.kvSerializer.SerializeValue(value)
+			bt.lru.Set(string(k), v)
+		}
+		return err
 	}
 }
 
