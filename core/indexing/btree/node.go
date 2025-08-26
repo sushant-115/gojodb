@@ -22,7 +22,7 @@ import (
 // )
 
 // Node represents an in-memory B-tree node.
-type Node[K any, V any] struct {
+type Node[K comparable, V any] struct {
 	pageID       pagemanager.PageID
 	isLeaf       bool
 	keys         []K

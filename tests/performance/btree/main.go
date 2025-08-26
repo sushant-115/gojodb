@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -14,6 +17,9 @@ import (
 )
 
 func main() {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 	// Initialize B-tree Index
 	baseDataDir := "/tmp/gojodb"
 	dbPath := filepath.Join(baseDataDir, "btree.db")
@@ -75,7 +81,7 @@ func read(dbInstance *btree.BTree[string, string]) {
 
 func write(dbInstance *btree.BTree[string, string]) {
 	wg := sync.WaitGroup{}
-	maxWorkers := 10
+	maxWorkers := 5
 	sem := make(chan struct{}, maxWorkers)
 	for i := 9000; i < 11000; i++ {
 		sem <- struct{}{}
@@ -85,15 +91,21 @@ func write(dbInstance *btree.BTree[string, string]) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			then := time.Now()
 			err := dbInstance.Insert(key, value, 0)
 			if err != nil {
 				log.Println("1000011000 Write Error: ", err)
 			}
+			now := time.Now()
+			fmt.Println("Key: ", key, "Write time taken: ", now.Sub(then).Milliseconds())
+			thenr := time.Now()
 			v, found, err := dbInstance.Search(key)
 			if err != nil {
 				log.Println("1000011000 Search Error: ", err)
 				return
 			}
+			nowr := time.Now()
+			fmt.Println("Key: ", key, "Search time taken: ", nowr.Sub(thenr).Nanoseconds())
 			if !found {
 				log.Println("1000011000 NOT FOUND: ", key)
 				return

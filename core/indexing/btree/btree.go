@@ -116,7 +116,7 @@ type KeyValueSerializer[K any, V any] struct {
 	DeserializeValue func([]byte) (V, error)
 }
 
-type BTree[K any, V any] struct {
+type BTree[K comparable, V any] struct {
 	rootPageID   pagemanager.PageID
 	degree       int
 	keyOrder     Order[K]
@@ -135,12 +135,12 @@ type BTree[K any, V any] struct {
 	pagesLocked            sync.Map
 	dbSize                 atomic.Uint64
 	dbSizeLock             sync.Mutex
-	lru                    *lru.Cache[string, []byte]
+	lru                    *lru.Cache[K, V]
 	// --- END NEW ---
 }
 
 // NewBTreeFile creates a new database file and initializes a new B-tree within it.
-func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
+func NewBTreeFile[K comparable, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
 	if degree < 2 {
 		return nil, fmt.Errorf("%w: got %d", ErrInvalidDegree, degree)
 	}
@@ -177,12 +177,12 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 	bt := &BTree[K, V]{
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
 		kvSerializer: kvSerializer, bpm: bpm, diskManager: dm, logManager: logManager, logger: logger,
-		lru: lru.New[string, []byte](1024,
-			lru.WithDefaultTTL[string, []byte](0), // no default TTL
-			lru.WithOnEvict[string, []byte](func(k string, v []byte, reason lru.EvictReason) {
+		lru: lru.New[K, V](2000,
+			lru.WithDefaultTTL[K, V](0), // no default TTL
+			lru.WithOnEvict[K, V](func(k K, v V, reason lru.EvictReason) {
 				fmt.Printf("evicted %q reason=%s\n", k, reason)
 			}),
-			lru.WithJanitor[string, []byte](time.Minute), // optional background expiry sweeper
+			lru.WithJanitor[K, V](time.Minute), // optional background expiry sweeper
 		),
 		// --- NEW: Initialize 2PC Participant State ---
 		// transactionTable: make(map[uint64]*Transaction),
@@ -240,7 +240,7 @@ func NewBTreeFile[K any, V any](filePath string, degree int, keyOrder Order[K], 
 }
 
 // OpenBTreeFile opens an existing database file and initializes the B-tree from its header.
-func OpenBTreeFile[K any, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
+func OpenBTreeFile[K comparable, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
 	if keyOrder == nil {
 		return nil, ErrNilKeyOrder
 	}
@@ -519,10 +519,8 @@ func (bt *BTree[K, V]) Search(key K) (V, bool, error) {
 		log.Println("DEBUG: Search on empty or uninitialized B-tree.")
 		return zeroV, false, nil
 	}
-	k, _ := bt.kvSerializer.SerializeKey(key)
-	if val, found := bt.lru.Get(string(k)); found {
-		v, _ := bt.kvSerializer.DeserializeValue(val)
-		return v, true, nil
+	if val, found := bt.lru.Get(key); found {
+		return val, true, nil
 	}
 	// Fetch the root node to start the search
 	rootNode, rootPage, err := bt.fetchNode(bt.rootPageID)
@@ -572,6 +570,9 @@ func (bt *BTree[K, V]) searchRecursive(currNode *Node[K, V], currPage *pagemanag
 	}
 
 	// Key not found in current internal node, descend to the appropriate child
+	if idx >= len(currNode.childPageIDs) {
+		fmt.Println("IDX ", idx, len(currNode.childPageIDs), currNode.pageID)
+	}
 	childPageIDToSearch := currNode.childPageIDs[idx]
 
 	// Unpin the current parent page BEFORE fetching the child.
@@ -699,9 +700,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		bt.lock.Unlock()
 		err = bt.insertNonFull(rootNode, rootPg, key, value, !exists, txnID) // insertNonFull unpins rootPg
 		if err == nil {
-			k, _ := bt.kvSerializer.SerializeKey(key)
-			v, _ := bt.kvSerializer.SerializeValue(value)
-			bt.lru.Set(string(k), v)
+			bt.lru.Set(key, value)
 		}
 		return err
 	}
@@ -813,9 +812,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		reloadedNewRootPage.Lock()
 		err = bt.insertNonFull(reloadedNewRootNode, reloadedNewRootPage, key, value, !exists, txnID) // Recursive call unpins
 		if err == nil {
-			k, _ := bt.kvSerializer.SerializeKey(key)
-			v, _ := bt.kvSerializer.SerializeValue(value)
-			bt.lru.Set(string(k), v)
+			bt.lru.Set(key, value)
 		}
 		return err
 	} else {
@@ -825,9 +822,7 @@ func (bt *BTree[K, V]) Insert(key K, value V, txnID uint64) error {
 		bt.lock.Unlock()
 		err = bt.insertNonFull(rootNode, rootPage, key, value, !exists, txnID) // insertNonFull unpins rootPage
 		if err == nil {
-			k, _ := bt.kvSerializer.SerializeKey(key)
-			v, _ := bt.kvSerializer.SerializeValue(value)
-			bt.lru.Set(string(k), v)
+			bt.lru.Set(key, value)
 		}
 		return err
 	}
@@ -2236,14 +2231,14 @@ type BTreeIterator[K any, V any] interface {
 }
 
 // pathEntry represents a node and the index of the child taken to reach the next level.
-type pathEntry[K any, V any] struct {
+type pathEntry[K comparable, V any] struct {
 	node *Node[K, V]
 	page *pagemanager.Page // Pinned and latched page for this node
 	idx  int               // Index of the child that was followed to get to the next level
 }
 
 // bTreeIterator is the concrete implementation of BTreeIterator.
-type bTreeIterator[K, V any] struct {
+type bTreeIterator[K comparable, V any] struct {
 	tree              *BTree[K, V]
 	currentNode       *Node[K, V]       // The current leaf node being iterated
 	currentPage       *pagemanager.Page // The page object for currentNode (pinned and latched)
