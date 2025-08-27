@@ -30,7 +30,7 @@ func main() {
 		log.Fatalf("failed to create main log manager: %w", err)
 	}
 	dbInstance, err := btree.NewBTreeFile[string, string](
-		dbPath, 3,
+		dbPath, 64,
 		btree.DefaultKeyOrder[string],
 		btree.KeyValueSerializer[string, string]{
 			SerializeKey:     btree.SerializeString,
@@ -81,7 +81,7 @@ func read(dbInstance *btree.BTree[string, string]) {
 
 func write(dbInstance *btree.BTree[string, string]) {
 	wg := sync.WaitGroup{}
-	maxWorkers := 5
+	maxWorkers := 20
 	sem := make(chan struct{}, maxWorkers)
 	for i := 9000; i < 11000; i++ {
 		sem <- struct{}{}

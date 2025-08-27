@@ -203,7 +203,7 @@ func initStorageNode() error {
 	// Initialize B-tree Index
 	dbPath := filepath.Join(baseDataDir, "btree.db")
 	dbInstance, err = btree.NewBTreeFile[string, string](
-		dbPath, 3,
+		dbPath, 32,
 		btree.DefaultKeyOrder[string],
 		btree.KeyValueSerializer[string, string]{
 			SerializeKey:     btree.SerializeString,
