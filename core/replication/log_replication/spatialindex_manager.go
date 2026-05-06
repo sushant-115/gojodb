@@ -1,7 +1,9 @@
 package logreplication
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 
@@ -12,6 +14,198 @@ import (
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
 )
+
+// spatialLogPayload is the JSON-encoded body stored in LogRecord.Data for
+// spatial insert/delete WAL records.
+type spatialLogPayload struct {
+	MinX   float64 `json:"min_x"`
+	MinY   float64 `json:"min_y"`
+	MaxX   float64 `json:"max_x"`
+	MaxY   float64 `json:"max_y"`
+	DataID string  `json:"data_id"`
+}
+
+// SpatialReplicationManager handles replication for Spatial Indexes.
+type SpatialReplicationManager struct {
+	BaseReplicationManager
+	SpatialIndex *spatial.SpatialIndexManager // The actual Spatial Index manager instance
+}
+
+// NewSpatialReplicationManager creates a new SpatialReplicationManager.
+func NewSpatialReplicationManager(nodeID string, sim *spatial.SpatialIndexManager, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, clientCert *tls.Config) *SpatialReplicationManager {
+	return &SpatialReplicationManager{
+		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.SpatialIndexType, lm, logger, nodeDataDir, clientCert),
+		SpatialIndex:           sim,
+	}
+}
+
+// Start initiates the Spatial Index replication manager.
+func (srm *SpatialReplicationManager) Start() error {
+	srm.Logger.Info("SpatialReplicationManager starting")
+	return srm.StartBase()
+}
+
+// Stop gracefully shuts down the Spatial Index replication manager.
+func (srm *SpatialReplicationManager) Stop() error {
+	srm.Logger.Info("SpatialReplicationManager stopping")
+	srm.StopBase()
+	return nil
+}
+
+// ApplyLogRecord applies a Spatial Index specific log record to the local R-tree.
+func (srm *SpatialReplicationManager) ApplyLogRecord(lr wal.LogRecord) error {
+	srm.Logger.Debug("Applying Spatial Index log record", zap.Uint64("lsn", uint64(lr.LSN)), zap.Any("type", lr.Type))
+	if srm.SpatialIndex == nil {
+		return fmt.Errorf("SpatialIndex instance is nil in SpatialReplicationManager")
+	}
+
+	if len(lr.Data) == 0 {
+		// Nothing to apply (e.g., header or no-op record).
+		return nil
+	}
+
+	var payload spatialLogPayload
+	if err := json.Unmarshal(lr.Data, &payload); err != nil {
+		return fmt.Errorf("spatial ApplyLogRecord: decode payload at LSN %d: %w", lr.LSN, err)
+	}
+
+	rect := spatial.Rect{
+		MinX: payload.MinX,
+		MinY: payload.MinY,
+		MaxX: payload.MaxX,
+		MaxY: payload.MaxY,
+	}
+	data := spatial.SpatialData{ID: payload.DataID}
+
+	switch lr.Type {
+	case wal.LogTypeRTreeInsert, wal.LogTypeRTreeUpdate, wal.LogTypeRTreeNewRoot, wal.LogTypeRTreeSplit:
+		if err := srm.SpatialIndex.Insert(rect, data); err != nil {
+			return fmt.Errorf("spatial ApplyLogRecord: Insert at LSN %d: %w", lr.LSN, err)
+		}
+	case wal.LogTypeRTreeDelete:
+		if err := srm.SpatialIndex.Delete(rect, data); err != nil {
+			return fmt.Errorf("spatial ApplyLogRecord: Delete at LSN %d: %w", lr.LSN, err)
+		}
+	default:
+		srm.Logger.Warn("spatial ApplyLogRecord: unrecognised record type, skipping",
+			zap.Any("type", lr.Type), zap.Uint64("lsn", uint64(lr.LSN)))
+	}
+	return nil
+}
+
+// ApplyLogRecordCtx is the context-aware version used by the indexmanager interface.
+func (srm *SpatialReplicationManager) ApplyLogRecordCtx(_ context.Context, lr *wal.LogRecord) error {
+	return srm.ApplyLogRecord(*lr)
+}
+
+// HandleInboundStream processes an incoming replication stream from a primary for Spatial Index.
+func (srm *SpatialReplicationManager) HandleInboundStream(conn net.Conn) error {
+	srm.Logger.Info("Handling inbound Spatial Index replication stream", zap.String("from", conn.RemoteAddr().String()))
+	srm.wg.Add(1)
+	go srm.receiveAndApplyLogs(conn, srm.stopChan, &srm.wg, srm.ApplyLogRecord)
+	return nil
+}
+
+// BecomePrimaryForSlot: This node is now primary for the given slot for Spatial Index.
+func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replicas map[string]string) error {
+	srm.mu.Lock()
+	defer srm.mu.Unlock()
+	srm.Logger.Info("Becoming primary for Spatial Index slot", zap.Uint64("slotID", slotID), zap.Any("replicas", replicas))
+
+	if _, exists := srm.PrimarySlotReplicas[slotID]; !exists {
+		srm.PrimarySlotReplicas[slotID] = make(map[string]*ReplicaConnectionInfo)
+	}
+
+	for replicaNodeID, replicaAddress := range replicas {
+		if _, exists := srm.PrimarySlotReplicas[slotID][replicaNodeID]; exists && srm.PrimarySlotReplicas[slotID][replicaNodeID].IsActive {
+			continue // Already streaming
+		}
+		_, cert := certs.LoadCerts("/tmp")
+		cfg := events.Config{
+			Addr:    replicaAddress,
+			URLPath: "/events",
+			TLS:     cert,
+		}
+		eventSender, err := events.NewEventSender(cfg)
+		if err != nil {
+			srm.Logger.Error("Failed to create eventSender for ", zap.String("replicaAddr", replicaAddress))
+		}
+		srm.Logger.Info("Successfully connected to Spatial Index replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
+
+		connInfo := &ReplicaConnectionInfo{
+			NodeID:      replicaNodeID,
+			Address:     replicaAddress,
+			EventSender: eventSender,
+			StopChan:    make(chan struct{}),
+			IsActive:    true,
+			LastAckLSN:  0,
+		}
+		srm.PrimarySlotReplicas[slotID][replicaNodeID] = connInfo
+
+		srm.wg.Add(1)
+		go srm.streamLogs(connInfo, &srm.wg, replicaNodeID)
+	}
+	return nil
+}
+
+// CeasePrimaryForSlot: This node is no longer primary for the Spatial Index slot.
+func (srm *SpatialReplicationManager) CeasePrimaryForSlot(slotID uint64) error {
+	srm.mu.Lock()
+	defer srm.mu.Unlock()
+	srm.Logger.Info("Ceasing to be primary for Spatial Index slot", zap.Uint64("slotID", slotID))
+
+	if replicaConns, exists := srm.PrimarySlotReplicas[slotID]; exists {
+		for _, connInfo := range replicaConns {
+			if connInfo.IsActive {
+				close(connInfo.StopChan)
+				connInfo.IsActive = false
+			}
+		}
+		delete(srm.PrimarySlotReplicas, slotID)
+	}
+	return nil
+}
+
+// BecomeReplicaForSlot: This node is now a replica for the Spatial Index slot.
+func (srm *SpatialReplicationManager) BecomeReplicaForSlot(slotID uint64, primaryNodeID string, primaryAddress string) error {
+	srm.mu.Lock()
+	defer srm.mu.Unlock()
+	srm.Logger.Info("Becoming replica for Spatial Index slot", zap.Uint64("slotID", slotID), zap.String("primaryNodeID", primaryNodeID), zap.String("primaryAddress", primaryAddress))
+
+	if connInfo, exists := srm.ReplicaSlotPrimaries[slotID]; exists && connInfo.IsActive {
+		if connInfo.NodeID == primaryNodeID && connInfo.Address == primaryAddress {
+			return nil // Already connected
+		}
+		close(connInfo.StopChan)
+		connInfo.IsActive = false
+	}
+
+	placeholderConnInfo := &ReplicaConnectionInfo{
+		NodeID:   primaryNodeID,
+		Address:  primaryAddress,
+		StopChan: make(chan struct{}),
+		IsActive: false,
+	}
+	srm.ReplicaSlotPrimaries[slotID] = placeholderConnInfo
+	srm.Logger.Info("Configured as replica for Spatial Index slot, waiting for primary.", zap.Uint64("slotID", slotID))
+	return nil
+}
+
+// CeaseReplicaForSlot: This node is no longer a replica for the Spatial Index slot.
+func (srm *SpatialReplicationManager) CeaseReplicaForSlot(slotID uint64) error {
+	srm.mu.Lock()
+	defer srm.mu.Unlock()
+	srm.Logger.Info("Ceasing to be replica for Spatial Index slot", zap.Uint64("slotID", slotID))
+
+	if connInfo, exists := srm.ReplicaSlotPrimaries[slotID]; exists {
+		if connInfo.IsActive {
+			close(connInfo.StopChan)
+			connInfo.IsActive = false
+		}
+		delete(srm.ReplicaSlotPrimaries, slotID)
+	}
+	return nil
+}
 
 // SpatialReplicationManager handles replication for Spatial Indexes.
 type SpatialReplicationManager struct {
