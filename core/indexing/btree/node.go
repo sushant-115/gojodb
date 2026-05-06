@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync"
 
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 )
@@ -21,13 +22,14 @@ import (
 // )
 
 // Node represents an in-memory B-tree node.
-type Node[K any, V any] struct {
+type Node[K comparable, V any] struct {
 	pageID       pagemanager.PageID
 	isLeaf       bool
 	keys         []K
 	values       []V
 	childPageIDs []pagemanager.PageID
 	tree         *BTree[K, V] // Reference to the parent BTree for BPM/DiskManager access
+	mu           sync.Mutex
 }
 
 func (n *Node[K, V]) GetPageID() pagemanager.PageID {

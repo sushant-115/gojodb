@@ -7,8 +7,10 @@ import (
 	"sort" // Required by slices.BinarySearchFunc and slices.Insert in btree.go
 
 	// Import your btree package
+	"github.com/sushant-115/gojodb/core/indexing"
 	"github.com/sushant-115/gojodb/core/indexing/btree"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	"go.uber.org/zap"
 )
 
 // Helper function to create default serializers for int64 keys and string values
@@ -52,7 +54,9 @@ func main() {
 	fmt.Println("--- Starting B-Tree Persistence and WAL Test ---")
 
 	// 1. Initialize LogManager
-	logManager, err := wal.NewLogManager(logDir, archiveDir, 4096, segmentSizeLimit)
+	zapLogger, _ := zap.NewDevelopment()
+	_ = segmentSizeLimit // no longer used directly
+	logManager, err := wal.NewLogManager(logDir, zapLogger, indexing.BTreeIndexType)
 	if err != nil {
 		log.Fatalf("Failed to create LogManager: %v", err)
 	}
@@ -66,7 +70,7 @@ func main() {
 
 	// 2. Create a new B-tree database
 	fmt.Printf("\nAttempting to create a new B-tree at %s...\n", dbFilePath)
-	bt, err := btree.NewBTreeFile[string, string](dbFilePath, degree, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager)
+	bt, err := btree.NewBTreeFile[string, string](dbFilePath, degree, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager, zapLogger)
 	if err != nil {
 		log.Fatalf("Failed to create new B-tree file: %v", err)
 	}
@@ -160,7 +164,7 @@ func main() {
 
 	// 8. Re-open the database, triggering recovery via LogManager
 	fmt.Printf("\nAttempting to re-open B-tree at %s with recovery...\n", dbFilePath)
-	btRecovered, err := btree.OpenBTreeFile[string, string](dbFilePath, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager)
+	btRecovered, err := btree.OpenBTreeFile[string, string](dbFilePath, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager, zapLogger)
 	if err != nil {
 		log.Fatalf("Failed to open existing B-tree file for recovery: %v", err)
 	}

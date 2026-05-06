@@ -456,7 +456,7 @@ func (c *Controller) handleAdminAssignSlotRange(w http.ResponseWriter, r *http.R
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf("Slot %d assigned to primary %s with replicas %v", req.SlotID, req.PrimaryNodeID, req.ReplicaNodeIDs)))
+	w.Write([]byte(fmt.Sprintf("Slot %d assigned to primary %s with replicas %v \n", req.SlotID, req.PrimaryNodeID, req.ReplicaNodeIDs)))
 }
 
 // handleAdminGetAllSlotAssignments returns the current shard slot assignments.

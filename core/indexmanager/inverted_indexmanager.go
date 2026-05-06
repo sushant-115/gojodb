@@ -1,6 +1,7 @@
 package indexmanager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,12 @@ import (
 	"github.com/sushant-115/gojodb/core/indexing/inverted_index"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
+	internaltelemetry "github.com/sushant-115/gojodb/internal/telemetry"
+	"github.com/sushant-115/gojodb/pkg/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ===============================================
@@ -23,39 +30,49 @@ type InvertedIndexManager struct {
 	latestLSN uint64
 	// For snapshotting (in-memory dummy)
 	snapshotData map[string]map[string][]string // snapshotID -> map[term]list[docID]
+	tracer       trace.Tracer
+	metrics      *internaltelemetry.GrpcGatewayMetrics
+	serviceName  string
 }
 
-func NewInvertedIndexManager(index *inverted_index.InvertedIndex) *InvertedIndexManager {
+func NewInvertedIndexManager(index *inverted_index.InvertedIndex, tel *telemetry.Telemetry) *InvertedIndexManager {
+	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
+	if err != nil {
+		fmt.Printf("failed to create gRPC metrics: %w", err)
+	}
 	return &InvertedIndexManager{
 		index:        index,
 		snapshotData: make(map[string]map[string][]string),
+		tracer:       tel.Tracer,
+		metrics:      grpcMetrics,
+		serviceName:  "inverted_indexmanager",
 	}
 }
 
 func (m *InvertedIndexManager) Name() string { return "inverted" }
 
 // Put is not directly supported for InvertedIndexManager (use AddDocument).
-func (m *InvertedIndexManager) Put(key string, value []byte) error {
+func (m *InvertedIndexManager) Put(ctx context.Context, key string, value []byte) error {
 	return fmt.Errorf("Put not supported on InvertedIndexManager; use AddDocument")
 }
 
 // Get is not directly supported for InvertedIndexManager.
-func (m *InvertedIndexManager) Get(key string) ([]byte, bool) {
+func (m *InvertedIndexManager) Get(ctx context.Context, key string) ([]byte, bool) {
 	return nil, false // Inverted index doesn't store direct key-value
 }
 
 // Delete is not directly supported for InvertedIndexManager (needs doc ID).
-func (m *InvertedIndexManager) Delete(key string) error {
+func (m *InvertedIndexManager) Delete(ctx context.Context, key string) error {
 	// Assuming a DeleteDocument method exists
 	// return m.index.DeleteDocument(key)
 	return fmt.Errorf("Delete not supported on InvertedIndexManager; use DeleteDocument(docID)")
 }
 
-func (m *InvertedIndexManager) GetRange(startKey, endKey string, limit int32) ([]*pb.KeyValuePair, error) {
+func (m *InvertedIndexManager) GetRange(ctx context.Context, startKey, endKey string, limit int32) ([]*pb.KeyValuePair, error) {
 	return nil, fmt.Errorf("GetRange not supported on InvertedIndexManager")
 }
 
-func (m *InvertedIndexManager) TextSearch(query, indexName string, limit int32) ([]*pb.TextSearchResult, error) {
+func (m *InvertedIndexManager) TextSearch(ctx context.Context, query, indexName string, limit int32) ([]*pb.TextSearchResult, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	docIDs, err := m.index.Search(query)
@@ -69,7 +86,7 @@ func (m *InvertedIndexManager) TextSearch(query, indexName string, limit int32) 
 	return results, err
 }
 
-func (m *InvertedIndexManager) AddDocument(docID string, content string) error {
+func (m *InvertedIndexManager) AddDocument(ctx context.Context, docID string, content string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	err := m.index.Insert(content, docID)
@@ -80,17 +97,17 @@ func (m *InvertedIndexManager) AddDocument(docID string, content string) error {
 }
 
 // InsertSpatial is not applicable for inverted index.
-func (m *InvertedIndexManager) InsertSpatial(rect spatial.Rect, dataID string) error {
+func (m *InvertedIndexManager) InsertSpatial(ctx context.Context, rect spatial.Rect, dataID string) error {
 	return fmt.Errorf("InsertSpatial not supported on InvertedIndexManager")
 }
 
 // DeleteSpatial is not applicable for inverted index.
-func (m *InvertedIndexManager) DeleteSpatial(dataID string) error {
+func (m *InvertedIndexManager) DeleteSpatial(ctx context.Context, dataID string) error {
 	return fmt.Errorf("DeleteSpatial not supported on InvertedIndexManager")
 }
 
 // PrepareSnapshot for InvertedIndexManager (dummy in-memory serialization).
-func (m *InvertedIndexManager) PrepareSnapshot() (string, error) {
+func (m *InvertedIndexManager) PrepareSnapshot(ctx context.Context) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	// Assuming InvertedIndex has a method to get its internal state (e.g., term -> []docID mapping)
@@ -112,7 +129,7 @@ func (m *InvertedIndexManager) PrepareSnapshot() (string, error) {
 }
 
 // StreamSnapshot for InvertedIndexManager.
-func (m *InvertedIndexManager) StreamSnapshot(snapshotID string, chunkChan chan []byte) error {
+func (m *InvertedIndexManager) StreamSnapshot(ctx context.Context, snapshotID string, chunkChan chan []byte) error {
 	defer close(chunkChan)
 	m.mu.RLock()
 	indexState, ok := m.snapshotData[snapshotID]
@@ -146,7 +163,7 @@ func (m *InvertedIndexManager) StreamSnapshot(snapshotID string, chunkChan chan 
 }
 
 // ApplySnapshot for InvertedIndexManager.
-func (m *InvertedIndexManager) ApplySnapshot(snapshotID string, chunkChan <-chan []byte) error {
+func (m *InvertedIndexManager) ApplySnapshot(ctx context.Context, snapshotID string, chunkChan <-chan []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -176,7 +193,7 @@ func (m *InvertedIndexManager) GetLatestLSN() uint64 {
 }
 
 // ApplyLogRecord for InvertedIndexManager.
-func (m *InvertedIndexManager) ApplyLogRecord(entry *wal.LogRecord) error {
+func (m *InvertedIndexManager) ApplyLogRecord(ctx context.Context, entry *wal.LogRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if entry.LogType != wal.LogTypeInvertedIndex {
@@ -199,4 +216,58 @@ func (m *InvertedIndexManager) ApplyLogRecord(entry *wal.LogRecord) error {
 	default:
 		return fmt.Errorf("unsupported log entry type for InvertedIndexManager: %v", entry.Type)
 	}
+}
+
+// StartMetricsAndTrace begins the telemetry recording for a gRPC method.
+// It returns a new context, the trace span, and the start time.
+func (s *InvertedIndexManager) StartMetricsAndTrace(ctx context.Context, fullMethodName string) (context.Context, trace.Span, time.Time) {
+	startTime := time.Now()
+
+	// Increment active RPCs and started counter
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+	s.metrics.RpcsStartedCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Start a new trace span
+	ctx, span := s.tracer.Start(ctx, fullMethodName, trace.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	return ctx, span, startTime
+}
+
+// EndMetricsAndTrace completes the telemetry recording for a gRPC method.
+func (s *InvertedIndexManager) EndMetricsAndTrace(ctx context.Context, span trace.Span, startTime time.Time, fullMethodName string, statusCode otelcodes.Code) {
+	latency := time.Since(startTime).Milliseconds()
+
+	// Set span status based on the final gRPC code
+	if statusCode != otelcodes.Ok {
+		span.SetStatus(otelcodes.Error, statusCode.String())
+	} else {
+		span.SetStatus(otelcodes.Ok, "Success")
+	}
+	span.End()
+
+	// Decrement active RPCs
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, -1, metric.WithAttributes(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Define attributes for the completed RPC.
+	metricAttributes := attribute.NewSet(
+		attribute.String("grpc.service", s.serviceName),
+		attribute.String("grpc.method", fullMethodName),
+		attribute.String("grpc.code", statusCode.String()),
+	)
+
+	// Record latency and increment handled counter
+	s.metrics.RpcLatencyHistogram.Record(ctx, latency, metric.WithAttributeSet(metricAttributes))
+	s.metrics.RpcsHandledCounter.Add(ctx, 1, metric.WithAttributeSet(metricAttributes))
 }

@@ -15,9 +15,17 @@ networks:
     driver: bridge
 
 services:
+  # Jaeger
+  jaeger-all-in-one:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4317:4317"   # OTLP gRPC endpoint
+    networks:
+      - gojodb-net
+
   # --- GojoDB Storage Nodes ---
   # These are the core data storage and controller nodes.
-
   gojodb-server-1:
     image: gojodb-server
     build:
@@ -38,6 +46,7 @@ services:
     command:
       - "/app/app"
       - "--node_id=node-1"
+      - "--log_file=/tmp/node1"
       - "--grpc_addr=gojodb-server-1:8001"
       - "--raft_addr=gojodb-server-1:7001"
       - "--http_addr=gojodb-server-1:9001"
@@ -45,6 +54,7 @@ services:
       - "--heartbeat_addr=gojodb-server-1:8083"
       - "--controller_addr=gojodb-server-1:9001"
       - "--bootstrap"
+      - "--oltp_endpoint=jaeger-all-in-one:4317"
       # First node, so no --join argument
     healthcheck:
       test: ["CMD", "sh", "-c", "sleep 1"]
@@ -72,12 +82,14 @@ services:
     command:
       - "/app/app"
       - "--node_id=node-2"
+      - "--log_file=/tmp/node2"
       - "--grpc_addr=gojodb-server-2:8002"
       - "--raft_addr=gojodb-server-2:7002"
       - "--http_addr=gojodb-server-2:9002"
       - "--replication_addr=gojodb-server-2:6002"
       - "--heartbeat_addr=gojodb-server-2:8084"
       - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
+      - "--oltp_endpoint=jaeger-all-in-one:4317"
     depends_on:
       gojodb-server-1:
         condition: service_healthy
@@ -107,12 +119,14 @@ services:
     command:
       - "/app/app"
       - "--node_id=node-3"
+      - "--log_file=/tmp/node3"
       - "--grpc_addr=gojodb-server-3:8003"
       - "--raft_addr=gojodb-server-3:7003"
       - "--http_addr=gojodb-server-3:9003"
       - "--replication_addr=gojodb-server-3:6003"
       - "--heartbeat_addr=gojodb-server-3:8085"
       - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
+      - "--oltp_endpoint=jaeger-all-in-one:4317"
     depends_on:
       gojodb-server-1:
         condition: service_healthy
@@ -136,11 +150,12 @@ services:
       - gojodb-net
     ports:
       - "50051:50051" # Client-facing gRPC port
+      - "9112:9112"
     environment:
       # The gateway needs to know the gRPC addresses of all storage nodes.
       - CLUSTER_NODES=gojodb-server-1:8001,gojodb-server-2:8002,gojodb-server-3:8003
       - LISTEN_ADDR=:7000
-    command: ["/app/app", "--controller_addr=gojodb-server-1:9001"]
+    command: ["/app/app", "--controller_addr=gojodb-server-1:9001", "--oltp_endpoint=jaeger-all-in-one:4317"]
     depends_on:
       gojodb-server-1:
         condition: service_healthy

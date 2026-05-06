@@ -147,8 +147,11 @@ func (bpm *BufferPoolManager) getVictimFrameInternal() (int, error) {
 	for e := bpm.lruList.Back(); e != nil; e = e.Prev() {
 		frameIdx := e.Value.(int)
 		if bpm.pages[frameIdx].GetPinCount() == 0 {
-			bpm.logger.Debug("Found LRU victim", zap.Int("frame_id", frameIdx), zap.Uint64("page_id", uint64(bpm.pages[frameIdx].GetPageID())))
-			return frameIdx, nil
+			if bpm.pages[frameIdx].TryLock() {
+				bpm.pages[frameIdx].Unlock()
+				bpm.logger.Debug("Found LRU victim", zap.Int("frame_id", frameIdx), zap.Uint64("page_id", uint64(bpm.pages[frameIdx].GetPageID())))
+				return frameIdx, nil
+			}
 		}
 	}
 

@@ -16,6 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -24,6 +28,8 @@ import (
 	pb "github.com/sushant-115/gojodb/api/proto" // Assuming your proto package is named 'proto'
 	fsm "github.com/sushant-115/gojodb/core/replication/raft_consensus"
 	commonutils "github.com/sushant-115/gojodb/internal/common_utils"
+	internaltelemetry "github.com/sushant-115/gojodb/internal/telemetry"
+	"github.com/sushant-115/gojodb/pkg/telemetry"
 )
 
 const (
@@ -35,10 +41,13 @@ const (
 	ShardMapUpdateInterval = 5 * time.Second
 	// NumShardSlots defines the total number of hash slots for sharding.
 	NumShardSlots = 1024 // Must match fsm.NumShardSlots
+
+	serviceName = "gojodb_gateway"
 )
 
 var (
 	controllerAddr = flag.String("controller_addr", "127.0.0.1:8080", "Controller address for joining Raft cluster and fetching shard map")
+	oltpEndpoint   = flag.String("oltp_endpoint", "127.0.0.1:4317", "OLTP collector endpoint to send traces")
 )
 
 // GatewayService implements the gRPC GatewayService.
@@ -51,30 +60,30 @@ type GatewayService struct {
 	nodeConns                            sync.Map // Mao to store Pool of gRPC client connections to storage nodes
 	quit                                 chan struct{}
 	httpClient                           *http.Client // HTTP client for controller API calls
+	tracer                               trace.Tracer
+	metrics                              *internaltelemetry.GrpcGatewayMetrics
 }
 
 // NewGatewayService creates a new GatewayService instance.
-func NewGatewayService(controllerAddr string) *GatewayService {
+func NewGatewayService(controllerAddr string, tel *telemetry.Telemetry) (*GatewayService, error) {
+	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gRPC metrics: %w", err)
+	}
+
 	gs := &GatewayService{
 		controllerAddr: controllerAddr,
 		quit:           make(chan struct{}),
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
+		tracer:         tel.Tracer,
+		metrics:        grpcMetrics,
 	}
-
-	// Initialize gRPC connection pool for storage nodes
-	// gs.nodeConns = &sync.Pool{
-	// 	New: func() interface{} {
-	// 		// This function will be called when a new connection is needed in the pool.
-	// 		// The actual connection will be established dynamically when needed in getStorageNodeClient.
-	// 		return nil // Return nil, connection will be established on demand
-	// 	},
-	// }
 
 	// Start goroutine to monitor the controller cluster for shard map updates
 	go gs.monitorControllerCluster()
 
 	log.Printf("GojoDB Gateway Service initialized, controller address: %s", controllerAddr)
-	return gs
+	return gs, nil
 }
 
 // monitorControllerCluster periodically fetches the cluster status and shard assignments from the controller.
@@ -161,6 +170,28 @@ func (gs *GatewayService) monitorControllerCluster() {
 	}
 }
 
+// Unary interceptor
+func loggingInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply interface{},
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	log.Printf("👉 gRPC call: %s, req=%v", method, req)
+
+	// invoke the actual RPC
+	err := invoker(ctx, method, req, reply, cc, opts...)
+
+	if err != nil {
+		log.Printf("❌ gRPC error: %v", err)
+	} else {
+		log.Printf("✅ gRPC reply: %v", reply)
+	}
+	return err
+}
+
 // getStorageNodeClient gets a gRPC client connection for a given node ID.
 // It tries to reuse from the pool or creates a new one.
 func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn, error) {
@@ -191,7 +222,9 @@ func (gs *GatewayService) getStorageNodeClient(nodeID string) (*grpc.ClientConn,
 
 	// No valid connection in pool, create a new one
 	log.Printf("Establishing new gRPC connection to storage node %s at %s", nodeID, addr)
-	conn, err := grpc.NewClient(addr, grpc.WithInsecure()) // Use WithInsecure for now, but in production use mTLS
+	conn, err := grpc.NewClient(addr, grpc.WithInsecure(),
+		grpc.WithUnaryInterceptor(loggingInterceptor),
+	) // Use WithInsecure for now, but in production use mTLS
 	if err != nil {
 		pool.Put(nil) // Put nil back to signal it's unusable
 		return nil, fmt.Errorf("failed to dial storage node %s at %s: %v", nodeID, addr, err)
@@ -251,15 +284,22 @@ func (gs *GatewayService) resolveResponsibleNode(slotID uint32, isWrite bool) (s
 
 // Put routes a Put request to the primary storage node for the key's slot.
 func (gs *GatewayService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	metricCtx, span, startTime := gs.StartMetricsAndTrace(ctx, "Put")
+	var statusCode otelcodes.Code
+	defer func() {
+		gs.EndMetricsAndTrace(metricCtx, span, startTime, "Put", statusCode)
+	}()
 	slotID := fsm.GetSlotForHashKey(req.Key)
 	nodeID, err := gs.resolveResponsibleNode(uint32(slotID), true) // true for write
 	if err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Error resolving node for Put key %s: %v", req.Key, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Unavailable, "node resolution failed: %v", err)
 	}
 	log.Println("Node picked for PUT:", nodeID, slotID)
 	conn, err := gs.getStorageNodeClient(nodeID)
 	if err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Error getting client for node %s: %v", nodeID, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Unavailable, "failed to get storage client: %v", err)
 	}
@@ -268,23 +308,32 @@ func (gs *GatewayService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutR
 	client := pb.NewIndexedWriteServiceClient(conn)
 	putResp, err := client.Put(ctx, req)
 	if err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Error calling Put on node %s for key %s: %v", nodeID, req.Key, err)
 		return &pb.PutResponse{Success: false, Message: err.Error()}, status.Errorf(codes.Internal, "storage node error: %v", err)
 	}
+	statusCode = otelcodes.Ok
 	return putResp, nil
 }
 
 // Get routes a Get request to a primary or replica storage node for the key's slot.
 func (gs *GatewayService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	metricCtx, span, startTime := gs.StartMetricsAndTrace(ctx, "Get")
+	var statusCode otelcodes.Code
+	defer func() {
+		gs.EndMetricsAndTrace(metricCtx, span, startTime, "Get", statusCode)
+	}()
 	slotID := fsm.GetSlotForHashKey(req.Key)
 	nodeID, err := gs.resolveResponsibleNode(slotID, false) // false for read
 	if err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Error resolving node for Get key %s: %v", req.Key, err)
 		return &pb.GetResponse{Found: false, Value: nil}, status.Errorf(codes.Unavailable, "node resolution failed: %v", err)
 	}
 
 	conn, err := gs.getStorageNodeClient(nodeID)
 	if err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Error getting client for node %s: %v", nodeID, err)
 		return &pb.GetResponse{Found: false, Value: nil}, status.Errorf(codes.Unavailable, "failed to get storage client: %v", err)
 	}
@@ -293,9 +342,11 @@ func (gs *GatewayService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetR
 	client := pb.NewIndexedReadServiceClient(conn)
 	getResp, err := client.Get(ctx, req)
 	if err != nil {
+		statusCode = otelcodes.Error
 		log.Printf("Error calling Get on node %s for key %s: %v", nodeID, req.Key, err)
 		return &pb.GetResponse{Found: false, Value: nil}, status.Errorf(codes.Internal, "storage node error: %v", err)
 	}
+	statusCode = otelcodes.Ok
 	return getResp, nil
 }
 
@@ -738,6 +789,10 @@ func (gs *GatewayService) GetClusterStatus(ctx context.Context, req *pb.GetClust
 
 // GetShardMap retrieves the current shard map from the gateway's cache.
 func (gs *GatewayService) GetShardMap(ctx context.Context, req *pb.GetShardMapRequest) (*pb.GetShardMapResponse, error) {
+	metricCtx, span, startTime := gs.StartMetricsAndTrace(ctx, "GetShardMap")
+	defer func() {
+		gs.EndMetricsAndTrace(metricCtx, span, startTime, "GetShardMap", otelcodes.Ok)
+	}()
 	resp := &pb.GetShardMapResponse{}
 	gs.slotAssignments.Range(func(key, val any) bool {
 		assign := val.(*fsm.SlotAssignment)
@@ -753,6 +808,60 @@ func (gs *GatewayService) GetShardMap(ctx context.Context, req *pb.GetShardMapRe
 	return resp, nil
 }
 
+// StartMetricsAndTrace begins the telemetry recording for a gRPC method.
+// It returns a new context, the trace span, and the start time.
+func (s *GatewayService) StartMetricsAndTrace(ctx context.Context, fullMethodName string) (context.Context, trace.Span, time.Time) {
+	startTime := time.Now()
+
+	// Increment active RPCs and started counter
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+	s.metrics.RpcsStartedCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Start a new trace span
+	ctx, span := s.tracer.Start(ctx, fullMethodName, trace.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	return ctx, span, startTime
+}
+
+// EndMetricsAndTrace completes the telemetry recording for a gRPC method.
+func (s *GatewayService) EndMetricsAndTrace(ctx context.Context, span trace.Span, startTime time.Time, fullMethodName string, statusCode otelcodes.Code) {
+	latency := time.Since(startTime).Milliseconds()
+
+	// Set span status based on the final gRPC code
+	if statusCode != otelcodes.Ok {
+		span.SetStatus(otelcodes.Error, statusCode.String())
+	} else {
+		span.SetStatus(otelcodes.Ok, "Success")
+	}
+	span.End()
+
+	// Decrement active RPCs
+	s.metrics.ActiveRpcsUpDownCounter.Add(ctx, -1, metric.WithAttributes(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+	))
+
+	// Define attributes for the completed RPC.
+	metricAttributes := attribute.NewSet(
+		attribute.String("grpc.service", serviceName),
+		attribute.String("grpc.method", fullMethodName),
+		attribute.String("grpc.code", statusCode.String()),
+	)
+
+	// Record latency and increment handled counter
+	s.metrics.RpcLatencyHistogram.Record(ctx, latency, metric.WithAttributeSet(metricAttributes))
+	s.metrics.RpcsHandledCounter.Add(ctx, 1, metric.WithAttributeSet(metricAttributes))
+}
+
 // Main function to start the gateway service.
 func main() {
 	flag.Parse()
@@ -761,9 +870,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
-
+	log.Println("OLTP endpoint: ", *oltpEndpoint)
+	tel, shutdown, err := telemetry.New(telemetry.Config{
+		Enabled:        true,
+		ServiceName:    "gojodb_gateway",
+		PrometheusPort: 9112,
+		OtlpEndpoint:   *oltpEndpoint,
+	})
+	if err != nil {
+		log.Fatal("Couldn't create telemetry. Error: ", err)
+	}
+	defer shutdown(context.Background())
 	s := grpc.NewServer()
-	gatewayService := NewGatewayService(*controllerAddr)
+	gatewayService, err := NewGatewayService(*controllerAddr, tel)
+	if err != nil {
+		log.Fatal("Couldn't create gateway. Error: ", err)
+	}
 	pb.RegisterGatewayServiceServer(s, gatewayService)
 
 	log.Printf("GojoDB Gateway server listening at %v", lis.Addr())

@@ -1,7 +1,9 @@
 package logreplication
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 
@@ -13,6 +15,16 @@ import (
 	"go.uber.org/zap"
 )
 
+// spatialLogPayload is the JSON-encoded body stored in LogRecord.Data for
+// spatial insert/delete WAL records.
+type spatialLogPayload struct {
+	MinX   float64 `json:"min_x"`
+	MinY   float64 `json:"min_y"`
+	MaxX   float64 `json:"max_x"`
+	MaxY   float64 `json:"max_y"`
+	DataID string  `json:"data_id"`
+}
+
 // SpatialReplicationManager handles replication for Spatial Indexes.
 type SpatialReplicationManager struct {
 	BaseReplicationManager
@@ -21,8 +33,6 @@ type SpatialReplicationManager struct {
 
 // NewSpatialReplicationManager creates a new SpatialReplicationManager.
 func NewSpatialReplicationManager(nodeID string, sim *spatial.SpatialIndexManager, lm *wal.LogManager, logger *zap.Logger, nodeDataDir string, clientCert *tls.Config) *SpatialReplicationManager {
-	// NOTE: spatial.IndexManager does not currently have GetLogManager() or an obvious LogManager field.
-	// We are passing the 'lm' parameter, assuming it's the correct one or spatial.IndexManager will be adapted.
 	return &SpatialReplicationManager{
 		BaseReplicationManager: NewBaseReplicationManager(nodeID, indexing.SpatialIndexType, lm, logger, nodeDataDir, clientCert),
 		SpatialIndex:           sim,
@@ -42,28 +52,50 @@ func (srm *SpatialReplicationManager) Stop() error {
 	return nil
 }
 
-// ApplyLogRecord applies a Spatial Index specific log record.
+// ApplyLogRecord applies a Spatial Index specific log record to the local R-tree.
 func (srm *SpatialReplicationManager) ApplyLogRecord(lr wal.LogRecord) error {
 	srm.Logger.Debug("Applying Spatial Index log record", zap.Uint64("lsn", uint64(lr.LSN)), zap.Any("type", lr.Type))
 	if srm.SpatialIndex == nil {
 		return fmt.Errorf("SpatialIndex instance is nil in SpatialReplicationManager")
 	}
 
-	// TODO: Implement spatial index log application.
-	// The spatial.IndexManager needs a method like ApplyReplicationLog(lr wal.LogRecord)
-	// or similar mechanism to apply changes from a log record.
-	// Example:
-	// if lr.LogType != wal.LogTypeSpatialIndex { // Assuming a LogTypeSpatialIndex exists
-	//     srm.Logger.Warn("Received log record not for Spatial Index", zap.Any("log_record_type", lr.LogType))
-	//	   return fmt.Errorf("log record type %s not applicable for spatial index", lr.LogType)
-	// }
-	// err := srm.SpatialIndex.ApplyReplicationLog(lr) // Hypothetical method
-	// if err != nil {
-	//    srm.Logger.Error("Failed to apply Spatial Index log record", zap.Error(err), zap.Uint64("lsn", uint64(lr.LSN)))
-	//	  return err
-	// }
-	srm.Logger.Warn("ApplyLogRecord for Spatial Index is a placeholder and needs actual implementation.", zap.Any("logRecord", lr))
-	return fmt.Errorf("ApplyLogRecord for Spatial Index not yet implemented")
+	if len(lr.Data) == 0 {
+		// Nothing to apply (e.g., header or no-op record).
+		return nil
+	}
+
+	var payload spatialLogPayload
+	if err := json.Unmarshal(lr.Data, &payload); err != nil {
+		return fmt.Errorf("spatial ApplyLogRecord: decode payload at LSN %d: %w", lr.LSN, err)
+	}
+
+	rect := spatial.Rect{
+		MinX: payload.MinX,
+		MinY: payload.MinY,
+		MaxX: payload.MaxX,
+		MaxY: payload.MaxY,
+	}
+	data := spatial.SpatialData{ID: payload.DataID}
+
+	switch lr.Type {
+	case wal.LogTypeRTreeInsert, wal.LogTypeRTreeUpdate, wal.LogTypeRTreeNewRoot, wal.LogTypeRTreeSplit:
+		if err := srm.SpatialIndex.Insert(rect, data); err != nil {
+			return fmt.Errorf("spatial ApplyLogRecord: Insert at LSN %d: %w", lr.LSN, err)
+		}
+	case wal.LogTypeRTreeDelete:
+		if err := srm.SpatialIndex.Delete(rect, data); err != nil {
+			return fmt.Errorf("spatial ApplyLogRecord: Delete at LSN %d: %w", lr.LSN, err)
+		}
+	default:
+		srm.Logger.Warn("spatial ApplyLogRecord: unrecognised record type, skipping",
+			zap.Any("type", lr.Type), zap.Uint64("lsn", uint64(lr.LSN)))
+	}
+	return nil
+}
+
+// ApplyLogRecordCtx is the context-aware version used by the indexmanager interface.
+func (srm *SpatialReplicationManager) ApplyLogRecordCtx(_ context.Context, lr *wal.LogRecord) error {
+	return srm.ApplyLogRecord(*lr)
 }
 
 // HandleInboundStream processes an incoming replication stream from a primary for Spatial Index.
@@ -98,16 +130,6 @@ func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replic
 		if err != nil {
 			srm.Logger.Error("Failed to create eventSender for ", zap.String("replicaAddr", replicaAddress))
 		}
-		// conn, err := net.DialTimeout("tcp", replicaAddress, 5*time.Second)
-		// if err != nil {
-		// 	srm.Logger.Error("Failed to connect to Spatial Index replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-		// 	continue
-		// }
-		// if err := srm.sendHandshake(conn); err != nil {
-		// 	srm.Logger.Error("Failed to send handshake to Spatial replica", zap.Error(err), zap.String("replicaNodeID", replicaNodeID))
-		// 	conn.Close()
-		// 	continue
-		// }
 		srm.Logger.Info("Successfully connected to Spatial Index replica", zap.String("replicaNodeID", replicaNodeID), zap.String("address", replicaAddress))
 
 		connInfo := &ReplicaConnectionInfo{
@@ -116,7 +138,7 @@ func (srm *SpatialReplicationManager) BecomePrimaryForSlot(slotID uint64, replic
 			EventSender: eventSender,
 			StopChan:    make(chan struct{}),
 			IsActive:    true,
-			LastAckLSN:  0, // TODO: Fetch initial LSN
+			LastAckLSN:  0,
 		}
 		srm.PrimarySlotReplicas[slotID][replicaNodeID] = connInfo
 
