@@ -16,8 +16,8 @@ import (
 	"strings"
 
 	pb "github.com/sushant-115/gojodb/api/proto"
-	"github.com/sushant-115/gojodb/core/indexmanager"
 	"github.com/sushant-115/gojodb/core/indexing/spatial"
+	"github.com/sushant-115/gojodb/core/indexmanager"
 	"github.com/sushant-115/gojodb/core/query_engine/optimizer"
 	"github.com/sushant-115/gojodb/core/query_engine/parser"
 )
@@ -142,7 +142,7 @@ func (e *Executor) execInvertedScan(ctx context.Context, plan *optimizer.Plan) (
 	}
 	rows := make([]Row, 0, len(results))
 	for _, r := range results {
-		rows = append(rows, Row{Key: r.DocId, Value: r.Snippet})
+		rows = append(rows, Row{Key: r.Key, Value: fmt.Sprintf("%f", r.Score)})
 	}
 	return rows, 0, nil
 }
@@ -162,7 +162,7 @@ func (e *Executor) execSpatialScan(ctx context.Context, plan *optimizer.Plan) ([
 	}
 	rows := make([]Row, 0, len(results))
 	for _, r := range results {
-		rows = append(rows, Row{Key: r.DocId, Value: r.Snippet})
+		rows = append(rows, Row{Key: r.Key, Value: fmt.Sprintf("%f", r.Score)})
 	}
 	return applyLimit(rows, plan.Limit), 0, nil
 }

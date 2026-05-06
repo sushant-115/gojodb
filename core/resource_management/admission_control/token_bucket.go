@@ -138,4 +138,3 @@ func (c *Controller) Stats(tenantID string) (tokens float64, burst float64) {
 	defer b.mu.Unlock()
 	return b.tokens, b.burst
 }
-

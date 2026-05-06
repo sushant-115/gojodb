@@ -34,7 +34,7 @@ type txnEntry struct {
 }
 
 type participantState struct {
-	p       Participant
+	p        Participant
 	prepared bool // phase-1 vote received
 }
 
@@ -408,9 +408,9 @@ func (m *Manager) undoOperation(ctx context.Context, txnID uint64, op undoRecord
 	// Build a compensating (CLR) log record and apply it.
 	payload, _ := json.Marshal(op)
 	clr := &wal.LogRecord{
-		Type:   wal.LogRecordTypeAbortTxn,
-		TxnID:  txnID,
-		Data:   payload,
+		Type:  wal.LogRecordTypeAbortTxn,
+		TxnID: txnID,
+		Data:  payload,
 	}
 	for _, p := range m.allParticipants {
 		_ = p.ApplyLogRecord(ctx, clr)

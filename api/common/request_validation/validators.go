@@ -86,21 +86,21 @@ func ValidateBulkPutRequest(r *pb.BulkPutRequest) error {
 	if r == nil {
 		return status.Error(codes.InvalidArgument, "request must not be nil")
 	}
-	if len(r.Pairs) == 0 {
-		return status.Error(codes.InvalidArgument, "pairs must not be empty")
+	if len(r.Entries) == 0 {
+		return status.Error(codes.InvalidArgument, "entries must not be empty")
 	}
-	if len(r.Pairs) > maxBulkItems {
-		return status.Errorf(codes.InvalidArgument, "bulk size %d exceeds maximum %d", len(r.Pairs), maxBulkItems)
+	if len(r.Entries) > maxBulkItems {
+		return status.Errorf(codes.InvalidArgument, "bulk size %d exceeds maximum %d", len(r.Entries), maxBulkItems)
 	}
-	for i, p := range r.Pairs {
+	for i, p := range r.Entries {
 		if len(p.Key) == 0 {
-			return status.Errorf(codes.InvalidArgument, "pair[%d]: key must not be empty", i)
+			return status.Errorf(codes.InvalidArgument, "entry[%d]: key must not be empty", i)
 		}
 		if len(p.Key) > maxKeyLength {
-			return status.Errorf(codes.InvalidArgument, "pair[%d]: key length exceeds maximum", i)
+			return status.Errorf(codes.InvalidArgument, "entry[%d]: key length exceeds maximum", i)
 		}
 		if len(p.Value) > maxValueLength {
-			return status.Errorf(codes.InvalidArgument, "pair[%d]: value length exceeds maximum", i)
+			return status.Errorf(codes.InvalidArgument, "entry[%d]: value length exceeds maximum", i)
 		}
 	}
 	return nil
