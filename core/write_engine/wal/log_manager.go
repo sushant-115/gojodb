@@ -372,11 +372,17 @@ func (l *LogManager) GetCurrentLSN() LSN {
 
 func (lm *LogManager) runPruningLoop() {
 	defer lm.wg.Done()
-	// Prune shortly after startup and then periodically
-	time.Sleep(1 * time.Minute)
+	// Initial delay before first prune — interruptible by shutdown.
+	initialDelay := time.NewTimer(1 * time.Minute)
+	defer initialDelay.Stop()
+	select {
+	case <-initialDelay.C:
+	case <-lm.shutdownCh:
+		return
+	}
+	lm.pruneOldSegments()
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	lm.pruneOldSegments()
 	for {
 		select {
 		case <-ticker.C:
@@ -898,12 +904,20 @@ func (lm *LogManager) findFirstLSNInSegment(segmentPath string) (LSN, error) {
 
 func (lm *LogManager) openNewSegment(segmentID uint64) error {
 	segmentPath := filepath.Join(lm.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segmentID, walFileSuffix))
-	f, err := os.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0640) // Use 0640 permissions
+	f, err := os.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0640)
 	if err != nil {
 		return fmt.Errorf("failed to create new WAL segment %s: %w", segmentPath, err)
 	}
 	lm.currentSegmentFile = f
 	lm.currentSegmentID = segmentID
+
+	// Register this segment's starting LSN so readers can locate it.
+	// The first record written here will have LSN = currentLSN + 1.
+	startLSN := lm.currentLSN + 1
+	lm.segmentMetaMtx.Lock()
+	lm.segmentStartLSNs[int(segmentID)] = startLSN
+	lm.segmentMetaMtx.Unlock()
+
 	lm.logger.Info("Opened new WAL segment", zap.String("path", segmentPath), zap.Uint64("segmentID", lm.currentSegmentID))
 	return nil
 }
@@ -930,6 +944,11 @@ func (lm *LogManager) AppendRecord(ctx context.Context, lr *LogRecord, logType L
 	req := commitRequest{
 		record: lr,
 		err:    errChan,
+	}
+
+	// Reject immediately if the context is already cancelled.
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 
 	// Send the request to the log writer's queue, respecting context cancellation.

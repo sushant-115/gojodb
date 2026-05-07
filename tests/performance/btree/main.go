@@ -27,7 +27,7 @@ func main() {
 	zlogger, _ := logger.New(logger.Config{Level: "error"})
 	logManager, err := wal.NewLogManager(walPath, zlogger, indexing.BTreeIndexType)
 	if err != nil {
-		log.Fatalf("failed to create main log manager: %w", err)
+		log.Fatalf("failed to create main log manager: %v", err)
 	}
 	dbInstance, err := btree.NewBTreeFile[string, string](
 		dbPath, 3,

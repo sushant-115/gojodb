@@ -39,7 +39,7 @@ type IndexedWriteService struct {
 func NewIndexedWriteService(nodeID string, slotID uint32, indexManagers map[string]indexmanager.IndexManager, tel *telemetry.Telemetry) *IndexedWriteService {
 	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
 	if err != nil {
-		log.Printf("failed to create gRPC metrics: %w", err)
+		log.Printf("failed to create gRPC metrics: %v", err)
 	}
 	idx := &IndexedWriteService{
 		nodeID: nodeID,
@@ -129,7 +129,7 @@ func (s *IndexedWriteService) Delete(ctx context.Context, req *pb.DeleteRequest)
 	btreeIdx, ok := s.indexManagers.Load("btree")
 	if !ok {
 		statusCode = otelcodes.Error
-		return &pb.DeleteResponse{Success: false, Message: ""}, status.Errorf(codes.Internal, "put failed (btree): %v")
+		return &pb.DeleteResponse{Success: false, Message: ""}, status.Errorf(codes.Internal, "put failed (btree): index not found")
 	}
 	btreeIndex := btreeIdx.(indexmanager.IndexManager)
 	if err := btreeIndex.Delete(metricCtx, req.Key); err != nil {

@@ -181,7 +181,7 @@ func NewBTreeFile[K comparable, V any](filePath string, degree int, keyOrder Ord
 		lru: lru.New[K, V](lruSize,
 			lru.WithDefaultTTL[K, V](0), // no default TTL
 			lru.WithOnEvict[K, V](func(k K, v V, reason lru.EvictReason) {
-				logger.Debug("lru eviction", zap.Any("key", k), zap.String("reason", string(reason)))
+				logger.Debug("lru eviction", zap.Any("key", k), zap.Int("reason", int(reason)))
 			}),
 			lru.WithJanitor[K, V](time.Minute), // optional background expiry sweeper
 		),
@@ -282,7 +282,7 @@ func OpenBTreeFile[K comparable, V any](filePath string, keyOrder Order[K], kvSe
 		lru: lru.New[K, V](lruSize,
 			lru.WithDefaultTTL[K, V](0),
 			lru.WithOnEvict[K, V](func(k K, v V, reason lru.EvictReason) {
-				logger.Debug("lru eviction", zap.Any("key", k), zap.String("reason", string(reason)))
+				logger.Debug("lru eviction", zap.Any("key", k), zap.Int("reason", int(reason)))
 			}),
 			lru.WithJanitor[K, V](time.Minute),
 		),
@@ -317,7 +317,7 @@ func OpenBTreeFile[K comparable, V any](filePath string, keyOrder Order[K], kvSe
 		// CRITICAL FIX: Update BTree's in-memory state from the re-read header
 		bt.rootPageID = header.RootPageID
 		bt.degree = int(header.Degree)
-		// If TreeSize was a field in BTree, you'd update it here too: bt.treeSize = header.TreeSize
+		bt.dbSize.Store(header.TreeSize)
 	}
 	// --- END CRITICAL FIX ---
 
@@ -453,12 +453,9 @@ func (bt *BTree[K, V]) WritePage(pageID pagemanager.PageID, pageData []byte) err
 
 // GetSize reads the persisted tree size from the file header.
 func (bt *BTree[K, V]) GetSize() (uint64, error) {
-	var header flushmanager.DBFileHeader
-	// Read header directly, ensures latest size from disk
-	if err := bt.diskManager.ReadHeader(&header); err != nil {
-		return 0, fmt.Errorf("failed to read tree size from header: %w", err)
-	}
-	return header.TreeSize, nil
+	// Return the in-memory counter; it is authoritative during a live session.
+	// FlushSizeToDisk() persists it to the header on checkpoint/close.
+	return bt.dbSize.Load(), nil
 }
 
 // FlushSizeToDisk persists the final in-memory TreeSize to the database file header.
@@ -1240,8 +1237,10 @@ func (bt *BTree[K, V]) Delete(key K, txnID uint64) error {
 		// log.Printf("WARNING: Error unpinning root page %d after deletion check: %v", currentRootPage.GetPageID(), unpinErr)
 	}
 
-	// If a key was successfully deleted from the tree structure, update the persisted size.
+	// If a key was successfully deleted from the tree structure, update the persisted size
+	// and invalidate the LRU read cache so subsequent Search calls go to disk.
 	if wasDeleted {
+		bt.lru.Delete(key)
 		if err := bt.updateInMemorySize(-1); err != nil {
 			// log.Printf("ERROR: Failed to update tree size after deletion: %v", err)
 		}
@@ -1352,9 +1351,14 @@ func (bt *BTree[K, V]) deleteRecursive(node *Node[K, V], nodePage *pagemanager.P
 			// Recurse into the child
 			return bt.deleteRecursive(childNode, childPage, key, txnID) // Recursive call unpins child
 		}
-		// After the recursive call, unpin the parent page (`nodePage`).
-		// It might have been dirtied by `ensureChildHasEnoughKeys` or a subsequent write.
-		if e := bt.bpm.UnpinPage(nodePage.GetPageID(), nodePage.IsDirty()); e != nil && err == nil {
+		// The parent was modified by ensureChildHasEnoughKeys (borrow or merge).
+		// Serialize the updated in-memory node back to the page buffer before unpinning,
+		// so that subsequent fetches read the current structure, not stale bytes.
+		if errS := node.serialize(nodePage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
+			bt.bpm.UnpinPage(nodePage.GetPageID(), false)
+			return false, fmt.Errorf("failed to serialize parent node %d after deletion: %w", node.pageID, errS)
+		}
+		if e := bt.bpm.UnpinPage(nodePage.GetPageID(), true); e != nil && err == nil {
 			err = fmt.Errorf("failed to unpin parent page %d after recursive deletion: %w", nodePage.GetPageID(), e)
 		}
 	}
@@ -1418,6 +1422,9 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *pagema
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin parent on error
 			return false, fmt.Errorf("failed to delete recursive. isKeyDelete: %v. Error: %w", keyActuallyRemoved, err)
 		}
+		// The original key was replaced by the predecessor and the predecessor was removed —
+		// the deletion of the original key is complete.
+		actuallyDeleted = keyActuallyRemoved
 
 		// Parent `node` was modified (key/value replaced). Serialize and unpin it.
 		if errS := node.serialize(nodePage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
@@ -1451,12 +1458,16 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *pagema
 		}
 
 		// Recursively delete the successor from the right child's subtree.
-		_, err = bt.deleteRecursive(reFetchedRightChildNode, reFetchedRightChildPage, succKey, txnID)
+		var succRemoved bool
+		succRemoved, err = bt.deleteRecursive(reFetchedRightChildNode, reFetchedRightChildPage, succKey, txnID)
 		// `deleteRecursive` will serialize and unpin `reFetchedRightChildPage`.
 		if err != nil {
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false) // Unpin parent on error
 			return false, err
 		}
+		// The original key was replaced by the successor and the successor was removed —
+		// the deletion of the original key is complete.
+		actuallyDeleted = succRemoved
 
 		// Parent `node` was modified. Serialize and unpin it.
 		if errS := node.serialize(nodePage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
@@ -1480,36 +1491,32 @@ func (bt *BTree[K, V]) deleteFromInternalNode(node *Node[K, V], nodePage *pagema
 		// 4. Serializing `leftChildNode` and marking `nodePage` dirty.
 		// 5. Unpinning `leftChildPage` and `rightChildPage`.
 		// 6. Deallocating `rightChildPageID`.
+		// Release the pre-fetched pages before mergeChildrenAndKey re-fetches them internally.
+		// Without this, the pin count of left/right children would be 2 inside the merge,
+		// and they'd remain pinned (count=1) after the merge completes — causing stale references.
+		bt.bpm.UnpinPage(leftChildPage.GetPageID(), false)
+		bt.bpm.UnpinPage(rightChildPage.GetPageID(), false)
+		leftChildPage = nil
+		rightChildPage = nil
+
+		// mergeChildrenAndKey handles the full merge + deletion of key from the merged child.
+		// It also updates parentNode (node) in memory and serializes the merged left child.
+		// After it returns: nodePage is marked dirty but NOT unpinned or serialized.
 		err = bt.mergeChildrenAndKey(node, nodePage, idxInNode, nil, nil, nil, nil, key, txnID)
 		if err != nil {
-			// If merge fails, some pages might still be pinned. Attempt to unpin for clean exit.
-			bt.bpm.UnpinPage(leftChildPage.GetPageID(), false)
-			bt.bpm.UnpinPage(rightChildPage.GetPageID(), false)
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false)
 			return false, fmt.Errorf("failed to merge children %d and %d for key %v: %w", leftChildPageID, rightChildPageID, key, err)
 		}
-		// At this point, `nodePage` is marked dirty by `mergeChildrenAndKey`, but not unpinned.
-		// `leftChildPage` and `rightChildPage` are unpinned by `mergeChildrenAndKey`.
+		// mergeChildrenAndKey deleted the key — treat as successful.
+		actuallyDeleted = true
 
-		// The `key` that was originally in `node` (and now in the merged `leftChildNode`)
-		// needs to be recursively deleted from the merged child.
-		reFetchedLeftChildNode, reFetchedLeftChildPage, reFetchErr := bt.fetchNode(leftChildPageID) // Merged child is pinned
-		if reFetchErr != nil {
-			bt.bpm.UnpinPage(nodePage.GetPageID(), true) // Parent was dirtied by merge
-			return false, fmt.Errorf("failed to re-fetch merged child %d: %w", leftChildPageID, reFetchErr)
-		}
-		actuallyDeleted, err := bt.deleteRecursive(reFetchedLeftChildNode, reFetchedLeftChildPage, key, txnID)
-		// `deleteRecursive` will serialize and unpin `reFetchedLeftChildPage`.
-		log.Println("Actually Deleted", actuallyDeleted)
-		// Finally, unpin the parent node's page.
+		// Serialize the updated parent node and unpin its page.
 		if errS := node.serialize(nodePage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
 			bt.bpm.UnpinPage(nodePage.GetPageID(), false)
 			return false, fmt.Errorf("failed to serialize parent node %d after merge: %w", node.pageID, errS)
 		}
 		if e := bt.bpm.UnpinPage(nodePage.GetPageID(), true); e != nil && err == nil {
-			err = e // Propagate unpin error if no other error occurred
-			log.Println("DiskManager: Failed to unpinpage. Error: ", err)
-
+			err = e
 		}
 	}
 	return actuallyDeleted, err
@@ -1656,21 +1663,16 @@ func (bt *BTree[K, V]) ensureChildHasEnoughKeys(parentNode *Node[K, V], parentPa
 	// If neither sibling can lend, we must merge.
 	// Unpin the child page first, as it will be merged into another or be the target of a merge.
 	if errUnpin := bt.bpm.UnpinPage(childPage.GetPageID(), false); errUnpin != nil {
-		// log.Printf("WARNING: Error unpinning child page %d before merge: %v", childPage.GetPageID(), errUnpin)
 		// Continue
 	}
 
-	// log.Printf("DEBUG: Txn %d: Neither sibling can lend for child %d. Performing merge.", txnID, childNode.pageID)
 	// Decide which sibling to merge with (prefer left if possible, else right).
-	if childIdx > 0 { // Merge child with left sibling
-		// `mergeChildrenAndKey` expects `leftMergeChildIdx` to be the index of the LEFT child of the merge pair.
-		// So, merge `parentNode.childPageIDs[childIdx-1]` (left sibling) and `parentNode.childPageIDs[childIdx]` (current child).
-		// The key `parentNode.keys[childIdx-1]` will come down from the parent.
-		return bt.mergeChildrenAndKey(parentNode, parentPage, childIdx-1, nil, nil, nil, nil, parentNode.keys[childIdx-1], txnID)
-	} else { // Merge child with right sibling (current child is `childIdx=0`)
-		// Merge `parentNode.childPageIDs[childIdx]` (current child) and `parentNode.childPageIDs[childIdx+1]` (right sibling).
-		// The key `parentNode.keys[childIdx]` will come down from the parent.
-		return bt.mergeChildrenAndKey(parentNode, parentPage, childIdx, nil, nil, nil, nil, parentNode.keys[childIdx], txnID)
+	// Use mergeChildrenOnly — the separator key descends but is NOT deleted here;
+	// the caller (deleteRecursive) will continue the deletion after this returns.
+	if childIdx > 0 { // Merge current child with its left sibling
+		return bt.mergeChildrenOnly(parentNode, parentPage, childIdx-1, txnID)
+	} else { // Merge current child (idx=0) with its right sibling
+		return bt.mergeChildrenOnly(parentNode, parentPage, childIdx, txnID)
 	}
 }
 
@@ -1802,92 +1804,82 @@ func (bt *BTree[K, V]) borrowFromRightSibling(
 	return firstErr
 }
 
-// mergeChildrenAndKey merges the right child (`parentNode.childPageIDs[leftMergeChildIdx+1]`)
-// into the left child (`parentNode.childPageIDs[leftMergeChildIdx]`),
-// and also moves the key (`parentNode.keys[leftMergeChildIdx]`) from the parent down.
-// It handles fetching all involved pages, performing modifications, serializing, unpinning,
-// and deallocating the right child's page. It marks `parentPage` dirty but *does not unpin* it.
-// The `originalKeyToDelete` is the key that was found in the parent, now moved down, and needs
-// to be recursively deleted from the merged child.
-func (bt *BTree[K, V]) mergeChildrenAndKey(
-	parentNode *Node[K, V], parentPage *pagemanager.Page, leftMergeChildIdx int,
-	// Hints for left/right nodes/pages; they will be fetched if nil.
-	// For clarity and directness, this function will always fetch them.
-	_leftNodeHint *Node[K, V], _leftPageHint *pagemanager.Page,
-	_rightNodeHint *Node[K, V], _rightPageHint *pagemanager.Page,
-	originalKeyToDelete K, // The key that was in parentNode and now needs to be deleted from the merged child
-	txnID uint64) error {
-
-	// log.Printf("DEBUG: Txn %d: Initiating merge operation for parent %d, left child index %d, key to delete: %v", txnID, parentNode.pageID, leftMergeChildIdx, originalKeyToDelete)
-
-	// 1. Fetch left child
+// mergeChildrenOnly merges the right child into the left child and moves the separator key
+// from the parent down — but does NOT delete any key from the merged child afterward.
+// Used by ensureChildHasEnoughKeys where the caller continues the deletion separately.
+// Marks parentPage dirty but does not unpin it. Unpins and serializes both child pages.
+func (bt *BTree[K, V]) mergeChildrenOnly(parentNode *Node[K, V], parentPage *pagemanager.Page, leftMergeChildIdx int, txnID uint64) error {
 	leftChildPageID := parentNode.childPageIDs[leftMergeChildIdx]
-	leftChildNode, leftChildPage, err := bt.fetchNode(leftChildPageID) // Left child is pinned
+	leftChildNode, leftChildPage, err := bt.fetchNode(leftChildPageID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch left child %d for merge: %w", leftChildPageID, err)
 	}
 
-	// 2. Fetch right child
 	rightChildPageID := parentNode.childPageIDs[leftMergeChildIdx+1]
-	rightChildNode, rightChildPage, err := bt.fetchNode(rightChildPageID) // Right child is pinned
+	rightChildNode, rightChildPage, err := bt.fetchNode(rightChildPageID)
 	if err != nil {
-		bt.bpm.UnpinPage(leftChildPage.GetPageID(), false) // Unpin left child on error
+		bt.bpm.UnpinPage(leftChildPage.GetPageID(), false)
 		return fmt.Errorf("failed to fetch right child %d for merge: %w", rightChildPageID, err)
 	}
 
-	// The key and value from parent that will move down to the left child
-	keyFromParent := parentNode.keys[leftMergeChildIdx]
-	valueFromParent := parentNode.values[leftMergeChildIdx]
+	// Move separator key from parent down to left child.
+	leftChildNode.keys = append(leftChildNode.keys, parentNode.keys[leftMergeChildIdx])
+	leftChildNode.values = append(leftChildNode.values, parentNode.values[leftMergeChildIdx])
 
-	// TODO: WAL Log: merge operation, including deallocation of rightChildPageID with TxnID
-
-	// 3. Move key from parent down to leftChild.
-	leftChildNode.keys = append(leftChildNode.keys, keyFromParent)
-	leftChildNode.values = append(leftChildNode.values, valueFromParent)
-
-	// 4. Append keys, values, and children from rightChild to leftChild.
+	// Append right child's keys, values, and (if internal) child pointers.
 	leftChildNode.keys = append(leftChildNode.keys, rightChildNode.keys...)
 	leftChildNode.values = append(leftChildNode.values, rightChildNode.values...)
 	if !leftChildNode.isLeaf {
 		leftChildNode.childPageIDs = append(leftChildNode.childPageIDs, rightChildNode.childPageIDs...)
 	}
-	// log.Printf("DEBUG: Txn %d: Merged content into left child %d. New keys: %d, New children: %d",
-	// txnID, leftChildNode.pageID, len(leftChildNode.keys), len(leftChildNode.childPageIDs))
 
-	// 5. Remove the merged key/value from parent.
+	// Remove separator key and right-child pointer from parent.
 	parentNode.keys = slices.Delete(parentNode.keys, leftMergeChildIdx, leftMergeChildIdx+1)
 	parentNode.values = slices.Delete(parentNode.values, leftMergeChildIdx, leftMergeChildIdx+1)
-	// 6. Remove the rightChild pointer from parent.
 	parentNode.childPageIDs = slices.Delete(parentNode.childPageIDs, leftMergeChildIdx+1, leftMergeChildIdx+2)
-	// log.Printf("DEBUG: Txn %d: Updated parent %d after merge. New keys: %d, New children: %d",
-	// txnID, parentNode.pageID, len(parentNode.keys), len(parentNode.childPageIDs))
+	parentPage.SetDirty(true)
 
-	parentPage.SetDirty(true) // Parent node modified
-
-	// 7. Serialize the modified left child.
 	if errS := leftChildNode.serialize(leftChildPage, bt.kvSerializer.SerializeKey, bt.kvSerializer.SerializeValue); errS != nil {
-		bt.bpm.UnpinPage(leftChildPage.GetPageID(), false)  // Unpin left child on error
-		bt.bpm.UnpinPage(rightChildPage.GetPageID(), false) // Unpin right child on error
+		bt.bpm.UnpinPage(leftChildPage.GetPageID(), false)
+		bt.bpm.UnpinPage(rightChildPage.GetPageID(), false)
 		return fmt.Errorf("failed to serialize left child %d after merge: %w", leftChildPageID, errS)
 	}
 
-	// 8. Unpin right child's page (its content is now merged into leftChildPage).
-	if errU := bt.bpm.UnpinPage(rightChildPage.GetPageID(), false); errU != nil {
-		// log.Printf("WARNING: Error unpinning right child %d after merge: %v", rightChildPage.GetPageID(), errU)
-	}
+	// Unpin both child pages; right child is no longer used.
+	bt.bpm.UnpinPage(leftChildPage.GetPageID(), true)
+	bt.bpm.UnpinPage(rightChildPage.GetPageID(), false)
 
-	// 9. Deallocate the page of the now-merged right child.
-	// This is critical to reclaim disk space.
+	// Deallocate the now-redundant right child page.
 	if errDealloc := bt.diskManager.DeallocatePage(rightChildPageID); errDealloc != nil {
-		// log.Printf("ERROR: Failed to deallocate merged right child page %d: %v", rightChildPageID, errDealloc)
-		// This is a soft error, but indicates a resource leak if not handled.
+		// soft error: resource leak, but not fatal
+	}
+	return nil
+}
+
+// mergeChildrenAndKey merges the right child into the left child (via mergeChildrenOnly)
+// and then recursively deletes originalKeyToDelete from the merged child.
+// Used by deleteFromInternalNode (Case 2c) where the separator key IS the key being deleted.
+// Marks parentPage dirty but does not unpin it.
+func (bt *BTree[K, V]) mergeChildrenAndKey(
+	parentNode *Node[K, V], parentPage *pagemanager.Page, leftMergeChildIdx int,
+	_leftNodeHint *Node[K, V], _leftPageHint *pagemanager.Page,
+	_rightNodeHint *Node[K, V], _rightPageHint *pagemanager.Page,
+	originalKeyToDelete K,
+	txnID uint64) error {
+
+	leftChildPageID := parentNode.childPageIDs[leftMergeChildIdx]
+
+	if err := bt.mergeChildrenOnly(parentNode, parentPage, leftMergeChildIdx, txnID); err != nil {
+		return err
 	}
 
-	// 10. Recursively delete the `originalKeyToDelete` from the now-merged `leftChildNode`.
-	// `leftChildPage` is still pinned and dirty. The `deleteRecursive` call will handle its final unpinning.
-	// log.Printf("DEBUG: Txn %d: Recursively deleting original key %v from merged child %d.", txnID, originalKeyToDelete, leftChildNode.pageID)
+	// Re-fetch the merged left child and delete the key from it.
+	leftChildNode, leftChildPage, err := bt.fetchNode(leftChildPageID)
+	if err != nil {
+		return fmt.Errorf("failed to re-fetch merged child %d: %w", leftChildPageID, err)
+	}
 	_, errDel := bt.deleteRecursive(leftChildNode, leftChildPage, originalKeyToDelete, txnID)
-	return errDel // This error includes final unpinning of leftChildPage
+	return errDel
 }
 
 // --- NEW: 2PC Participant Methods ---
@@ -2247,16 +2239,22 @@ type pathEntry[K comparable, V any] struct {
 
 // bTreeIterator is the concrete implementation of BTreeIterator.
 type bTreeIterator[K comparable, V any] struct {
-	tree              *BTree[K, V]
-	currentNode       *Node[K, V]       // The current leaf node being iterated
-	currentPage       *pagemanager.Page // The page object for currentNode (pinned and latched)
-	currentKeyIdx     int               // Index of the current key in currentNode.keys
-	startKey          K
-	endKey            K
-	isExhausted       bool
-	initialSearchDone bool              // Flag to indicate if initial search to startKey is complete
-	pathStack         []pathEntry[K, V] // Stack to keep track of the path from root to current leaf
-	isFullScan        bool              // NEW: Flag to indicate if this is a full scan (unbounded)
+	tree          *BTree[K, V]
+	currentNode   *Node[K, V]       // The current leaf node being iterated
+	currentPage   *pagemanager.Page // The page object for currentNode (pinned and latched)
+	currentKeyIdx int               // Index of the current key in currentNode.keys
+	startKey      K
+	endKey        K
+	isExhausted   bool
+	// pendingKey/Value hold the separator key of the internal node traversed when
+	// moving from one leaf to the next. In a B-tree (not B+tree), separator keys
+	// in internal nodes ARE real data entries and must be emitted in order.
+	pendingKey    K
+	pendingValue  V
+	hasPending    bool
+	pathStack     []pathEntry[K, V] // internal-node path from root to current leaf (kept pinned)
+	isFullScan    bool
+	initialSearchDone bool // unused — kept for compatibility; always true after init
 }
 
 // Iterator returns a new BTreeIterator for the specified key range [startKey, endKey).
@@ -2276,7 +2274,7 @@ func (bt *BTree[K, V]) Iterator(startKey K, endKey K) (BTreeIterator[K, V], erro
 	}
 
 	// Find the first leaf page containing or preceding startKey and populate the path stack
-	node, page, err := bt.findLeafForIterator(bt.rootPageID, startKey, iter.pathStack)
+	node, page, err := bt.findLeafForIterator(bt.rootPageID, startKey, &iter.pathStack)
 	if err != nil {
 		iter.Close() // Ensure any pinned pages from failed search are unpinned
 		return nil, fmt.Errorf("failed to find starting leaf for iterator: %w", err)
@@ -2325,7 +2323,7 @@ func (bt *BTree[K, V]) FullScan() (BTreeIterator[K, V], error) {
 	}
 
 	// Find the absolute leftmost leaf to start the full scan
-	node, page, err := bt.findLeftmostLeaf(bt.rootPageID, iter.pathStack)
+	node, page, err := bt.findLeftmostLeaf(bt.rootPageID, &iter.pathStack)
 	if err != nil {
 		iter.Close() // Ensure any pinned pages from failed search are unpinned
 		return nil, fmt.Errorf("failed to find leftmost leaf for full scan: %w", err)
@@ -2340,40 +2338,29 @@ func (bt *BTree[K, V]) FullScan() (BTreeIterator[K, V], error) {
 }
 
 // findLeafForIterator recursively finds the leaf node where the iteration should start.
-// It uses read crabbing (S-latches) and populates the pathStack.
-func (bt *BTree[K, V]) findLeafForIterator(pageID pagemanager.PageID, key K, pathStack []pathEntry[K, V]) (*Node[K, V], *pagemanager.Page, error) {
-	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
+// Only internal nodes are pushed onto pathStack (kept pinned for later navigation).
+// The leaf itself is returned without being added to the stack — it is tracked via
+// iter.currentNode / iter.currentPage and unpinned by moveToNextLeaf or Close.
+func (bt *BTree[K, V]) findLeafForIterator(pageID pagemanager.PageID, key K, pathStack *[]pathEntry[K, V]) (*Node[K, V], *pagemanager.Page, error) {
+	currNode, currPage, err := bt.fetchNode(pageID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Add current node and its page to the path stack
-	// The index `idx` for this level will be determined in the recursive call.
-	// For now, push with a placeholder index. It will be updated by the caller.
-	pathStack = append(pathStack, pathEntry[K, V]{node: currNode, page: currPage, idx: -1})
-
 	if currNode.isLeaf {
-		return currNode, currPage, nil // Found the leaf
+		// Return the leaf without pushing it — caller tracks it via currentNode/currentPage.
+		return currNode, currPage, nil
 	}
 
-	// Find the child to descend into
+	// Internal node: find the child to descend into, record it in the stack (pinned).
 	idx, _ := slices.BinarySearchFunc(currNode.keys, key, bt.keyOrder)
 	childPageID := currNode.childPageIDs[idx]
 
-	// Update the index in the last path entry for the current node
-	pathStack[len(pathStack)-1].idx = idx
+	// Push BEFORE descending so the entry is visible if a later append reallocates the slice.
+	*pathStack = append(*pathStack, pathEntry[K, V]{node: currNode, page: currPage, idx: idx})
+	// Do NOT unpin currPage here — it remains pinned in the stack for navigation.
 
-	// Read crabbing: Acquire S-latch on child before releasing S-latch on parent
-	// The fetchNode for child will acquire S-latch on child.
-	// We then release the S-latch on currPage.
-	unpinErr := bt.bpm.UnpinPage(currPage.GetPageID(), false) // Unpin parent page
-	if unpinErr != nil {
-		// log.Printf("WARNING: Error unpinning page %d during iterator findLeaf: %v", currPage.GetPageID(), unpinErr)
-		// Proceed, but log the warning.
-	}
-
-	// Pass the updated pathStack to the recursive call
-	return bt.findLeafForIterator(childPageID, key, pathStack) // Recursive call
+	return bt.findLeafForIterator(childPageID, key, pathStack)
 }
 
 // Next returns the next key-value pair in the iteration.
@@ -2387,9 +2374,25 @@ func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
 	}
 
 	for {
+		// Emit the pending separator key before processing the next leaf's keys.
+		// In a B-tree, separator keys in internal nodes are real data entries emitted
+		// in sorted order between the keys of adjacent leaf nodes.
+		if iter.hasPending {
+			key := iter.pendingKey
+			value := iter.pendingValue
+			iter.hasPending = false
+
+			if iter.isFullScan || iter.tree.keyOrder(key, iter.endKey) <= 0 {
+				return key, value, true, nil
+			}
+			// Pending key > endKey: iteration complete.
+			iter.isExhausted = true
+			iter.Close()
+			return zeroK, zeroV, false, nil
+		}
+
 		// Check if current node is valid and has more keys to process
 		if iter.currentNode == nil {
-			// This can happen if moveToNextLeaf failed or was called when no more leaves exist
 			iter.isExhausted = true
 			iter.Close()
 			return zeroK, zeroV, false, nil
@@ -2402,45 +2405,31 @@ func (iter *bTreeIterator[K, V]) Next() (K, V, bool, error) {
 
 			// If it's a full scan, just return the key/value
 			if iter.isFullScan {
-				iter.currentKeyIdx++ // Advance for next call
+				iter.currentKeyIdx++
 				return key, value, true, nil
 			}
 
-			// For bounded scans, check if the current key is within the desired endKey range
-			// The condition is `key >= startKey` and `key < endKey`.
-			// `iter.tree.keyOrder(key, iter.endKey) < 0` means `key < endKey`.
-			// `iter.tree.keyOrder(key, iter.startKey) >= 0` means `key >= startKey`.
-			if iter.tree.keyOrder(key, iter.endKey) < 0 { // key < endKey
-				// If initial search is done, we only need to check against endKey.
-				// Otherwise, we need to ensure key is >= startKey.
-				if iter.initialSearchDone && iter.tree.keyOrder(key, iter.startKey) >= 0 {
-					iter.currentKeyIdx++ // Advance for next call
-					return key, value, true, nil
-				} else if !iter.initialSearchDone { // This branch should ideally not be hit if initial search is done correctly
-					// This means we are still in the process of finding the first valid key.
-					// If key is within range, advance and return.
-					if iter.tree.keyOrder(key, iter.startKey) >= 0 {
-						iter.currentKeyIdx++
-						return key, value, true, nil
-					}
-				}
-			} else {
-				// Reached or exceeded endKey. Exhaust the iterator.
-				iter.isExhausted = true
-				iter.Close()
-				return zeroK, zeroV, false, nil
+			// For bounded scans check [startKey, endKey] inclusive.
+			// currentKeyIdx was positioned at the first key >= startKey during init,
+			// so all subsequent keys in ascending order are already >= startKey.
+			if iter.tree.keyOrder(key, iter.endKey) <= 0 { // key <= endKey
+				iter.currentKeyIdx++
+				return key, value, true, nil
 			}
-			iter.currentKeyIdx++ // Move to the next key in the current node if the current one was skipped (e.g., < startKey)
+			// key > endKey: iteration complete.
+			iter.isExhausted = true
+			iter.Close()
+			return zeroK, zeroV, false, nil
 		}
 
-		// Current node exhausted, move to the next leaf node
+		// Current leaf exhausted, move to the next leaf node.
+		// moveToNextLeaf may set hasPending if a separator key must be emitted.
 		if err := iter.moveToNextLeaf(); err != nil {
 			iter.isExhausted = true
 			iter.Close()
 			return zeroK, zeroV, false, fmt.Errorf("failed to move to next leaf: %w", err)
 		}
 
-		// After moving to the next leaf, reset currentKeyIdx to 0 for the new leaf
 		iter.currentKeyIdx = 0
 	}
 }
@@ -2473,31 +2462,34 @@ func (iter *bTreeIterator[K, V]) moveToNextLeaf() error {
 
 		// Check if there's a next sibling child
 		if childIdx+1 < len(parentNode.childPageIDs) {
-			// Found a next sibling. Descend into it.
+			// In a B-tree (not B+tree), the separator key between childIdx and childIdx+1
+			// is a real data entry that must be emitted in sorted order.
+			// Record it as a pending key — Next() will emit it before the next leaf's keys.
+			iter.pendingKey = parentNode.keys[childIdx]
+			iter.pendingValue = parentNode.values[childIdx]
+			iter.hasPending = true
+
 			nextChildPageID := parentNode.childPageIDs[childIdx+1]
 
-			// Unpin the parent page (read crabbing) before fetching the next child
+			// Unpin the parent page before descending to the next child.
 			if err := iter.tree.bpm.UnpinPage(parentPage.GetPageID(), false); err != nil {
-				// log.Printf("WARNING: Error unpinning parent page %d before descending to next child: %v", parentPage.GetPageID(), err)
-				// Continue, but log
+				// Continue on unpin warning
 			}
 
 			// Find the leftmost leaf in the subtree rooted at nextChildPageID
-			newNode, newPage, err := iter.tree.findLeftmostLeaf(nextChildPageID, iter.pathStack)
+			newNode, newPage, err := iter.tree.findLeftmostLeaf(nextChildPageID, &iter.pathStack)
 			if err != nil {
 				return fmt.Errorf("failed to find leftmost leaf from child %d: %w", nextChildPageID, err)
 			}
 			iter.currentNode = newNode
 			iter.currentPage = newPage
-			iter.currentKeyIdx = 0 // Start from the beginning of the new leaf
-			return nil             // Successfully moved to next leaf
+			iter.currentKeyIdx = 0
+			return nil
 		} else {
-			// No more children at this level for the current parent.
-			// Unpin the parent page as we are done with it.
+			// No more children at this level; unpin and continue up.
 			if err := iter.tree.bpm.UnpinPage(parentPage.GetPageID(), false); err != nil {
-				// log.Printf("WARNING: Error unpinning parent page %d after exhausting children: %v", parentPage.GetPageID(), err)
+				// Continue on unpin warning
 			}
-			// Continue loop to go up to the next parent
 		}
 	}
 
@@ -2507,28 +2499,23 @@ func (iter *bTreeIterator[K, V]) moveToNextLeaf() error {
 }
 
 // findLeftmostLeaf recursively finds the leftmost leaf node in the subtree rooted at pageID.
-// It populates the pathStack as it descends.
-func (bt *BTree[K, V]) findLeftmostLeaf(pageID pagemanager.PageID, pathStack []pathEntry[K, V]) (*Node[K, V], *pagemanager.Page, error) {
-	currNode, currPage, err := bt.fetchNode(pageID) // Fetches and S-latches currPage
+// Only internal nodes are pushed onto pathStack (kept pinned for navigation).
+// The leaf is returned without being added to the stack.
+func (bt *BTree[K, V]) findLeftmostLeaf(pageID pagemanager.PageID, pathStack *[]pathEntry[K, V]) (*Node[K, V], *pagemanager.Page, error) {
+	currNode, currPage, err := bt.fetchNode(pageID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Add current node and its page to the path stack. Index is always 0 for leftmost descent.
-	pathStack = append(pathStack, pathEntry[K, V]{node: currNode, page: currPage, idx: 0})
-
 	if currNode.isLeaf {
-		return currNode, currPage, nil // Found the leftmost leaf
+		return currNode, currPage, nil
 	}
 
-	childPageID := currNode.childPageIDs[0] // Always take the leftmost child
+	childPageID := currNode.childPageIDs[0]
+	// Push internal node (pinned) before descending.
+	*pathStack = append(*pathStack, pathEntry[K, V]{node: currNode, page: currPage, idx: 0})
+	// Do NOT unpin here — page stays pinned in the stack.
 
-	// Read crabbing: Acquire S-latch on child before releasing S-latch on parent
-	if err := bt.bpm.UnpinPage(currPage.GetPageID(), false); err != nil {
-		// log.Printf("WARNING: Error unpinning page %d during findLeftmostLeaf: %v", currPage.GetPageID(), err)
-	}
-
-	// Recursive call
 	return bt.findLeftmostLeaf(childPageID, pathStack)
 }
 

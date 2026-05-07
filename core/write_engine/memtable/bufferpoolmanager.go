@@ -8,38 +8,68 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	flushmanager "github.com/sushant-115/gojodb/core/write_engine/flush_manager"
 	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
 	"github.com/sushant-115/gojodb/core/write_engine/wal"
 	"go.uber.org/zap"
-	// Added for time.Ticker
 )
 
 // BufferPoolManager manages in-memory pages (frames) and interacts with the DiskManager.
-// It implements a simple LRU (Least Recently Used) eviction policy.
+// It implements a sharded LRU eviction policy.
 //
-// The page table is sharded across numBPMShards buckets to reduce lock contention
-// for concurrent FetchPage / UnpinPage calls on different page IDs.
-// Each shard has its own mutex, page table map, and LRU structures.
-// A global eviction mutex (evictMu) serialises victim selection across shards.
+// Each shard owns a disjoint subset of frames, tracked in freeStack (unloaded) and lruList
+// (loaded, ordered least-to-most recently used). On a cache miss, claimFrame tries the
+// target shard first (only that shard's mutex required). The global evictMu is only acquired
+// when the target shard has no evictable frames and a cross-shard steal is needed.
 
 const numBPMShards = 16
 
 type bpmShard struct {
-	mu      sync.Mutex
-	pages   map[pagemanager.PageID]int // PageID → frame index
-	lruList *list.List
-	lruMap  map[int]*list.Element // frame index → list element
+	mu        sync.Mutex
+	pages     map[pagemanager.PageID]int // PageID → frame index
+	lruList   *list.List
+	lruMap    map[int]*list.Element // frame index → list element
+	freeStack []int                 // frames with no page loaded, available immediately
+}
+
+// victimFrame atomically claims an evictable frame from this shard.
+// It removes the frame from all shard structures so that no other goroutine can select it.
+// Returns (frameIdx, evictedPageID). Returns (-1, InvalidPageID) when the shard is fully pinned.
+// MUST be called with s.mu held.
+func (s *bpmShard) victimFrame(allPages []*pagemanager.Page) (int, pagemanager.PageID) {
+	// Free (unloaded) frames are the cheapest — no dirty flush or disk read needed.
+	if n := len(s.freeStack); n > 0 {
+		fi := s.freeStack[n-1]
+		s.freeStack = s.freeStack[:n-1]
+		return fi, pagemanager.InvalidPageID
+	}
+	// Walk the LRU from the least-recently-used end.
+	for e := s.lruList.Back(); e != nil; e = e.Prev() {
+		fi := e.Value.(int)
+		if allPages[fi].GetPinCount() == 0 {
+			pid := allPages[fi].GetPageID()
+			// Atomically remove the frame from all shard structures.
+			s.lruList.Remove(e)
+			delete(s.lruMap, fi)
+			if pid != pagemanager.InvalidPageID {
+				delete(s.pages, pid)
+			}
+			return fi, pid
+		}
+	}
+	return -1, pagemanager.InvalidPageID
 }
 
 type BufferPoolManager struct {
 	diskManager *flushmanager.DiskManager
-	logManager  *wal.LogManager // Changed from interface{} to *wal.LogManager
+	logManager  *wal.LogManager
 	poolSize    int
 	pages       []*pagemanager.Page // Page frames (indexed by frame ID)
 	shards      [numBPMShards]bpmShard
-	evictMu     sync.Mutex // Serialises victim selection across shards
+	evictMu     sync.Mutex    // held only during cross-shard steals
+	clockHand   atomic.Uint32 // round-robin starting shard for cross-shard victim search
 	pageSize    int
 	numPages    pagemanager.PageID
 	logType     wal.LogType
@@ -60,43 +90,97 @@ func (bpm *BufferPoolManager) SetNextPageID(pageID pagemanager.PageID) {
 }
 
 // NewBufferPoolManager creates and initializes a new BufferPoolManager.
+// Frames are distributed evenly across shards so that each shard can immediately
+// serve cache-miss requests from its own freeStack without touching evictMu.
 func NewBufferPoolManager(poolSize int, diskManager *flushmanager.DiskManager, logManager *wal.LogManager, logger *zap.Logger) *BufferPoolManager {
 	if diskManager == nil {
 		log.Fatal("NewBufferPoolManager: diskManager cannot be nil")
 	}
 	bpm := &BufferPoolManager{
 		diskManager: diskManager,
-		logManager:  logManager, // Now directly *wal.LogManager
+		logManager:  logManager,
 		poolSize:    poolSize,
 		pages:       make([]*pagemanager.Page, poolSize),
 		pageSize:    diskManager.GetPageSize(),
 		logger:      logger,
 	}
+	framesPerShard := poolSize / numBPMShards
 	for i := 0; i < numBPMShards; i++ {
+		base := i * framesPerShard
+		end := base + framesPerShard
+		if i == numBPMShards-1 {
+			end = poolSize // last shard absorbs any remainder
+		}
+		free := make([]int, 0, end-base)
+		for fi := base; fi < end; fi++ {
+			free = append(free, fi)
+		}
 		bpm.shards[i] = bpmShard{
-			pages:   make(map[pagemanager.PageID]int),
-			lruList: list.New(),
-			lruMap:  make(map[int]*list.Element),
+			pages:     make(map[pagemanager.PageID]int),
+			lruList:   list.New(),
+			lruMap:    make(map[int]*list.Element),
+			freeStack: free,
 		}
 	}
 	for i := 0; i < poolSize; i++ {
 		bpm.pages[i] = pagemanager.NewPage(pagemanager.InvalidPageID, bpm.pageSize)
 	}
-	bpm.logger.Info("INFO: BufferPoolManager initialized with pool size %d, page size %d", zap.Int("pool_size", poolSize), zap.Int("page_size", bpm.pageSize))
+	bpm.logger.Info("BufferPoolManager initialized", zap.Int("pool_size", poolSize), zap.Int("page_size", bpm.pageSize), zap.Int("shards", numBPMShards), zap.Int("frames_per_shard", framesPerShard))
 	return bpm
+}
+
+// claimFrame selects and atomically removes a frame from the buffer pool for use by the caller.
+// It tries the target shard first (no global lock needed). If the target shard has no evictable
+// frames, it acquires evictMu and steals from other shards in round-robin order.
+// The returned frame has already been removed from its previous shard's structures; on failure
+// the caller MUST return the frame to the target shard's freeStack.
+func (bpm *BufferPoolManager) claimFrame(targetShard int) (frameIdx int, evictedPageID pagemanager.PageID, err error) {
+	s := &bpm.shards[targetShard]
+
+	// Fast path: target shard has a free or evictable frame — no global lock.
+	s.mu.Lock()
+	fi, pid := s.victimFrame(bpm.pages)
+	s.mu.Unlock()
+	if fi >= 0 {
+		bpm.logger.Debug("Claimed frame from target shard", zap.Int("shard", targetShard), zap.Int("frame_id", fi), zap.Uint64("evicted_page", uint64(pid)))
+		return fi, pid, nil
+	}
+
+	// Slow path: target shard fully pinned — steal from another shard.
+	// Use a clock hand to avoid always hammering the same shard.
+	bpm.evictMu.Lock()
+	defer bpm.evictMu.Unlock()
+
+	start := int(bpm.clockHand.Add(1) % numBPMShards)
+	for i := 0; i < numBPMShards; i++ {
+		si := (start + i) % numBPMShards
+		if si == targetShard {
+			continue // already tried
+		}
+		os := &bpm.shards[si]
+		os.mu.Lock()
+		fi, pid = os.victimFrame(bpm.pages)
+		os.mu.Unlock()
+		if fi >= 0 {
+			bpm.logger.Debug("Stole frame from shard", zap.Int("from_shard", si), zap.Int("target_shard", targetShard), zap.Int("frame_id", fi))
+			return fi, pid, nil
+		}
+	}
+	bpm.logger.Error("Buffer pool full and all pages pinned")
+	return -1, pagemanager.InvalidPageID, flushmanager.ErrBufferPoolFull
 }
 
 // FetchPage retrieves a page from the buffer pool. If not present, it fetches from disk.
 // It pins the page, increments its pin count, and moves it to the front of the LRU list.
 func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager.Page, error) {
-	s := &bpm.shards[shardFor(pageID)]
-	s.mu.Lock()
+	si := shardFor(pageID)
+	s := &bpm.shards[si]
 
-	// 1. Check if page is already in the buffer pool
+	// Fast path: cache hit — only the target shard's mutex is needed.
+	s.mu.Lock()
 	if frameIdx, ok := s.pages[pageID]; ok {
 		page := bpm.pages[frameIdx]
 		page.Pin()
-		// Move to front of LRU to mark as recently used
 		if page.GetLruElement() != nil {
 			s.lruList.MoveToFront(page.GetLruElement())
 		}
@@ -106,14 +190,57 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 	}
 	s.mu.Unlock()
 
-	// 2. Page not in pool – acquire eviction lock and find a victim frame.
-	bpm.evictMu.Lock()
-	defer bpm.evictMu.Unlock()
+	// Slow path: cache miss — claim a frame (atomically removed from its shard's structures).
+	frameIdx, victimPageID, err := bpm.claimFrame(si)
+	if err != nil {
+		bpm.logger.Error("Failed to claim frame", zap.Any("page_id", pageID), zap.Error(err))
+		return nil, err
+	}
+	victimPage := bpm.pages[frameIdx]
+	bpm.logger.Debug("Cache miss: evicting frame", zap.Any("page_id", pageID), zap.Int("frame", frameIdx), zap.Uint64("evicted_page", uint64(victimPageID)))
 
-	// Re-check under evictMu (another goroutine may have loaded the page).
+	// Flush dirty victim to disk. The frame is already invisible to other goroutines
+	// (removed from shard structures), so no lock is needed here.
+	if victimPage.IsDirty() && victimPageID != pagemanager.InvalidPageID {
+		if bpm.logManager != nil && victimPage.GetLSN() != pagemanager.InvalidLSN {
+			if err := bpm.logManager.Sync(); err != nil {
+				bpm.logger.Error("WAL sync failed before evicting dirty page", zap.Uint64("victim", uint64(victimPageID)), zap.Error(err))
+				s.mu.Lock()
+				s.freeStack = append(s.freeStack, frameIdx) // return claimed frame
+				s.mu.Unlock()
+				return nil, fmt.Errorf("failed to flush log for victim page %d: %w", victimPageID, err)
+			}
+		}
+		if err := bpm.diskManager.WritePage(victimPageID, victimPage.GetData()); err != nil {
+			s.mu.Lock()
+			s.freeStack = append(s.freeStack, frameIdx)
+			s.mu.Unlock()
+			return nil, fmt.Errorf("failed to flush dirty victim page %d: %w", victimPageID, err)
+		}
+		victimPage.SetDirty(false)
+	}
+	victimPage.Reset()
+
+	// Load new page from disk (no locks held — I/O is slow).
+	bpm.logger.Debug("Reading page from disk into frame", zap.Any("page_id", pageID), zap.Int("frame", frameIdx))
+	if err := bpm.diskManager.ReadPage(pageID, victimPage.GetData()); err != nil {
+		s.mu.Lock()
+		s.freeStack = append(s.freeStack, frameIdx)
+		s.mu.Unlock()
+		return nil, fmt.Errorf("failed to read page %d from disk: %w", pageID, err)
+	}
+
+	// Register the newly loaded page in the target shard.
+	victimPage.SetPageID(pageID)
+	victimPage.SetPinCount(1)
+	victimPage.SetDirty(false)
+	victimPage.SetLSN(pagemanager.InvalidLSN)
+
 	s.mu.Lock()
-	if frameIdx, ok := s.pages[pageID]; ok {
-		page := bpm.pages[frameIdx]
+	// Double-check: another goroutine may have raced and loaded the same page.
+	if existingFrame, ok := s.pages[pageID]; ok {
+		s.freeStack = append(s.freeStack, frameIdx) // return our frame
+		page := bpm.pages[existingFrame]
 		page.Pin()
 		if page.GetLruElement() != nil {
 			s.lruList.MoveToFront(page.GetLruElement())
@@ -121,58 +248,6 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 		s.mu.Unlock()
 		return page, nil
 	}
-	s.mu.Unlock()
-
-	frameIdx, victimPageID, err := bpm.getVictimFrameInternal()
-	if err != nil {
-		bpm.logger.Error("Failed to get victim frame", zap.Any("page_id", pageID), zap.Error(err))
-		return nil, err
-	}
-	victimPage := bpm.pages[frameIdx]
-	bpm.logger.Debug("Page not found in buffer pool, evicting old_page", zap.Any("page_id", pageID), zap.Int("frame_index", frameIdx), zap.Uint32("old_page", uint32(victimPage.GetPageID())))
-
-	// 3. If victim page is dirty, flush it to disk (outside any shard lock – disk I/O is slow).
-	if victimPage.IsDirty() && victimPageID != pagemanager.InvalidPageID {
-		if bpm.logManager != nil && victimPage.GetLSN() != pagemanager.InvalidLSN {
-			if err := bpm.logManager.Sync(); err != nil {
-				bpm.logger.Error("Failed to flush log for victim page before flushing page:", zap.Any("victim_page_id", victimPageID), zap.Uint64("lsn", uint64(victimPage.GetLSN())), zap.Error(err))
-				return nil, fmt.Errorf("failed to flush log for victim page %d: %w", victimPageID, err)
-			}
-		}
-		if err := bpm.diskManager.WritePage(victimPageID, victimPage.GetData()); err != nil {
-			return nil, fmt.Errorf("failed to flush dirty victim page %d: %w", victimPageID, err)
-		}
-		victimPage.SetDirty(false)
-	}
-
-	// 4. Remove victim page from its shard.
-	if victimPageID != pagemanager.InvalidPageID {
-		vs := &bpm.shards[shardFor(victimPageID)]
-		vs.mu.Lock()
-		delete(vs.pages, victimPageID)
-		if victimPage.GetLruElement() != nil {
-			vs.lruList.Remove(victimPage.GetLruElement())
-			delete(vs.lruMap, frameIdx)
-		}
-		vs.mu.Unlock()
-	}
-
-	// 5. Reset victim page for new content.
-	victimPage.Reset()
-
-	// 6. Load new page data from disk (outside shard lock – I/O).
-	bpm.logger.Debug("reading page from disk into frame", zap.Any("page_id", pageID), zap.Any("frame_idx", frameIdx))
-	if err := bpm.diskManager.ReadPage(pageID, victimPage.GetData()); err != nil {
-		return nil, fmt.Errorf("failed to read page %d from disk: %w", pageID, err)
-	}
-
-	// 7. Update metadata and register in the target shard.
-	victimPage.SetPageID(pageID)
-	victimPage.SetPinCount(1)
-	victimPage.SetDirty(false)
-	victimPage.SetLSN(pagemanager.InvalidLSN)
-
-	s.mu.Lock()
 	s.pages[pageID] = frameIdx
 	victimPage.SetLruElement(s.lruList.PushFront(frameIdx))
 	s.lruMap[frameIdx] = victimPage.GetLruElement()
@@ -181,39 +256,10 @@ func (bpm *BufferPoolManager) FetchPage(pageID pagemanager.PageID) (*pagemanager
 	return victimPage, nil
 }
 
-// getVictimFrameInternal finds an unpinned frame to evict across all shards.
-// MUST be called with bpm.evictMu held.
-func (bpm *BufferPoolManager) getVictimFrameInternal() (frameIdx int, evictedPageID pagemanager.PageID, err error) {
-	// Scan all shards in order, checking their LRU tails.
-	for i := 0; i < numBPMShards; i++ {
-		s := &bpm.shards[i]
-		s.mu.Lock()
-		for e := s.lruList.Back(); e != nil; e = e.Prev() {
-			fi := e.Value.(int)
-			if bpm.pages[fi].GetPinCount() == 0 {
-				pid := bpm.pages[fi].GetPageID()
-				s.mu.Unlock()
-				bpm.logger.Debug("Found LRU victim", zap.Int("frame_id", fi), zap.Uint64("page_id", uint64(pid)))
-				return fi, pid, nil
-			}
-		}
-		s.mu.Unlock()
-	}
-
-	// Fall back: look for completely free frames (never loaded).
-	for i := 0; i < bpm.poolSize; i++ {
-		if bpm.pages[i].GetPageID() == pagemanager.InvalidPageID {
-			bpm.logger.Debug("Found empty frame as victim", zap.Int("frame_id", i))
-			return i, pagemanager.InvalidPageID, nil
-		}
-	}
-
-	bpm.logger.Error("Buffer pool full and all pages pinned")
-	return -1, pagemanager.InvalidPageID, flushmanager.ErrBufferPoolFull
-}
+// getVictimFrameInternal is superseded by claimFrame + bpmShard.victimFrame.
+// Kept as a no-op shim in case any internal call site was missed during refactor.
 
 // UnpinPage decrements the pin count for a page. If isDirty is true, it marks the page as dirty.
-// This is a key point for logging page modifications.
 func (bpm *BufferPoolManager) UnpinPage(pageID pagemanager.PageID, isDirty bool) error {
 	s := &bpm.shards[shardFor(pageID)]
 	s.mu.Lock()
@@ -247,21 +293,25 @@ func (bpm *BufferPoolManager) UnpinPage(pageID pagemanager.PageID, isDirty bool)
 				return fmt.Errorf("failed to append log record for page %d: %w", pageID, err)
 			}
 			s.mu.Lock()
-			page.SetLSN(pagemanager.LSN(lsn))
+			// Guard against eviction + reuse of the frame while the lock was dropped:
+			// only update LSN if this frame still belongs to the same page.
+			if curr, still := s.pages[pageID]; still && curr == frameIdx {
+				page.SetLSN(pagemanager.LSN(lsn))
+			}
 			s.mu.Unlock()
-			bpm.logger.Debug("Unpinned page", zap.Uint64("page_id", uint64(pageID)), zap.Int("frame_id", frameIdx), zap.Uint32("pin_count", page.GetPinCount()), zap.Bool("is_dirty", page.IsDirty()), zap.Uint64("lsn", uint64(page.GetLSN())))
+			bpm.logger.Debug("Unpinned dirty page", zap.Uint64("page_id", uint64(pageID)), zap.Int("frame_id", frameIdx))
 			return nil
 		}
 	}
 	s.mu.Unlock()
-	bpm.logger.Debug("Unpinned page", zap.Uint64("page_id", uint64(pageID)), zap.Int("frame_id", frameIdx), zap.Uint32("pin_count", page.GetPinCount()), zap.Bool("is_dirty", page.IsDirty()), zap.Uint64("lsn", uint64(page.GetLSN())))
+	bpm.logger.Debug("Unpinned page", zap.Uint64("page_id", uint64(pageID)), zap.Int("frame_id", frameIdx), zap.Uint32("pin_count", page.GetPinCount()), zap.Bool("is_dirty", page.IsDirty()))
 	return nil
 }
 
 // NewPage allocates a new page on disk and fetches it into the buffer pool.
 // It pins the new page and marks it dirty.
 func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, error) {
-	// Allocate a disk page first (outside any shard lock).
+	// Allocate a disk page ID first (outside any lock — disk metadata operation).
 	newPageID, err := bpm.diskManager.AllocatePage()
 	if err != nil {
 		bpm.logger.Error("Failed to allocate new page on disk", zap.Error(err))
@@ -269,10 +319,11 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 	}
 	bpm.logger.Debug("Allocated new page on disk", zap.Uint64("page_id", uint64(newPageID)))
 
-	bpm.evictMu.Lock()
-	defer bpm.evictMu.Unlock()
+	si := shardFor(newPageID)
+	s := &bpm.shards[si]
 
-	frameIdx, victimPageID, err := bpm.getVictimFrameInternal()
+	// Claim a frame from the target shard (or steal from another).
+	frameIdx, victimPageID, err := bpm.claimFrame(si)
 	if err != nil {
 		_ = bpm.diskManager.DeallocatePage(newPageID)
 		bpm.logger.Error("Failed to get frame for new page, deallocated", zap.Uint64("page_id", uint64(newPageID)), zap.Error(err))
@@ -281,31 +332,25 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 	victimPage := bpm.pages[frameIdx]
 	bpm.logger.Debug("New page getting frame", zap.Uint64("new_page_id", uint64(newPageID)), zap.Int("frame_id", frameIdx), zap.Uint64("victim_page_id", uint64(victimPageID)))
 
-	// Flush dirty victim outside shard lock.
+	// Flush dirty victim outside any lock.
 	if victimPage.IsDirty() && victimPageID != pagemanager.InvalidPageID {
 		if bpm.logManager != nil && victimPage.GetLSN() != pagemanager.InvalidLSN {
 			if err := bpm.logManager.Sync(); err != nil {
-				bpm.logger.Error("Failed to flush log for victim page before eviction", zap.Uint64("victim_page_id", uint64(victimPageID)), zap.Uint64("lsn", uint64(victimPage.GetLSN())), zap.Error(err))
+				bpm.logger.Error("WAL sync failed before evicting dirty page", zap.Uint64("victim", uint64(victimPageID)), zap.Error(err))
+				s.mu.Lock()
+				s.freeStack = append(s.freeStack, frameIdx)
+				s.mu.Unlock()
 				return nil, pagemanager.InvalidPageID, fmt.Errorf("failed to flush log for victim page %d: %w", victimPageID, err)
 			}
 		}
 		bpm.logger.Debug("Flushing dirty victim page for new page", zap.Uint64("victim_page_id", uint64(victimPageID)), zap.Uint64("new_page_id", uint64(newPageID)))
 		if err := bpm.diskManager.WritePage(victimPageID, victimPage.GetData()); err != nil {
+			s.mu.Lock()
+			s.freeStack = append(s.freeStack, frameIdx)
+			s.mu.Unlock()
 			return nil, pagemanager.InvalidPageID, fmt.Errorf("failed to flush dirty victim %d for new page: %w", victimPageID, err)
 		}
 		victimPage.SetDirty(false)
-	}
-
-	// Remove victim from its shard.
-	if victimPageID != pagemanager.InvalidPageID {
-		vs := &bpm.shards[shardFor(victimPageID)]
-		vs.mu.Lock()
-		delete(vs.pages, victimPageID)
-		if victimPage.GetLruElement() != nil {
-			vs.lruList.Remove(victimPage.GetLruElement())
-			delete(vs.lruMap, frameIdx)
-		}
-		vs.mu.Unlock()
 	}
 
 	victimPage.Reset()
@@ -314,14 +359,13 @@ func (bpm *BufferPoolManager) NewPage() (*pagemanager.Page, pagemanager.PageID, 
 	victimPage.SetDirty(true)
 	victimPage.SetLSN(pagemanager.InvalidLSN)
 
-	ns := &bpm.shards[shardFor(newPageID)]
-	ns.mu.Lock()
-	ns.pages[newPageID] = frameIdx
-	victimPage.SetLruElement(ns.lruList.PushFront(frameIdx))
-	ns.lruMap[frameIdx] = victimPage.GetLruElement()
-	ns.mu.Unlock()
+	s.mu.Lock()
+	s.pages[newPageID] = frameIdx
+	victimPage.SetLruElement(s.lruList.PushFront(frameIdx))
+	s.lruMap[frameIdx] = victimPage.GetLruElement()
+	s.mu.Unlock()
 
-	bpm.logger.Debug("New page loaded into frame", zap.Uint64("page_id", uint64(newPageID)), zap.Int("frame_id", frameIdx), zap.Uint32("pin_count", victimPage.GetPinCount()), zap.Bool("is_dirty", victimPage.IsDirty()))
+	bpm.logger.Debug("New page loaded into frame", zap.Uint64("page_id", uint64(newPageID)), zap.Int("frame_id", frameIdx), zap.Uint32("pin_count", victimPage.GetPinCount()))
 
 	if bpm.logManager != nil {
 		logRecord := &wal.LogRecord{
@@ -357,13 +401,14 @@ func (bpm *BufferPoolManager) FlushPage(pageID pagemanager.PageID) error {
 		bpm.logger.Debug("Page is clean, no flush needed", zap.Uint64("page_id", uint64(pageID)), zap.Int("frame_id", frameIdx))
 		return nil
 	}
-	lsn := page.GetLSN()
+	// Snapshot LSN under lock so we can detect concurrent modifications after the flush.
+	lsnAtFlushStart := page.GetLSN()
 	s.mu.Unlock()
 
-	// WAL flush and disk write outside shard lock.
-	if bpm.logManager != nil && lsn != pagemanager.InvalidLSN {
+	// WAL flush and disk write outside shard lock (slow I/O).
+	if bpm.logManager != nil && lsnAtFlushStart != pagemanager.InvalidLSN {
 		if err := bpm.logManager.Sync(); err != nil {
-			bpm.logger.Error("Failed to flush log before flushing page", zap.Uint64("page_id", uint64(pageID)), zap.Uint64("lsn", uint64(lsn)), zap.Error(err))
+			bpm.logger.Error("Failed to flush log before flushing page", zap.Uint64("page_id", uint64(pageID)), zap.Error(err))
 			return fmt.Errorf("failed to flush log for page %d: %w", pageID, err)
 		}
 	}
@@ -378,8 +423,12 @@ func (bpm *BufferPoolManager) FlushPage(pageID pagemanager.PageID) error {
 	}
 	bpm.logger.Debug("Page data integrity check", zap.Bool("is_equal", bytes.Equal(page.GetData(), dd)))
 
+	// Only clear dirty if the page hasn't been modified since we started the flush and
+	// the frame still belongs to this page (wasn't evicted and reused while I/O ran).
 	s.mu.Lock()
-	page.SetDirty(false)
+	if curr, still := s.pages[pageID]; still && curr == frameIdx && page.GetLSN() == lsnAtFlushStart {
+		page.SetDirty(false)
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -396,21 +445,46 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 		}
 	}
 
-	bpm.logger.Debug("Flushing all dirty pages from buffer pool")
-	for i, page := range bpm.pages {
-		if page.GetPageID() != pagemanager.InvalidPageID && page.IsDirty() {
-			bpm.logger.Debug("Flushing page during FlushAllPages", zap.Uint64("page_id", uint64(page.GetPageID())), zap.Int("frame_id", i))
-			err := bpm.diskManager.WritePage(page.GetPageID(), page.GetData())
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				fmt.Fprintf(os.Stderr, "Error flushing page %d: %v\n", page.GetPageID(), err)
-			} else {
-				page.SetDirty(false)
+	// Collect dirty frames per shard under the shard lock (avoids data races on page metadata).
+	type dirtyEntry struct {
+		frameIdx int
+		pageID   pagemanager.PageID
+		lsn      pagemanager.LSN
+		si       int
+	}
+	var dirty []dirtyEntry
+	for i := 0; i < numBPMShards; i++ {
+		s := &bpm.shards[i]
+		s.mu.Lock()
+		for pid, fi := range s.pages {
+			pg := bpm.pages[fi]
+			if pg.IsDirty() {
+				dirty = append(dirty, dirtyEntry{fi, pid, pg.GetLSN(), i})
 			}
 		}
+		s.mu.Unlock()
 	}
+
+	// Flush each dirty page outside shard locks (slow I/O).
+	bpm.logger.Debug("Flushing dirty pages", zap.Int("count", len(dirty)))
+	for _, d := range dirty {
+		pg := bpm.pages[d.frameIdx]
+		if err := bpm.diskManager.WritePage(d.pageID, pg.GetData()); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			fmt.Fprintf(os.Stderr, "Error flushing page %d: %v\n", d.pageID, err)
+			continue
+		}
+		// Clear dirty only if the frame still holds the same page and LSN.
+		s := &bpm.shards[d.si]
+		s.mu.Lock()
+		if curr, still := s.pages[d.pageID]; still && curr == d.frameIdx && pg.GetLSN() == d.lsn {
+			pg.SetDirty(false)
+		}
+		s.mu.Unlock()
+	}
+
 	if err := bpm.diskManager.Sync(); err != nil {
 		if firstErr == nil {
 			firstErr = err
@@ -423,6 +497,7 @@ func (bpm *BufferPoolManager) FlushAllPages() error {
 
 // InvalidatePage removes a page from the buffer pool's hash table,
 // forcing a fresh read from DiskManager on the next FetchPage.
+// The freed frame is returned to the shard's freeStack for immediate reuse.
 func (bpm *BufferPoolManager) InvalidatePage(pageID pagemanager.PageID) {
 	s := &bpm.shards[shardFor(pageID)]
 	s.mu.Lock()
@@ -443,6 +518,8 @@ func (bpm *BufferPoolManager) InvalidatePage(pageID pagemanager.PageID) {
 		delete(s.lruMap, frameID)
 		page.SetLruElement(nil)
 	}
+	// Return the frame to the free pool so it can be claimed without LRU eviction.
+	s.freeStack = append(s.freeStack, frameID)
 	s.mu.Unlock()
 	bpm.logger.Debug("Invalidated page from buffer pool", zap.Uint64("page_id", uint64(pageID)), zap.Int("frame_id", frameID))
 }

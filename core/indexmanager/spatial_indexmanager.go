@@ -37,7 +37,7 @@ type SpatialIndexManager struct {
 func NewSpatialIndexManager(rtree *spatial.SpatialIndexManager, tel *telemetry.Telemetry) *SpatialIndexManager {
 	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
 	if err != nil {
-		fmt.Printf("failed to create gRPC metrics: %w", err)
+		fmt.Printf("failed to create gRPC metrics: %v", err)
 	}
 	return &SpatialIndexManager{
 		tree:         rtree,

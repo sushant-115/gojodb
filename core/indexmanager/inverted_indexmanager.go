@@ -38,7 +38,7 @@ type InvertedIndexManager struct {
 func NewInvertedIndexManager(index *inverted_index.InvertedIndex, tel *telemetry.Telemetry) *InvertedIndexManager {
 	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
 	if err != nil {
-		fmt.Printf("failed to create gRPC metrics: %w", err)
+		fmt.Printf("failed to create gRPC metrics: %v", err)
 	}
 	return &InvertedIndexManager{
 		index:        index,

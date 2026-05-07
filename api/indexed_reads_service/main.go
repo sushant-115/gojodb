@@ -36,7 +36,7 @@ type IndexedReadService struct {
 func NewIndexedReadService(nodeID string, slotID uint32, indexManagers map[string]indexmanager.IndexManager, tel *telemetry.Telemetry) *IndexedReadService {
 	grpcMetrics, err := internaltelemetry.NewGrpcGatewayMetrics(tel.Meter)
 	if err != nil {
-		fmt.Printf("failed to create gRPC metrics: %w", err)
+		fmt.Printf("failed to create gRPC metrics: %v", err)
 	}
 	return &IndexedReadService{
 		nodeID:        nodeID,
