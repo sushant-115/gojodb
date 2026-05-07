@@ -86,6 +86,7 @@ var (
 	heartbeatAddr     = flag.String("heartbeat_addr", "127.0.0.1:8081", "Port for replication data exchange between storage nodes")   // Clarified purpose
 	oltpEndpoint      = flag.String("oltp_endpoint", "127.0.0.1:4317", "OLTP collector endpoint to send traces")
 	logfile           = flag.String("log_file", "/tmp/"+*nodeID, "OLTP collector endpoint to send traces")
+	bufferPoolSize    = flag.Int("buffer_pool_size", 1000, "Number of buffer pool frames for the B-tree (each frame is 4 KiB)")
 	myStorageNodeID   string // Set from nodeID flag
 	myStorageNodeAddr string // Address this node is reachable at by other storage nodes (e.g. for replication)
 	raftTransport     *raft.NetworkTransport
@@ -211,9 +212,9 @@ func initStorageNode() error {
 			SerializeValue:   btree.SerializeString,
 			DeserializeValue: btree.DeserializeString,
 		},
-		10000,
+		*bufferPoolSize,
 		4096,
-		2000,
+		*bufferPoolSize/5,
 		logManager,
 		zlogger.Named("btree_index"),
 	)

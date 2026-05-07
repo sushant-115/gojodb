@@ -7,6 +7,20 @@
 #
 # To shutdown:
 # docker-compose down
+#
+# Memory layout on a c5a.4xlarge (32 GB):
+#   3 × gojodb-server : 3 × 4 GB  = 12 GB
+#   gojodb-gateway    :     1 GB  =  1 GB
+#   gojodb-controller :   512 MB  =  0.5 GB
+#   jaeger            :   1.5 GB  =  1.5 GB
+#   OS + Docker daemon:           ~  3 GB
+#   Headroom / swap   :           ~ 14 GB
+#
+# IMPORTANT: Before starting, add swap on the EC2 host so OOM does not
+# hard-lock the instance:
+#   sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+#   sudo mkswap /swapfile && sudo swapon /swapfile
+#   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 version: '3.8'
 
@@ -14,18 +28,37 @@ networks:
   gojodb-net:
     driver: bridge
 
+x-server-resources: &server-resources
+  mem_limit: 4g
+  memswap_limit: 4g    # disable swap for this container (swap=mem means no swap)
+  cpus: '4'
+
+x-server-env: &server-env
+  # Hard cap on Go heap.  Leave ~512 MiB headroom for non-heap allocations
+  # (goroutine stacks, OS threads, cgo, etc.).
+  GOMEMLIMIT: 3584MiB
+  # Tune GC: 50% → collect more aggressively; reduces peak heap at slight CPU cost.
+  GOGC: "50"
+
 services:
-  # Jaeger
+  # Jaeger — use badger (disk-backed) storage so traces do not fill RAM.
   jaeger-all-in-one:
     image: jaegertracing/all-in-one:latest
+    environment:
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=true
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
     ports:
       - "16686:16686" # Jaeger UI
       - "4317:4317"   # OTLP gRPC endpoint
     networks:
       - gojodb-net
+    mem_limit: 1500m
+    memswap_limit: 1500m
+    cpus: '1'
 
   # --- GojoDB Storage Nodes ---
-  # These are the core data storage and controller nodes.
   gojodb-server-1:
     image: gojodb-server
     build:
@@ -43,6 +76,8 @@ services:
       - "8083:8083" # Heartbeat
     volumes:
       - ./data/node1:/data
+    environment:
+      <<: *server-env
     command:
       - "/app/app"
       - "--node_id=node-1"
@@ -55,12 +90,13 @@ services:
       - "--controller_addr=gojodb-server-1:9001"
       - "--bootstrap"
       - "--oltp_endpoint=jaeger-all-in-one:4317"
-      # First node, so no --join argument
+      - "--buffer_pool_size=500"
     healthcheck:
       test: ["CMD", "sh", "-c", "sleep 1"]
       interval: 10s
       timeout: 5s
       retries: 3
+    <<: *server-resources
 
   gojodb-server-2:
     image: gojodb-server
@@ -79,6 +115,8 @@ services:
       - "8084:8084"
     volumes:
       - ./data/node2:/data
+    environment:
+      <<: *server-env
     command:
       - "/app/app"
       - "--node_id=node-2"
@@ -88,8 +126,9 @@ services:
       - "--http_addr=gojodb-server-2:9002"
       - "--replication_addr=gojodb-server-2:6002"
       - "--heartbeat_addr=gojodb-server-2:8084"
-      - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
+      - "--controller_addr=gojodb-server-1:9001"
       - "--oltp_endpoint=jaeger-all-in-one:4317"
+      - "--buffer_pool_size=500"
     depends_on:
       gojodb-server-1:
         condition: service_healthy
@@ -98,6 +137,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    <<: *server-resources
 
   gojodb-server-3:
     image: gojodb-server
@@ -116,6 +156,8 @@ services:
       - "8085:8085"
     volumes:
       - ./data/node3:/data
+    environment:
+      <<: *server-env
     command:
       - "/app/app"
       - "--node_id=node-3"
@@ -125,8 +167,9 @@ services:
       - "--http_addr=gojodb-server-3:9003"
       - "--replication_addr=gojodb-server-3:6003"
       - "--heartbeat_addr=gojodb-server-3:8085"
-      - "--controller_addr=gojodb-server-1:9001" # Join the cluster via node 1's Raft address
+      - "--controller_addr=gojodb-server-1:9001"
       - "--oltp_endpoint=jaeger-all-in-one:4317"
+      - "--buffer_pool_size=500"
     depends_on:
       gojodb-server-1:
         condition: service_healthy
@@ -135,10 +178,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    <<: *server-resources
 
   # --- GojoDB Gateway ---
-  # This is the single entry point for clients.
-
   gojodb-gateway:
     image: gojodb-gateway
     build:
@@ -152,9 +194,10 @@ services:
       - "50051:50051" # Client-facing gRPC port
       - "9112:9112"
     environment:
-      # The gateway needs to know the gRPC addresses of all storage nodes.
       - CLUSTER_NODES=gojodb-server-1:8001,gojodb-server-2:8002,gojodb-server-3:8003
       - LISTEN_ADDR=:7000
+      - GOMEMLIMIT=768MiB
+      - GOGC=50
     command: ["/app/app", "--controller_addr=gojodb-server-1:9001", "--oltp_endpoint=jaeger-all-in-one:4317"]
     depends_on:
       gojodb-server-1:
@@ -163,6 +206,9 @@ services:
         condition: service_healthy
       gojodb-server-3:
         condition: service_healthy
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: '2'
 
 volumes:
   node1-data:
