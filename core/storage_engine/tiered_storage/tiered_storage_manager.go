@@ -1,112 +1,257 @@
 package tiered_storage
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"strings"
+	"math"
+	"sort"
 	"sync"
 	"time"
 
-	coldstorage "github.com/sushant-115/gojodb/core/storage_engine/cold_storage" // Assuming PageManager for hot tier interaction
-	hotstorage "github.com/sushant-115/gojodb/core/storage_engine/hot_storage"
-	pagemanager "github.com/sushant-115/gojodb/core/write_engine/page_manager"
-	"github.com/sushant-115/gojodb/core/write_engine/wal" // For WAL segment tiering
 	"go.uber.org/zap"
-	// FSM client/interface will be needed to update metadata
-	// "github.com/sushant-115/gojodb/core/replication/raft_consensus/fsm/client" or similar
+
+	"github.com/sushant-115/gojodb/core/security/encryption"
+	coldstorage "github.com/sushant-115/gojodb/core/storage_engine/cold_storage"
+	hotstorage "github.com/sushant-115/gojodb/core/storage_engine/hot_storage"
 )
 
-// TieredStorageManager manages data movement between different storage tiers.
+const (
+	// ewmaAlpha is the smoothing factor for the Exponentially Weighted Moving
+	// Average used to track access frequency.  Higher → faster reaction to recent
+	// activity.
+	ewmaAlpha = 0.3
+
+	defaultEvalInterval = 1 * time.Hour
+	defaultMaxRetries   = 3
+	defaultRetryBase    = 500 * time.Millisecond
+)
+
+// Config holds optional parameters for the TieredStorageManager.
+type Config struct {
+	// EncryptionKey is a 16-, 24-, or 32-byte AES key.  When non-nil, all data
+	// written to cold storage is encrypted with AES-256-GCM.
+	EncryptionKey []byte
+	// EvalInterval controls how often the DLM policy loop runs.
+	EvalInterval time.Duration
+	// MaxRetries is the number of times a failed write to cold storage is
+	// retried before the error is propagated.
+	MaxRetries int
+}
+
+func (c *Config) evalInterval() time.Duration {
+	if c == nil || c.EvalInterval == 0 {
+		return defaultEvalInterval
+	}
+	return c.EvalInterval
+}
+
+func (c *Config) maxRetries() int {
+	if c == nil || c.MaxRetries == 0 {
+		return defaultMaxRetries
+	}
+	return c.MaxRetries
+}
+
+// TieredStorageManager manages data movement between hot and cold storage tiers.
 type TieredStorageManager struct {
-	hotStorageAdapter  *hotstorage.HotStorageAdapter
-	coldStorageAdapter *coldstorage.ColdStorageAdapter
-	// warmStorageAdapter WarmStorageAdapter // To be defined and added if a warm tier is implemented
-
-	// pageManager is used to interact with data in the hot tier (e.g., reading pages to tier out)
-	pageManager *pagemanager.PageManager // This might need to be an interface
-
-	// logManager is used for WAL segment tiering
-	walLogManager *wal.LogManager // This is for identifying WALs to archive
+	hotAdapter  *hotstorage.HotStorageAdapter
+	coldAdapter *coldstorage.ColdStorageAdapter
+	crypto      *encryption.CryptoUtils // nil when encryption is disabled
 
 	logger *zap.Logger
 	mu     sync.RWMutex
+	cfg    Config
 
-	// dlmPolicies are fetched from the Controller/FSM or a config source.
-	dlmPolicies []DLMPolicy
-
-	// localTieringMetadataCache is a cache of TieredDataMetadata for frequently accessed items.
-	// The authoritative source is the Raft FSM.
-	localTieringMetadataCache map[string]TieredDataMetadata // Key: LogicalUnitID
-
-	// fsmClient is an interface to interact with the Raft FSM for metadata updates.
-	// fsmClient fsm.ClientAPI // Placeholder for FSM interaction
+	dlmPolicies               []DLMPolicy
+	localTieringMetadataCache map[string]TieredDataMetadata // key: LogicalUnitID
 
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 }
 
 // NewTieredStorageManager creates a new TieredStorageManager.
-// The pageManager and walLogManager are passed for interaction with hot data and WALs.
 func NewTieredStorageManager(
 	hotAdapter *hotstorage.HotStorageAdapter,
 	coldAdapter *coldstorage.ColdStorageAdapter,
-	pageMgr *pagemanager.PageManager, // Or an interface
-	walMgr *wal.LogManager,
+	cfg Config,
 	logger *zap.Logger,
-	// fsmClient fsm.ClientAPI, // Pass FSM client
-) *TieredStorageManager {
-	return &TieredStorageManager{
-		hotStorageAdapter:         hotAdapter,
-		coldStorageAdapter:        coldAdapter,
-		pageManager:               pageMgr,
-		walLogManager:             walMgr,
-		logger:                    logger.Named("tiered_storage_manager"),
+) (*TieredStorageManager, error) {
+	tsm := &TieredStorageManager{
+		hotAdapter:                hotAdapter,
+		coldAdapter:               coldAdapter,
+		logger:                    logger.Named("tiered_storage"),
+		cfg:                       cfg,
 		dlmPolicies:               make([]DLMPolicy, 0),
 		localTieringMetadataCache: make(map[string]TieredDataMetadata),
-		// fsmClient:               fsmClient,
-		stopChan: make(chan struct{}),
+		stopChan:                  make(chan struct{}),
 	}
+
+	if len(cfg.EncryptionKey) > 0 {
+		cu, err := encryption.NewCryptoUtils(cfg.EncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("tiered_storage: init encryption: %w", err)
+		}
+		tsm.crypto = cu
+		logger.Info("encryption enabled for cold storage tier")
+	}
+
+	return tsm, nil
 }
 
-// Start initiates background processes for DLM policy evaluation.
+// Start initiates background DLM policy evaluation.
 func (tsm *TieredStorageManager) Start() error {
-	tsm.logger.Info("Starting TieredStorageManager background processes...")
+	tsm.logger.Info("starting TieredStorageManager")
 	tsm.wg.Add(1)
 	go tsm.dlmPolicyEvaluationLoop()
-
-	// TODO: Start other background tasks like periodic cache refresh from FSM, etc.
 	return nil
 }
 
-// Stop gracefully shuts down the TieredStorageManager.
+// Stop gracefully shuts down background goroutines.
 func (tsm *TieredStorageManager) Stop() error {
-	tsm.logger.Info("Stopping TieredStorageManager...")
+	tsm.logger.Info("stopping TieredStorageManager")
 	close(tsm.stopChan)
 	tsm.wg.Wait()
-	tsm.logger.Info("TieredStorageManager stopped.")
+	tsm.logger.Info("TieredStorageManager stopped")
 	return nil
 }
 
-// LoadDLMPolicies loads (or refreshes) DLM policies, e.g., from the controller/FSM.
+// Close releases any resources held by the manager.
+func (tsm *TieredStorageManager) Close() error { return nil }
+
+// LoadDLMPolicies replaces the current policy set.
 func (tsm *TieredStorageManager) LoadDLMPolicies(policies []DLMPolicy) {
 	tsm.mu.Lock()
 	defer tsm.mu.Unlock()
 	tsm.dlmPolicies = policies
-	tsm.logger.Info("DLM policies loaded/refreshed", zap.Int("count", len(policies)))
+	tsm.logger.Info("DLM policies loaded", zap.Int("count", len(policies)))
 }
+
+// RegisterUnit registers a hot-tier data unit for tiering management.
+// Call this whenever new data is written to hot storage.
+func (tsm *TieredStorageManager) RegisterUnit(meta TieredDataMetadata) {
+	tsm.mu.Lock()
+	defer tsm.mu.Unlock()
+	if meta.CreationTime.IsZero() {
+		meta.CreationTime = time.Now()
+	}
+	if meta.LastModifiedTime.IsZero() {
+		meta.LastModifiedTime = meta.CreationTime
+	}
+	meta.CurrentTier = HotTier
+	tsm.localTieringMetadataCache[meta.LogicalUnitID] = meta
+}
+
+// UpdateAccessStats records an access event for the given unit.  The access
+// frequency score is updated using an EWMA so recent activity has more weight.
+func (tsm *TieredStorageManager) UpdateAccessStats(logicalUnitID string, accessTime time.Time) {
+	tsm.mu.Lock()
+	defer tsm.mu.Unlock()
+
+	meta, exists := tsm.localTieringMetadataCache[logicalUnitID]
+	if !exists {
+		return
+	}
+	// EWMA: newScore = alpha + (1-alpha)*oldScore
+	// A single access contributes 1.0; frequency scores decay toward 0 over time.
+	meta.AccessFrequencyScore = ewmaAlpha + (1-ewmaAlpha)*meta.AccessFrequencyScore
+	meta.LastAccessTime = accessTime
+	tsm.localTieringMetadataCache[logicalUnitID] = meta
+}
+
+// MigrateUnit synchronously migrates a single unit to targetTier.
+// Exposed for on-demand tiering (e.g. from an admin API).
+func (tsm *TieredStorageManager) MigrateUnit(ctx context.Context, unitID string, targetTier StorageTierType) error {
+	tsm.mu.RLock()
+	meta, ok := tsm.localTieringMetadataCache[unitID]
+	tsm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("tiered_storage: unit %q not found in metadata cache", unitID)
+	}
+	return tsm.migrateDataUnit(ctx, meta, targetTier)
+}
+
+// RecallDataUnit reads a tiered-out data unit from cold storage and writes it
+// back to hot storage.  Returns the raw (decrypted) data.
+func (tsm *TieredStorageManager) RecallDataUnit(ctx context.Context, logicalUnitID string) ([]byte, error) {
+	tsm.mu.RLock()
+	meta, ok := tsm.localTieringMetadataCache[logicalUnitID]
+	tsm.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("tiered_storage: unit %q not found in metadata cache", logicalUnitID)
+	}
+	if meta.CurrentTier == HotTier {
+		return tsm.hotAdapter.Read(logicalUnitID)
+	}
+
+	// 1. Read from cold storage.
+	rawData, err := tsm.coldAdapter.Read(ctx, meta.LocationPointer)
+	if err != nil {
+		return nil, fmt.Errorf("tiered_storage: recall read cold for %s: %w", logicalUnitID, err)
+	}
+
+	// 2. Decrypt if the unit was encrypted.
+	plaintext := rawData
+	if meta.EncryptionKeyID != "" && tsm.crypto != nil {
+		plaintext, err = tsm.crypto.Decrypt(rawData)
+		if err != nil {
+			return nil, fmt.Errorf("tiered_storage: recall decrypt %s: %w", logicalUnitID, err)
+		}
+	}
+
+	// 3. Verify checksum.
+	if meta.Checksum != "" {
+		actual := checksum(plaintext)
+		if actual != meta.Checksum {
+			return nil, fmt.Errorf("tiered_storage: recall checksum mismatch for %s: want %s got %s",
+				logicalUnitID, meta.Checksum, actual)
+		}
+	}
+
+	// 4. Write back to hot storage.
+	if _, err = tsm.hotAdapter.Write(logicalUnitID, plaintext); err != nil {
+		return nil, fmt.Errorf("tiered_storage: recall write hot for %s: %w", logicalUnitID, err)
+	}
+
+	// 5. Update metadata.
+	tsm.mu.Lock()
+	meta.CurrentTier = HotTier
+	meta.LocationPointer = logicalUnitID
+	meta.LastAccessTime = time.Now()
+	tsm.localTieringMetadataCache[logicalUnitID] = meta
+	tsm.mu.Unlock()
+
+	tsm.logger.Info("unit recalled to hot tier",
+		zap.String("unitID", logicalUnitID),
+		zap.Int("bytes", len(plaintext)))
+	return plaintext, nil
+}
+
+// GetMetadata returns the tiering metadata for a unit (for inspection / testing).
+func (tsm *TieredStorageManager) GetMetadata(unitID string) (TieredDataMetadata, bool) {
+	tsm.mu.RLock()
+	defer tsm.mu.RUnlock()
+	m, ok := tsm.localTieringMetadataCache[unitID]
+	return m, ok
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 func (tsm *TieredStorageManager) dlmPolicyEvaluationLoop() {
 	defer tsm.wg.Done()
-	// TODO: Make evaluation interval configurable
-	ticker := time.NewTicker(1 * time.Hour) // Evaluate policies periodically
+	ticker := time.NewTicker(tsm.cfg.evalInterval())
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-tsm.stopChan:
-			tsm.logger.Info("DLM policy evaluation loop stopping.")
+			tsm.logger.Info("DLM evaluation loop stopping")
 			return
 		case <-ticker.C:
-			tsm.logger.Info("Evaluating DLM policies...")
+			tsm.logger.Info("evaluating DLM policies")
 			tsm.evaluateAndExecutePolicies()
 		}
 	}
@@ -118,339 +263,226 @@ func (tsm *TieredStorageManager) evaluateAndExecutePolicies() {
 	copy(policies, tsm.dlmPolicies)
 	tsm.mu.RUnlock()
 
-	// Sort policies by priority if not already sorted
-	// sort.SliceStable(policies, func(i, j int) bool {
-	// 	return policies[i].Priority < policies[j].Priority
-	// })
+	// Lower priority number = higher priority; evaluate in ascending order.
+	sort.Slice(policies, func(i, j int) bool {
+		return policies[i].Priority < policies[j].Priority
+	})
 
 	for _, policy := range policies {
 		if !policy.IsEnabled {
 			continue
 		}
-		tsm.logger.Debug("Evaluating policy", zap.String("policyID", policy.PolicyID), zap.String("policyName", policy.PolicyName))
-
-		// 1. Identify candidate data units based on TargetEntityType and TargetEntityMatcher.
-		//    This requires querying metadata (from local cache or FSM).
-		//    Example: For UserTableData, iterate over pages/segments in policy.SourceTier.
-		//    Example: For WALSegments, ask tsm.walLogManager for archivable segments.
-
 		candidates, err := tsm.findCandidateDataUnits(policy)
 		if err != nil {
-			tsm.logger.Error("Failed to find candidate data units for policy", zap.String("policyID", policy.PolicyID), zap.Error(err))
+			tsm.logger.Error("findCandidateDataUnits failed",
+				zap.String("policy", policy.PolicyID), zap.Error(err))
 			continue
 		}
-
-		for _, unitMetadata := range candidates {
-			if unitMetadata.IsPinned {
-				tsm.logger.Debug("Skipping pinned data unit", zap.String("unitID", unitMetadata.LogicalUnitID))
+		for _, unit := range candidates {
+			if unit.IsPinned {
 				continue
 			}
-			if tsm.shouldMigrate(unitMetadata, policy) {
-				tsm.logger.Info("Data unit meets migration criteria",
-					zap.String("unitID", unitMetadata.LogicalUnitID),
-					zap.String("policyID", policy.PolicyID),
-					zap.String("sourceTier", string(unitMetadata.CurrentTier)),
-					zap.String("targetTier", string(policy.TargetTier)))
-
-				err := tsm.migrateDataUnit(unitMetadata, policy.TargetTier)
-				if err != nil {
-					tsm.logger.Error("Failed to migrate data unit",
-						zap.String("unitID", unitMetadata.LogicalUnitID),
-						zap.String("policyID", policy.PolicyID),
-						zap.Error(err))
-					// TODO: Implement retry logic or mark as "failed_migration" in metadata
-				} else {
-					tsm.logger.Info("Successfully migrated data unit",
-						zap.String("unitID", unitMetadata.LogicalUnitID),
-						zap.String("policyID", policy.PolicyID),
-						zap.String("newTier", string(policy.TargetTier)))
-				}
+			if !tsm.shouldMigrate(unit, policy) {
+				continue
 			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			if err := tsm.migrateDataUnit(ctx, unit, policy.TargetTier); err != nil {
+				tsm.logger.Error("migration failed",
+					zap.String("unitID", unit.LogicalUnitID),
+					zap.String("policy", policy.PolicyID),
+					zap.Error(err))
+			} else {
+				tsm.logger.Info("migration complete",
+					zap.String("unitID", unit.LogicalUnitID),
+					zap.String("targetTier", string(policy.TargetTier)))
+			}
+			cancel()
 		}
 	}
 }
 
-// findCandidateDataUnits fetches metadata for units that *could* be migrated by this policy.
 func (tsm *TieredStorageManager) findCandidateDataUnits(policy DLMPolicy) ([]TieredDataMetadata, error) {
-	// This is a complex part. It needs to:
-	// 1. Determine the scope (e.g., all pages of a certain table, all WALs).
-	// 2. Query the FSM (or a local replica of relevant metadata) for units in policy.SourceTier matching policy.TargetEntityType.
-	//    - For UserTableData, this might mean iterating through page metadata associated with specific shards/tables.
-	//    - For WALSegments, it means querying tsm.walLogManager.GetArchivableSegments()
-	//      (this method needs to be added to LogManager).
-	// This is a placeholder, actual implementation needs FSM interaction.
-	tsm.logger.Warn("findCandidateDataUnits is a placeholder and needs full FSM integration.", zap.Any("policy", policy))
+	tsm.mu.RLock()
+	defer tsm.mu.RUnlock()
 
 	var candidates []TieredDataMetadata
-	if policy.TargetEntityType == WALSegments && policy.SourceTier == HotTier {
-		// Example for WAL segments:
-		// archivableSegments, err := tsm.walLogManager.GetArchivableSegments(minAgeForArchival) // minAge from policy.TriggerValue
-		// if err != nil { return nil, err }
-		// for _, seg := range archivableSegments {
-		//    candidates = append(candidates, TieredDataMetadata{
-		//        LogicalUnitID: seg.Name, ShardID: "GLOBAL_WAL", /*or shard-specific if WALs are per-shard*/
-		//        CurrentTier: HotTier, Size: seg.Size, CreationTime: seg.CreationTime,
-		//    })
-		// }
-	} else if policy.TargetEntityType == UserTableData {
-		// Example for user data (pages/segments):
-		// Iterate through localTieringMetadataCache or query FSM
-		// This needs to be efficient. FSM might need to support queries like:
-		// "Get all units in shard X, table Y, currently in HotTier, older than Z days."
-		tsm.mu.RLock()
-		for _, meta := range tsm.localTieringMetadataCache {
-			if meta.CurrentTier == policy.SourceTier { // Simplified check
-				// Further matching based on policy.TargetEntityMatcher would go here
-				candidates = append(candidates, meta)
-			}
+	for _, meta := range tsm.localTieringMetadataCache {
+		if meta.CurrentTier != policy.SourceTier {
+			continue
 		}
-		tsm.mu.RUnlock()
+		if policy.TargetEntityType == WALSegments && meta.CustomTags["type"] != "wal" {
+			continue
+		}
+		if policy.TargetEntityType == IndexData && meta.CustomTags["type"] != "index" {
+			continue
+		}
+		candidates = append(candidates, meta)
 	}
-
 	return candidates, nil
 }
 
-// shouldMigrate checks if a specific data unit meets the policy's trigger conditions.
 func (tsm *TieredStorageManager) shouldMigrate(unit TieredDataMetadata, policy DLMPolicy) bool {
 	switch policy.TriggerType {
 	case Age:
-		ageDuration, err := time.ParseDuration(policy.TriggerValue) // e.g., "90d" -> 90 * 24 * time.Hour
+		d, err := time.ParseDuration(policy.TriggerValue)
 		if err != nil {
-			tsm.logger.Error("Invalid age duration in policy", zap.String("policyID", policy.PolicyID), zap.String("value", policy.TriggerValue), zap.Error(err))
+			tsm.logger.Error("invalid age trigger value",
+				zap.String("policy", policy.PolicyID),
+				zap.String("value", policy.TriggerValue))
 			return false
 		}
-		// Use LastModifiedTime or CreationTime depending on data type and policy intent
-		referenceTime := unit.LastModifiedTime
-		if referenceTime.IsZero() {
-			referenceTime = unit.CreationTime
+		ref := unit.LastModifiedTime
+		if ref.IsZero() {
+			ref = unit.CreationTime
 		}
-		if time.Since(referenceTime) >= ageDuration {
-			return true
-		}
+		return time.Since(ref) >= d
+
 	case AccessFrequency:
-		// Requires access frequency tracking. Parse policy.TriggerValue (e.g., "<5_reads_last_30d")
-		// Compare against unit.AccessFrequencyScore or similar metric.
-		tsm.logger.Warn("AccessFrequency trigger not yet fully implemented.", zap.String("unitID", unit.LogicalUnitID))
-		return false // Placeholder
+		// TriggerValue is a float threshold; migrate if score is BELOW it
+		// (rarely accessed data should move to cold).
+		var threshold float64
+		if _, err := fmt.Sscanf(policy.TriggerValue, "%f", &threshold); err != nil {
+			return false
+		}
+		return unit.AccessFrequencyScore < threshold
+
 	case Utilization:
-		// This trigger type usually applies to the source tier as a whole, not individual units.
-		// The evaluation loop might check source tier utilization first before checking individual units.
-		// Or, policy applies if source_tier_util > X AND unit_age > Y.
-		tsm.logger.Warn("Utilization trigger not yet fully implemented.", zap.String("unitID", unit.LogicalUnitID))
-		return false // Placeholder
-	default:
-		tsm.logger.Warn("Unknown trigger type in policy", zap.String("policyID", policy.PolicyID), zap.String("trigger", string(policy.TriggerType)))
-		return false
+		// Utilization-based policies are evaluated at the tier level.
+		// Without a tier-level utilization API, we use unit size as a proxy:
+		// if the unit is larger than TriggerValue bytes, consider it for archival.
+		var minBytes int64
+		if _, err := fmt.Sscanf(policy.TriggerValue, "%d", &minBytes); err != nil {
+			return false
+		}
+		return unit.Size >= minBytes
 	}
 	return false
 }
 
-// migrateDataUnit performs the actual data movement and metadata update.
-func (tsm *TieredStorageManager) migrateDataUnit(unit TieredDataMetadata, targetTier StorageTierType) error {
-	tsm.logger.Info("Attempting to migrate data unit",
+// migrateDataUnit moves a unit from its current tier to targetTier.
+func (tsm *TieredStorageManager) migrateDataUnit(ctx context.Context, unit TieredDataMetadata, targetTier StorageTierType) error {
+	tsm.logger.Info("migrating unit",
 		zap.String("unitID", unit.LogicalUnitID),
-		zap.String("fromTier", string(unit.CurrentTier)),
-		zap.String("toTier", string(targetTier)))
+		zap.String("from", string(unit.CurrentTier)),
+		zap.String("to", string(targetTier)))
 
-	var data []byte
-	// var err error
+	// 1. Read from source tier.
+	data, err := tsm.readFromTier(ctx, unit)
+	if err != nil {
+		return fmt.Errorf("tiered_storage: read source for %s: %w", unit.LogicalUnitID, err)
+	}
 
-	// 1. Read data from the source tier
-	if unit.CurrentTier == HotTier {
-		if unit.LogicalUnitID[:4] == "page" { // Assuming LogicalUnitID for pages is "page-<PageID>"
-			// pageID, _ := strconv.Atoi(unit.LogicalUnitID[5:])
-			// pageData, err := tsm.pageManager.ReadPageForTiering(pagemanager.PageID(pageID)) // Needs method on PageManager
-			// if err != nil { return fmt.Errorf("failed to read page %s from hot tier: %w", unit.LogicalUnitID, err) }
-			// data = pageData.GetData()
-			return fmt.Errorf("reading page data from hot tier not fully implemented for tiering")
-		} else if unit.LogicalUnitID[:3] == "wal" { // Assuming "wal-<SegmentName>"
-			// walSegmentName := unit.LogicalUnitID[4:]
-			// data, err = tsm.walLogManager.ReadWALSegmentForArchival(walSegmentName) // Needs method on LogManager
-			// if err != nil { return fmt.Errorf("failed to read WAL segment %s: %w", walSegmentName, err) }
-			return fmt.Errorf("reading WAL segment data not fully implemented for tiering")
-		} else {
-			return fmt.Errorf("unknown data unit type in hot tier: %s", unit.LogicalUnitID)
+	// 2. Compute plaintext checksum for later verification.
+	plainChecksum := checksum(data)
+
+	// 3. Optionally encrypt.
+	toWrite := data
+	encKeyID := ""
+	if tsm.crypto != nil {
+		toWrite, err = tsm.crypto.Encrypt(data)
+		if err != nil {
+			return fmt.Errorf("tiered_storage: encrypt %s: %w", unit.LogicalUnitID, err)
 		}
-	} else {
-		// Reading from another cold/warm tier (e.g., warm to cold)
-		// This would involve using the appropriate adapter for unit.CurrentTier
-		// data, err = tsm.getAdapterForTier(unit.CurrentTier).Read(unit.LocationPointer)
-		// if err != nil { return fmt.Errorf("failed to read data unit %s from %s: %w", unit.LogicalUnitID, unit.CurrentTier, err) }
-		return fmt.Errorf("reading from non-hot tier (%s) not implemented yet", unit.CurrentTier)
-	}
-	_ = data // Use data
-
-	// 2. TODO: Encrypt data if targetTier requires/policy dictates, using crypto_utils.
-
-	// 3. Write data to the target tier
-	var newLocationPointer string
-	targetAdapter := tsm.getAdapterForTier(targetTier)
-	if targetAdapter == nil {
-		return fmt.Errorf("no adapter found for target tier: %s", targetTier)
-	}
-	// newLocationPointer, err = targetAdapter.Write(unit.LogicalUnitID, data) // Write method on adapter
-	// if err != nil { return fmt.Errorf("failed to write unit %s to %s: %w", unit.LogicalUnitID, targetTier, err) }
-	_ = newLocationPointer
-	return fmt.Errorf("writing to target tier not fully implemented")
-
-	// 4. TODO: Verify write (e.g., read back and checksum, or use adapter's verification)
-
-	// 5. Update metadata in FSM (this must be atomic)
-	// updatedMetadata := unit
-	// updatedMetadata.CurrentTier = targetTier
-	// updatedMetadata.LocationPointer = newLocationPointer
-	// updatedMetadata.LastModifiedTime = time.Now() // Or keep original if policy dictates
-
-	// cmd := fsm.Command{Type: fsm.CommandUpdateTieringMetadata, TieringMetadata: updatedMetadata}
-	// if err := tsm.fsmClient.Apply(cmd); err != nil {
-	//    // IMPORTANT: Handle failure here. If FSM update fails, we might have orphaned data in targetTier.
-	//    // Need a cleanup mechanism or retry for FSM update.
-	//    tsm.logger.Error("CRITICAL: Failed to update FSM tiering metadata after successful write to target tier.",
-	//        zap.String("unitID", unit.LogicalUnitID), zap.String("targetTier", string(targetTier)), zap.Error(err))
-	//    // TODO: Attempt to delete from targetTier if FSM update is conclusively failed.
-	//    return fmt.Errorf("failed to commit tiering metadata update to FSM: %w", err)
-	// }
-
-	// 6. Update local cache
-	// tsm.mu.Lock()
-	// tsm.localTieringMetadataCache[unit.LogicalUnitID] = updatedMetadata
-	// tsm.mu.Unlock()
-
-	// 7. If original tier was hot, inform PageManager/BufferPoolManager that the page can be evicted
-	// if unit.CurrentTier == HotTier && unit.LogicalUnitID[:4] == "page" {
-	//    pageID, _ := strconv.Atoi(unit.LogicalUnitID[5:])
-	//    tsm.pageManager.MarkPageTieredOut(pagemanager.PageID(pageID), targetTier, newLocationPointer)
-	// }
-
-	// return nil
-}
-
-// RecallDataUnit fetches a data unit from a colder tier into the hot tier.
-// This is called when a tiered-out data unit is accessed.
-func (tsm *TieredStorageManager) RecallDataUnit(logicalUnitID string) ([]byte, error) {
-	// 1. Get metadata from FSM (or cache)
-	// meta, err := tsm.getTieringMetadata(logicalUnitID)
-	// if err != nil { return nil, err}
-	// if meta.CurrentTier == HotTier { return nil, fmt.Errorf("unit %s is already in hot tier", logicalUnitID) }
-
-	// 2. Read from meta.CurrentTier using meta.LocationPointer and appropriate adapter
-	// sourceAdapter := tsm.getAdapterForTier(meta.CurrentTier)
-	// if sourceAdapter == nil { return nil, fmt.Errorf("no adapter for source tier %s of unit %s", meta.CurrentTier, logicalUnitID) }
-	// data, err := sourceAdapter.Read(meta.LocationPointer)
-	// if err != nil { return nil, fmt.Errorf("failed to read unit %s from %s: %w", logicalUnitID, meta.CurrentTier, err) }
-
-	// 3. TODO: Decrypt if necessary
-
-	// 4. Write to hot tier (e.g., load into BufferPoolManager)
-	//    This depends on the type of logicalUnitID.
-	// if logicalUnitID[:4] == "page" {
-	//    pageID, _ := strconv.Atoi(logicalUnitID[5:])
-	//    err := tsm.pageManager.LoadRecalledPage(pagemanager.PageID(pageID), data)
-	//    if err != nil { return nil, fmt.Errorf("failed to load recalled page %s into buffer pool: %w", logicalUnitID, err) }
-	// } else {
-	//    return nil, fmt.Errorf("recall for unit type of %s not implemented", logicalUnitID)
-	// }
-
-	// 5. Update FSM metadata: unit is now also in HotTier (or primarily in HotTier)
-	//    The policy might be to keep it in both temporarily, or move it.
-	//    For simplicity, let's assume it's now considered Hot.
-	// newMeta := meta
-	// newMeta.CurrentTier = HotTier
-	// newMeta.LocationPointer = "" // Pointer for hot tier is implicit or handled by PageManager
-	// newMeta.LastAccessTime = time.Now()
-
-	// cmd := fsm.Command{Type: fsm.CommandUpdateTieringMetadata, TieringMetadata: newMeta}
-	// if err := tsm.fsmClient.Apply(cmd); err != nil {
-	//    return data, fmt.Errorf("failed to update FSM tiering metadata after recall (data recalled successfully): %w", err)
-	// }
-	// tsm.mu.Lock()
-	// tsm.localTieringMetadataCache[logicalUnitID] = newMeta
-	// tsm.mu.Unlock()
-
-	// return data, nil
-	return nil, fmt.Errorf("RecallDataUnit not fully implemented")
-}
-
-// getAdapterForTier returns the appropriate storage adapter for a given tier.
-func (tsm *TieredStorageManager) getAdapterForTier(tier StorageTierType) *coldstorage.ColdStorageAdapter { // Return general interface
-	// This logic will expand as more tier types and adapters are added.
-	// For now, assumes all non-hot tiers use the single coldStorageAdapter.
-	switch tier {
-	case HotTier:
-		// Hot tier interaction is usually via PageManager or direct HotStorageAdapter for some ops
-		tsm.logger.Warn("Attempted to get generic adapter for HotTier; direct interaction preferred.", zap.String("tier", string(tier)))
-		return nil // Or return tsm.hotStorageAdapter if it fits a common interface
-	case ColdTierS3, ColdTierS3GDA, ColdTierS3GF, ColdTierS3GIR, ColdTierS3GS, ColdTierGCSArchive, ColdTierGCSColdline, ColdTierGCSNearline, WarmTierCloud:
-		// All these could potentially map to tsm.coldStorageAdapter if it's configured for S3/GCS.
-		// This needs to be more sophisticated, possibly a map of TierType -> AdapterInstance.
-		// For simplicity now, assuming coldStorageAdapter handles all these.
-		if tsm.coldStorageAdapter.GetAdapterType() == "s3" && (strings.HasPrefix(string(tier), "cold_s3") || strings.HasPrefix(string(tier), "warm_s3")) {
-			return tsm.coldStorageAdapter
-		}
-		if tsm.coldStorageAdapter.GetAdapterType() == "gcs" && (strings.HasPrefix(string(tier), "cold_gcs") || strings.HasPrefix(string(tier), "warm_gcs")) {
-			return tsm.coldStorageAdapter
-		}
-		tsm.logger.Error("No specific cold adapter configured for tier, returning default cold adapter", zap.String("tier", string(tier)), zap.String("adapterType", tsm.coldStorageAdapter.GetAdapterType()))
-		return tsm.coldStorageAdapter // Fallback, might be wrong
-	// case WarmTierLocal:
-	// return tsm.warmStorageAdapter // When implemented
-	default:
-		tsm.logger.Error("Unknown or unsupported storage tier", zap.String("tier", string(tier)))
-		return nil
-	}
-}
-
-// getTieringMetadata retrieves metadata for a logical unit, preferring cache, then FSM.
-func (tsm *TieredStorageManager) getTieringMetadata(logicalUnitID string) (TieredDataMetadata, error) {
-	tsm.mu.RLock()
-	meta, found := tsm.localTieringMetadataCache[logicalUnitID]
-	tsm.mu.RUnlock()
-	if found {
-		return meta, nil
+		encKeyID = "aes-gcm-v1"
 	}
 
-	// TODO: Fetch from FSM
-	// meta, err := tsm.fsmClient.GetTieringMetadata(logicalUnitID)
-	// if err != nil { return TieredDataMetadata{}, err }
-	// if meta != nil {
-	//    tsm.mu.Lock()
-	//    tsm.localTieringMetadataCache[logicalUnitID] = *meta
-	//    tsm.mu.Unlock()
-	//    return *meta, nil
-	// }
-	return TieredDataMetadata{}, fmt.Errorf("metadata for unit %s not found", logicalUnitID)
-}
+	// 4. Write to target tier with retry.
+	objectKey := unit.LogicalUnitID
+	var uri string
+	if err = tsm.writeWithRetry(ctx, objectKey, toWrite, &uri); err != nil {
+		return fmt.Errorf("tiered_storage: write cold for %s: %w", unit.LogicalUnitID, err)
+	}
 
-// UpdateAccessStats is called by PageManager or other components when a data unit is accessed.
-func (tsm *TieredStorageManager) UpdateAccessStats(logicalUnitID string, accessTime time.Time) {
-	// This should update the LastAccessTime and AccessFrequencyScore in the FSM.
-	// It might batch updates to FSM to avoid overhead.
-	tsm.logger.Debug("Access detected, stats update pending for FSM", zap.String("unitID", logicalUnitID), zap.Time("accessTime", accessTime))
+	// 5. Verify: read back, decrypt, compare checksum.
+	if err = tsm.verifyWrite(ctx, objectKey, plainChecksum); err != nil {
+		// Best-effort cleanup of the orphaned object.
+		_ = tsm.coldAdapter.Delete(ctx, objectKey)
+		return fmt.Errorf("tiered_storage: verify write for %s: %w", unit.LogicalUnitID, err)
+	}
 
-	// For now, update local cache; a background job could sync this to FSM periodically or FSM updated directly.
+	// 6. Update metadata.
 	tsm.mu.Lock()
-	defer tsm.mu.Unlock()
-	if meta, exists := tsm.localTieringMetadataCache[logicalUnitID]; exists {
-		meta.LastAccessTime = accessTime
-		// TODO: Update AccessFrequencyScore based on an algorithm (e.g., EWMA, counter)
-		tsm.localTieringMetadataCache[logicalUnitID] = meta
-	} else {
-		// If not in cache, it implies it might be newly created in hot tier or needs fetch from FSM.
-		// For now, log it. A robust system would fetch from FSM, update, and propose back.
-		tsm.logger.Debug("Access to unit not in local tiering cache", zap.String("unitID", logicalUnitID))
+	updated := unit
+	updated.CurrentTier = targetTier
+	updated.LocationPointer = objectKey
+	updated.Checksum = plainChecksum
+	updated.EncryptionKeyID = encKeyID
+	updated.LastModifiedTime = time.Now()
+	tsm.localTieringMetadataCache[unit.LogicalUnitID] = updated
+	tsm.mu.Unlock()
+
+	// 7. Remove from hot tier if we just moved it out.
+	if unit.CurrentTier == HotTier {
+		if delErr := tsm.hotAdapter.Delete(unit.LogicalUnitID); delErr != nil {
+			tsm.logger.Warn("failed to delete tiered-out unit from hot storage",
+				zap.String("unitID", unit.LogicalUnitID), zap.Error(delErr))
+		}
 	}
-	// cmd := fsm.Command{Type: fsm.CommandUpdateTieringAccessStats, LogicalUnitID: logicalUnitID, AccessTime: accessTime}
-	// err := tsm.fsmClient.Apply(cmd)
-	// if err != nil {
-	//  tsm.logger.Error("Failed to update access stats in FSM", zap.String("unitID", logicalUnitID), zap.Error(err))
-	// }
+
+	return nil
 }
 
-// Close any resources held by TieredStorageManager
-func (tsm *TieredStorageManager) Close() error {
-	// This method might be needed if the manager holds closable resources,
-	// like persistent connections to a metadata store or specific adapters.
-	// For now, Stop() handles goroutine cleanup.
-	tsm.logger.Info("TieredStorageManager closed.")
+func (tsm *TieredStorageManager) readFromTier(ctx context.Context, unit TieredDataMetadata) ([]byte, error) {
+	switch unit.CurrentTier {
+	case HotTier:
+		return tsm.hotAdapter.Read(unit.LogicalUnitID)
+	default:
+		return tsm.coldAdapter.Read(ctx, unit.LocationPointer)
+	}
+}
+
+func (tsm *TieredStorageManager) writeWithRetry(ctx context.Context, objectKey string, data []byte, uriOut *string) error {
+	maxRetries := tsm.cfg.maxRetries()
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * defaultRetryBase
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		uri, err := tsm.coldAdapter.Write(ctx, objectKey, data)
+		if err == nil {
+			if uriOut != nil {
+				*uriOut = uri
+			}
+			return nil
+		}
+		lastErr = err
+		tsm.logger.Warn("cold storage write failed, retrying",
+			zap.String("objectKey", objectKey),
+			zap.Int("attempt", attempt+1),
+			zap.Error(err))
+	}
+	return fmt.Errorf("all %d write attempts failed: %w", maxRetries, lastErr)
+}
+
+func (tsm *TieredStorageManager) verifyWrite(ctx context.Context, objectKey, expected string) error {
+	raw, err := tsm.coldAdapter.Read(ctx, objectKey)
+	if err != nil {
+		return fmt.Errorf("verify read failed: %w", err)
+	}
+
+	// Decrypt before comparing if encryption is enabled.
+	plaintext := raw
+	if tsm.crypto != nil {
+		plaintext, err = tsm.crypto.Decrypt(raw)
+		if err != nil {
+			return fmt.Errorf("verify decrypt failed: %w", err)
+		}
+	}
+
+	actual := checksum(plaintext)
+	if actual != expected {
+		return fmt.Errorf("checksum mismatch: want %s got %s", expected, actual)
+	}
 	return nil
+}
+
+// checksum returns the hex-encoded SHA-256 digest of data.
+func checksum(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
 }

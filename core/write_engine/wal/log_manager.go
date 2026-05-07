@@ -370,6 +370,35 @@ func (l *LogManager) GetCurrentLSN() LSN {
 	return l.currentLSN
 }
 
+// GetSegmentFilesForBackup returns the paths of all WAL segment files that contain
+// records at or after fromLSN.  The caller should include these files verbatim in
+// a backup so that ARIES recovery can replay them on top of the snapshot.
+func (lm *LogManager) GetSegmentFilesForBackup(fromLSN LSN) ([]string, error) {
+	lm.mu.RLock()
+	defer lm.mu.RUnlock()
+
+	// Find the segment whose start LSN is the largest one that is <= fromLSN.
+	// That segment may contain records both before and after fromLSN.
+	cutoffID := -1
+	for segID, startLSN := range lm.segmentStartLSNs {
+		if startLSN <= fromLSN && (cutoffID < 0 || segID > cutoffID) {
+			cutoffID = segID
+		}
+	}
+
+	var files []string
+	for segID := range lm.segmentStartLSNs {
+		if cutoffID < 0 || segID >= cutoffID {
+			p := filepath.Join(lm.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segID, walFileSuffix))
+			if _, err := os.Stat(p); err == nil {
+				files = append(files, p)
+			}
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
 func (lm *LogManager) runPruningLoop() {
 	defer lm.wg.Done()
 	// Initial delay before first prune — interruptible by shutdown.
