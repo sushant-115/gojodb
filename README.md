@@ -1,23 +1,11 @@
-# **# **GojoDB - A Universal, Horizontally Scalable Database****
+# GojoDB — A Universal, Horizontally Scalable Database
 
-GojoDB is an ambitious project to build a universal database designed for extreme extensibility, horizontal scalability, and robust resource management. It aims to provide high availability and fault tolerance for modern data-intensive applications. It is a distributed key-value database designed for high availability, fault tolerance, and efficient data retrieval, particularly for text-based content. It features built-in log replication, tiered storage management, and an inverted indexing system for fast full-text search capabilities.
+GojoDB is a distributed key-value database written in Go. It combines Raft-based cluster coordination, a pluggable multi-index storage layer (B-tree, inverted index, R-tree spatial), write-ahead logging with log replication, and tiered storage management to provide a durable, query-rich data platform.
+
+**Full documentation**: [docs/README.md](docs/README.md)
 
 - Milestone Plan: https://docs.google.com/document/d/1h7EVUI1Cq3jjjEcOZ7-OIjjvjgEIi4mn-BAsKBBYFE4/edit?usp=sharing
-
 - High level and low level design: https://docs.google.com/document/d/1kh8X3yKDaBk03Aa7z_Pp-rm8j2Sb-1Z8Owm_eKGecxY/edit?usp=sharing
-
-## **Table of Contents**
-
-* [Features](#bookmark=id.k5zvhpjvts40)  
-* [Architecture](#bookmark=id.4jbqgzqjj3t9)  
-* [Getting Started](#bookmark=id.umldwf2e0i06)  
-  * [Prerequisites](#bookmark=id.kdo370vpj78h)  
-  * [Building the Project](#bookmark=id.hynjg25smlah)  
-  * [Running Standalone Server](#bookmark=id.7k52i5rge9by)  
-  * [Running a Cluster](#bookmark=id.7fug6qbm9ac0)  
-* [Usage](#bookmark=id.nrdatfveijaq)  
-* [Contributing](#bookmark=id.yyg2cwpezt6l)  
-* [License](#bookmark=id.h2mv664i2ufv)
 
 ## **Features**
 

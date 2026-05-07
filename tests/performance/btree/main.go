@@ -40,6 +40,7 @@ func main() {
 		},
 		10000,
 		4096,
+		2000,
 		logManager,
 		zlogger.Named("btree_index"),
 	)

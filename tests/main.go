@@ -70,7 +70,7 @@ func main() {
 
 	// 2. Create a new B-tree database
 	fmt.Printf("\nAttempting to create a new B-tree at %s...\n", dbFilePath)
-	bt, err := btree.NewBTreeFile[string, string](dbFilePath, degree, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager, zapLogger)
+	bt, err := btree.NewBTreeFile[string, string](dbFilePath, degree, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, 2000, logManager, zapLogger)
 	if err != nil {
 		log.Fatalf("Failed to create new B-tree file: %v", err)
 	}
@@ -164,7 +164,7 @@ func main() {
 
 	// 8. Re-open the database, triggering recovery via LogManager
 	fmt.Printf("\nAttempting to re-open B-tree at %s with recovery...\n", dbFilePath)
-	btRecovered, err := btree.OpenBTreeFile[string, string](dbFilePath, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, logManager, zapLogger)
+	btRecovered, err := btree.OpenBTreeFile[string, string](dbFilePath, btree.DefaultKeyOrder[string], kvSerializers, poolSize, pageSize, 2000, logManager, zapLogger)
 	if err != nil {
 		log.Fatalf("Failed to open existing B-tree file for recovery: %v", err)
 	}

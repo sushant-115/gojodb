@@ -436,5 +436,5 @@ func (m *Manager) appendTxnRecord(txnID uint64, recType wal.LogRecordType, data 
 		Timestamp: time.Now().UnixNano(),
 		Data:      data,
 	}
-	return m.logManager.AppendRecord(record, wal.LogTypeBtree)
+	return m.logManager.AppendRecord(context.TODO(), record, wal.LogTypeBtree)
 }

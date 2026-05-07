@@ -2,6 +2,7 @@ package spatial
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -410,7 +411,7 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 			Data:      page.GetData(), // Store new root ID
 			LSN:       rt.lm.GetCurrentLSN(),
 		}
-		if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
+		if _, err := rt.lm.AppendRecord(context.TODO(), logRecord, wal.LogTypeSpatial); err != nil {
 			return fmt.Errorf("failed to log R-tree new root: %w", err)
 		}
 
@@ -474,7 +475,7 @@ func (rt *RTree) Insert(rect Rect, data SpatialData) error {
 		Data:      page.GetData(),
 		LSN:       rt.lm.GetCurrentLSN(),
 	}
-	if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
+	if _, err := rt.lm.AppendRecord(context.TODO(), logRecord, wal.LogTypeSpatial); err != nil {
 		//leafNode.mu.Unlock()
 		return fmt.Errorf("failed to log R-tree insert: %w", err)
 	}
@@ -610,7 +611,7 @@ func (rt *RTree) splitNode(oldNode *Node) (*Node, error) {
 			oldNode.pageID, newNode.pageID, len(oldNode.entries), len(newNode.entries))),
 		LSN: rt.lm.GetCurrentLSN(),
 	}
-	if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
+	if _, err := rt.lm.AppendRecord(context.TODO(), logRecord, wal.LogTypeSpatial); err != nil {
 		return nil, fmt.Errorf("failed to log R-tree split: %w", err)
 	}
 
@@ -704,7 +705,7 @@ func (rt *RTree) adjustTree(node *Node, newNode *Node) error {
 					Data:      binary.LittleEndian.AppendUint64(nil, uint64(newRootPageID)), // Store new root ID
 					LSN:       rt.lm.GetCurrentLSN(),
 				}
-				if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
+				if _, err := rt.lm.AppendRecord(context.TODO(), logRecord, wal.LogTypeSpatial); err != nil {
 					return fmt.Errorf("failed to log R-tree new root after root split: %w", err)
 				}
 
@@ -781,7 +782,7 @@ func (rt *RTree) adjustTree(node *Node, newNode *Node) error {
 			Data:      parentPage.GetData(), // Store the full page data for replay
 			LSN:       rt.lm.GetCurrentLSN(),
 		}
-		if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
+		if _, err := rt.lm.AppendRecord(context.TODO(), logRecord, wal.LogTypeSpatial); err != nil {
 			parentNode.mu.Unlock()
 			return fmt.Errorf("failed to log R-tree parent update: %w", err)
 		}
@@ -887,7 +888,7 @@ func (rt *RTree) Delete(rect Rect, data SpatialData) error {
 			Data:      binary.LittleEndian.AppendUint64(nil, uint64(pagemanager.InvalidPageID)),
 			LSN:       rt.lm.GetCurrentLSN(),
 		}
-		if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
+		if _, err := rt.lm.AppendRecord(context.TODO(), logRecord, wal.LogTypeSpatial); err != nil {
 			return fmt.Errorf("failed to log R-tree empty root: %w", err)
 		}
 
@@ -931,7 +932,7 @@ func (rt *RTree) deleteRecursive(currentPageID pagemanager.PageID, targetRect Re
 					Data:      []byte(fmt.Sprintf(`{"Rect":{"MinX":%f,"MinY":%f,"MaxX":%f,"MaxY":%f},"Data":{"ID":"%s"}}`, targetRect.MinX, targetRect.MinY, targetRect.MaxX, targetRect.MaxY, targetData.ID)), // Serialize entry for WAL
 					LSN:       rt.lm.GetCurrentLSN(),
 				}
-				if _, err := rt.lm.AppendRecord(logRecord, wal.LogTypeSpatial); err != nil {
+				if _, err := rt.lm.AppendRecord(context.TODO(), logRecord, wal.LogTypeSpatial); err != nil {
 					return false, fmt.Errorf("failed to log R-tree delete: %w", err)
 				}
 			} else {

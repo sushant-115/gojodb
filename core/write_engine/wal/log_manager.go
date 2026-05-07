@@ -3,6 +3,7 @@ package wal
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -37,6 +38,9 @@ const (
 var (
 	encryptionKey = []byte("SOMEKEY1SOMEKEY1")
 )
+
+// encodeBufPool pools bytes.Buffer instances used by LogRecord.Encode to reduce allocations.
+var encodeBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 type LSN uint64
 
@@ -102,8 +106,10 @@ type commitRequest struct {
 
 // Encode serializes the LogRecord into a byte slice for network transmission or disk storage.
 func (lr *LogRecord) Encode() ([]byte, error) {
-	// Use a buffer for efficient byte concatenation.
-	buf := new(bytes.Buffer)
+	// Use a pooled buffer for efficient byte concatenation.
+	buf := encodeBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer encodeBufPool.Put(buf)
 
 	// Write fixed-size fields using binary.BigEndian.
 	// The order of writing must be strictly maintained for decoding.
@@ -162,7 +168,10 @@ func (lr *LogRecord) Encode() ([]byte, error) {
 	// Finally, we can set the total record size and return the full byte slice.
 	lr.RecordSize = uint32(buf.Len())
 
-	return buf.Bytes(), nil
+	// Copy before returning because buf goes back to the pool after this function returns.
+	result := make([]byte, buf.Len())
+	copy(result, buf.Bytes())
+	return result, nil
 }
 
 // DecodeLogRecord deserializes a byte slice back into a LogRecord struct.
@@ -349,16 +358,20 @@ func NewLogManager(walDir string, logger *zap.Logger, indextype indexing.IndexTy
 	go lm.logWriter()
 
 	// Start a background goroutine for periodic pruning
+	lm.wg.Add(1)
 	go lm.runPruningLoop()
 
 	return lm, nil
 }
 
 func (l *LogManager) GetCurrentLSN() LSN {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.currentLSN
 }
 
 func (lm *LogManager) runPruningLoop() {
+	defer lm.wg.Done()
 	// Prune shortly after startup and then periodically
 	time.Sleep(1 * time.Minute)
 	ticker := time.NewTicker(5 * time.Minute)
@@ -375,9 +388,9 @@ func (lm *LogManager) runPruningLoop() {
 }
 
 func (lm *LogManager) pruneOldSegments() {
-	lm.mtx.Lock()
+	lm.mu.RLock()
 	checkpointLSN := lm.currentLSN
-	lm.mtx.Unlock()
+	lm.mu.RUnlock()
 
 	if checkpointLSN == 0 {
 		lm.logger.Debug("Skipping WAL pruning, no checkpoint has been set.")
@@ -424,7 +437,7 @@ func (lm *LogManager) pruneOldSegments() {
 		nextSegmentStartLSN := lm.segmentStartLSNs[nextSegmentID]
 
 		if segmentID < int(lm.currentSegmentID) && nextSegmentStartLSN < safeLSN {
-			filePath := filepath.Join(lm.walDir, fmt.Sprintf("%s%d%s", walFilePrefix, segmentID, walFileSuffix))
+			filePath := filepath.Join(lm.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segmentID, walFileSuffix))
 			lm.logger.Info("Pruning old WAL segment", zap.String("file", filePath), zap.Int("segmentID", segmentID))
 			err := os.Remove(filePath)
 			if err != nil {
@@ -485,7 +498,6 @@ func (lm *LogManager) GetWALReaderForStreaming(fromLSN LSN, slotName string) (*W
 		slotName:   slotName,
 		stopChan:   make(chan struct{}),
 	}
-	reader.wg.Add(1)
 
 	// Open the initial segment using the effective LSN
 	if err := reader.openSegmentForLSN(slot.RestartLSN); err != nil {
@@ -539,7 +551,8 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) ([]byte, error) {
 						r.logManager.cond.Wait()
 					}
 					r.logManager.mtx.Unlock()
-					continue // Retry reading after being woken up
+					time.Sleep(5 * time.Millisecond) // avoid tight spin on spurious broadcast
+					continue                         // Retry reading after being woken up
 				}
 				// A real error occurred while reading the size
 				r.logManager.logger.Error("Error reading log record size", zap.Error(err))
@@ -579,7 +592,6 @@ func (r *WALStreamReader) Next(logRecord *LogRecord) ([]byte, error) {
 func (r *WALStreamReader) Close() error {
 	close(r.stopChan)
 	r.logManager.cond.Broadcast() // Wake up the reader if it's waiting, so it can exit
-	r.wg.Wait()
 
 	r.logManager.slotsMtx.Lock()
 	if slot, exists := r.logManager.replicationSlots[r.slotName]; exists {
@@ -602,8 +614,8 @@ func (r *WALStreamReader) openSegmentForLSN(lsn LSN) error {
 	r.logManager.segmentMetaMtx.RLock()
 	defer r.logManager.segmentMetaMtx.RUnlock()
 
-	var targetSegmentID = 1
-	var latestSegmentID = 1
+	var targetSegmentID = -1
+	var latestSegmentID = -1
 	var latestSegmentStartLSN LSN = 0
 
 	// Find the segment containing the LSN
@@ -728,8 +740,17 @@ func (lm *LogManager) recover() error {
 			continue
 		}
 
+		segmentPath := filepath.Join(lm.walDir, file.Name())
+
+		// Populate segmentStartLSNs for every discovered segment (Fix 6).
+		firstLSN, firstErr := lm.findFirstLSNInSegment(segmentPath)
+		if firstErr != nil {
+			lm.logger.Warn("Could not determine first LSN for segment", zap.String("segmentPath", segmentPath), zap.Error(firstErr))
+		} else if firstLSN > 0 {
+			lm.segmentStartLSNs[int(segmentID)] = firstLSN
+		}
+
 		if segmentID >= lastSegmentID { // Find the highest segment ID
-			segmentPath := filepath.Join(lm.walDir, file.Name())
 			tempLastLSN, err := lm.findLastLSNInSegment(segmentPath)
 			if err != nil {
 				lm.logger.Error("Failed to find last LSN in segment, segment might be corrupt or empty", zap.String("segmentPath", segmentPath), zap.Error(err))
@@ -849,6 +870,32 @@ func (lm *LogManager) findLastLSNInSegment(segmentPath string) (LSN, error) {
 	return lastReadLSN, nil
 }
 
+// findFirstLSNInSegment reads just the first record from a WAL segment and returns its LSN.
+// Returns (0, nil) for an empty segment.
+func (lm *LogManager) findFirstLSNInSegment(segmentPath string) (LSN, error) {
+	file, err := os.Open(segmentPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open segment %s: %w", segmentPath, err)
+	}
+	defer file.Close()
+
+	var recordSize uint32
+	if err := binary.Read(file, binary.BigEndian, &recordSize); err != nil {
+		if err == io.EOF {
+			return 0, nil // empty segment
+		}
+		return 0, fmt.Errorf("error reading first record size in %s: %w", segmentPath, err)
+	}
+	if recordSize < 8 {
+		return 0, fmt.Errorf("first record too small to contain LSN in %s", segmentPath)
+	}
+	lsnBytes := make([]byte, 8)
+	if _, err := io.ReadFull(file, lsnBytes); err != nil {
+		return 0, fmt.Errorf("error reading first LSN bytes in %s: %w", segmentPath, err)
+	}
+	return LSN(binary.BigEndian.Uint64(lsnBytes)), nil
+}
+
 func (lm *LogManager) openNewSegment(segmentID uint64) error {
 	segmentPath := filepath.Join(lm.walDir, fmt.Sprintf("%s%020d%s", walFilePrefix, segmentID, walFileSuffix))
 	f, err := os.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0640) // Use 0640 permissions
@@ -875,7 +922,8 @@ func (lm *LogManager) persistReplicationSlots() error {
 
 // AppendRecord appends a log record to the WAL.
 // AppendRecord now sends the log record to a channel and waits for confirmation.
-func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) {
+func (lm *LogManager) AppendRecord(ctx context.Context, lr *LogRecord, logType LogType) (LSN, error) {
+	lr.LogType = logType
 	// Create a channel to receive the result of this specific request.
 	errChan := make(chan error, 1)
 
@@ -884,8 +932,12 @@ func (lm *LogManager) AppendRecord(lr *LogRecord, logType LogType) (LSN, error) 
 		err:    errChan,
 	}
 
-	// Send the request to the log writer's queue.
-	lm.logQueue <- req
+	// Send the request to the log writer's queue, respecting context cancellation.
+	select {
+	case lm.logQueue <- req:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 
 	// Wait for the log writer to process the request and send back a result.
 	// This blocks until the log record is durably on disk.
@@ -939,6 +991,9 @@ func (lm *LogManager) flushBatch(batch *[]commitRequest) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
+	// Track which records already had an error sent so we don't double-send on flush/fsync failure.
+	failed := make([]bool, len(*batch))
+
 	// Process all records in the batch.
 	for i := range *batch {
 		req := &(*batch)[i] // Use a pointer to modify the original request
@@ -951,20 +1006,26 @@ func (lm *LogManager) flushBatch(batch *[]commitRequest) {
 		encoded, err := req.record.Encode()
 		if err != nil {
 			req.err <- fmt.Errorf("failed to encode log record: %w", err)
+			failed[i] = true
 			continue // Move to the next record
 		}
 
-		// Segment rollover logic (simplified for clarity)
-		// You would check the total size of the batch here before writing.
-		// if err := lm.rollOverSegmentIfNeeded(len(encoded)); err != nil { ... }
+		// Roll over to a new segment if this record would exceed the max segment size.
+		if err := lm.rollOverSegmentIfNeeded(len(encoded)); err != nil {
+			req.err <- fmt.Errorf("failed to roll over WAL segment: %w", err)
+			failed[i] = true
+			continue
+		}
 
 		// Write to the buffered writer
 		if err := binary.Write(lm.writer, binary.BigEndian, req.record.RecordSize); err != nil {
 			req.err <- fmt.Errorf("failed to write record size: %w", err)
+			failed[i] = true
 			continue
 		}
 		if _, err := lm.writer.Write(encoded); err != nil {
 			req.err <- fmt.Errorf("failed to write record data: %w", err)
+			failed[i] = true
 			continue
 		}
 	}
@@ -973,9 +1034,11 @@ func (lm *LogManager) flushBatch(batch *[]commitRequest) {
 	// 1. Flush the OS buffer.
 	err := lm.writer.Flush()
 	if err != nil {
-		// Signal error to all waiting clients in the batch
-		for _, req := range *batch {
-			req.err <- fmt.Errorf("failed to flush WAL writer: %w", err)
+		// Signal error only to clients that haven't already received one.
+		for i, req := range *batch {
+			if !failed[i] {
+				req.err <- fmt.Errorf("failed to flush WAL writer: %w", err)
+			}
 		}
 		*batch = (*batch)[:0] // Clear the batch
 		return
@@ -984,8 +1047,10 @@ func (lm *LogManager) flushBatch(batch *[]commitRequest) {
 	// 2. Force the OS to write to physical disk.
 	err = lm.currentSegmentFile.Sync()
 	if err != nil {
-		for _, req := range *batch {
-			req.err <- fmt.Errorf("failed to fsync WAL: %w", err)
+		for i, req := range *batch {
+			if !failed[i] {
+				req.err <- fmt.Errorf("failed to fsync WAL: %w", err)
+			}
 		}
 		*batch = (*batch)[:0] // Clear the batch
 		return
@@ -993,12 +1058,40 @@ func (lm *LogManager) flushBatch(batch *[]commitRequest) {
 	// --- END KEY SECTION ---
 
 	// Success! Notify all waiting clients that their transaction is durable.
-	for _, req := range *batch {
-		close(req.err) // Closing the channel signals success with no error
+	for i, req := range *batch {
+		if !failed[i] {
+			close(req.err) // Closing the channel signals success with no error
+		}
 	}
 	lm.cond.Broadcast()
 	// Clear the batch for the next set of records.
 	*batch = (*batch)[:0]
+}
+
+// rollOverSegmentIfNeeded switches to a new WAL segment if writing additionalBytes would exceed maxSegmentSize.
+// Must be called with lm.mu held.
+func (lm *LogManager) rollOverSegmentIfNeeded(additionalBytes int) error {
+	stat, err := lm.currentSegmentFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat current WAL segment: %w", err)
+	}
+	buffered := int64(lm.writer.Buffered())
+	if stat.Size()+buffered+int64(additionalBytes) < lm.maxSegmentSize {
+		return nil
+	}
+	// Flush buffered data before rolling over.
+	if err := lm.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush before segment rollover: %w", err)
+	}
+	newStartLSN := lm.currentLSN + 1
+	if err := lm.rollOverSegment(); err != nil {
+		return fmt.Errorf("failed to roll over segment: %w", err)
+	}
+	lm.writer = bufio.NewWriter(lm.currentSegmentFile)
+	lm.segmentMetaMtx.Lock()
+	lm.segmentStartLSNs[int(lm.currentSegmentID)] = newStartLSN
+	lm.segmentMetaMtx.Unlock()
+	return nil
 }
 
 func (lm *LogManager) rollOverSegment() error {
@@ -1027,6 +1120,11 @@ func (lm *LogManager) Sync() error {
 
 // Close closes the LogManager and the current WAL file.
 func (lm *LogManager) Close() error {
+	// Signal both background goroutines (logWriter and runPruningLoop) to stop.
+	close(lm.shutdown)
+	close(lm.shutdownCh)
+	lm.wg.Wait()
+
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	if lm.currentSegmentFile != nil {
@@ -1040,8 +1138,6 @@ func (lm *LogManager) Close() error {
 		lm.logger.Info("LogManager closed.", zap.Uint64("lastLSN", uint64(lm.currentLSN)))
 		return closeErr
 	}
-	close(lm.shutdown)
-	lm.wg.Wait()
 	return nil
 }
 

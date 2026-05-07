@@ -2,6 +2,7 @@ package inverted_index
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -406,7 +407,7 @@ func (idx *InvertedIndex) Insert(text string, docKey string) error {
 			PageID:    pagemanager.InvalidPageID,  // Not a specific page, but a logical update to the term dictionary
 			Data:      logData.Bytes(),
 		}
-		if _, err := idx.lm.AppendRecord(lr, wal.LogTypeInvertedIndex); err != nil {
+		if _, err := idx.lm.AppendRecord(context.TODO(), lr, wal.LogTypeInvertedIndex); err != nil {
 			// log.Printf("WARNING: Failed to log inverted index update for term '%s': %v", term, err)
 		}
 	}

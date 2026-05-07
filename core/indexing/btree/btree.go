@@ -2,6 +2,7 @@ package btree
 
 import (
 	"cmp"
+	"context"
 	"encoding/binary" // For serializing pagemanager.PageID to bytes
 	"errors"
 	"fmt"
@@ -140,7 +141,7 @@ type BTree[K comparable, V any] struct {
 }
 
 // NewBTreeFile creates a new database file and initializes a new B-tree within it.
-func NewBTreeFile[K comparable, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
+func NewBTreeFile[K comparable, V any](filePath string, degree int, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, pageSize int, lruSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
 	if degree < 2 {
 		return nil, fmt.Errorf("%w: got %d", ErrInvalidDegree, degree)
 	}
@@ -177,10 +178,10 @@ func NewBTreeFile[K comparable, V any](filePath string, degree int, keyOrder Ord
 	bt := &BTree[K, V]{
 		rootPageID: InvalidPageID, degree: degree, keyOrder: keyOrder,
 		kvSerializer: kvSerializer, bpm: bpm, diskManager: dm, logManager: logManager, logger: logger,
-		lru: lru.New[K, V](2000,
+		lru: lru.New[K, V](lruSize,
 			lru.WithDefaultTTL[K, V](0), // no default TTL
 			lru.WithOnEvict[K, V](func(k K, v V, reason lru.EvictReason) {
-				fmt.Printf("evicted %q reason=%s\n", k, reason)
+				logger.Debug("lru eviction", zap.Any("key", k), zap.String("reason", string(reason)))
 			}),
 			lru.WithJanitor[K, V](time.Minute), // optional background expiry sweeper
 		),
@@ -240,7 +241,7 @@ func NewBTreeFile[K comparable, V any](filePath string, degree int, keyOrder Ord
 }
 
 // OpenBTreeFile opens an existing database file and initializes the B-tree from its header.
-func OpenBTreeFile[K comparable, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
+func OpenBTreeFile[K comparable, V any](filePath string, keyOrder Order[K], kvSerializer KeyValueSerializer[K, V], poolSize int, defaultPageSize int, lruSize int, logManager *wal.LogManager, logger *zap.Logger) (*BTree[K, V], error) {
 	if keyOrder == nil {
 		return nil, ErrNilKeyOrder
 	}
@@ -278,6 +279,13 @@ func OpenBTreeFile[K comparable, V any](filePath string, keyOrder Order[K], kvSe
 		diskManager:  dm,
 		logManager:   logManager,
 		logger:       logger,
+		lru: lru.New[K, V](lruSize,
+			lru.WithDefaultTTL[K, V](0),
+			lru.WithOnEvict[K, V](func(k K, v V, reason lru.EvictReason) {
+				logger.Debug("lru eviction", zap.Any("key", k), zap.String("reason", string(reason)))
+			}),
+			lru.WithJanitor[K, V](time.Minute),
+		),
 		// --- NEW: Initialize 2PC Participant State ---
 		// transactionTable: make(map[uint64]*Transaction),
 		// keyLocks:         make(map[string]uint64),
@@ -343,7 +351,7 @@ func (bt *BTree[K, V]) SetRootPageID(newRootPageID pagemanager.PageID, txnID uin
 	}
 	// binary.LittleEndian.PutUint64(logRecord.Data, uint64(oldRootPageID))
 
-	_, err := bt.logManager.AppendRecord(logRecord, wal.LogTypeBtree)
+	_, err := bt.logManager.AppendRecord(context.TODO(), logRecord, wal.LogTypeBtree)
 	if err != nil {
 		// log.Printf("ERROR: Failed to log root page ID change from %d to %d: %v", oldRootPageID, newRootPageID, err)
 		// This is a critical error, as root change might not be recoverable.
@@ -1930,7 +1938,7 @@ func (bt *BTree[K, V]) Prepare(txnID uint64, operations []TransactionOperation) 
 	// This record needs to contain enough info to redo/undo the operations if needed.
 	// For V1, we'll log a generic PREPARE record. Full operations would be serialized into NewData.
 	// For now, we assume the Coordinator will re-send operations on COMMIT/ABORT.
-	_, err = bt.logManager.AppendRecord(&wal.LogRecord{
+	_, err = bt.logManager.AppendRecord(context.TODO(), &wal.LogRecord{
 		TxnID:     txnID,
 		Type:      wal.LogRecordTypePrepare,
 		IndexType: indexing.BTreeIndexType,
@@ -1970,7 +1978,7 @@ func (bt *BTree[K, V]) Commit(txnID uint64) error {
 	// log.Printf("INFO: Txn %d: Received COMMIT request. Logging COMMIT record.", txnID)
 
 	// Log the COMMIT record
-	_, err := bt.logManager.AppendRecord(&wal.LogRecord{
+	_, err := bt.logManager.AppendRecord(context.TODO(), &wal.LogRecord{
 		TxnID:     txnID,
 		Type:      wal.LogRecordTypeCommitTxn,
 		IndexType: indexing.BTreeIndexType,
@@ -2011,7 +2019,7 @@ func (bt *BTree[K, V]) Abort(txnID uint64) error {
 	// log.Printf("INFO: Txn %d: Received ABORT request. Logging ABORT record.", txnID)
 
 	// Log the ABORT record
-	_, err := bt.logManager.AppendRecord(&wal.LogRecord{
+	_, err := bt.logManager.AppendRecord(context.TODO(), &wal.LogRecord{
 		TxnID:     txnID,
 		Type:      wal.LogRecordTypeAbortTxn,
 		IndexType: indexing.BTreeIndexType,
